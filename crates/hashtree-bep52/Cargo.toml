@@ -1,0 +1,22 @@
+[package]
+name = "hashtree-bep52"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BEP52 (BitTorrent v2) compatible merkle tree implementation"
+keywords = ["merkle", "bittorrent", "bep52", "hash", "torrent"]
+
+[dependencies]
+sha2.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+hex = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+rand = "0.8"
+
+[[bench]]
+name = "bep52_bench"
+harness = false

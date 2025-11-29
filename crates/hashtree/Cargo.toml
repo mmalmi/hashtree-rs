@@ -1,0 +1,25 @@
+[package]
+name = "hashtree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Simple content-addressed merkle tree with KV storage"
+keywords = ["merkle", "content-addressed", "hash", "tree", "storage"]
+
+[dependencies]
+sha2.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+criterion = "0.5"
+rand = "0.8"
+
+[[bench]]
+name = "builder"
+harness = false
