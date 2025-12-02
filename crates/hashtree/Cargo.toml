@@ -16,6 +16,15 @@ async-trait.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 
+# Encryption (optional)
+aes-gcm = { version = "0.10", optional = true }
+hkdf = { version = "0.12", optional = true }
+rand = { version = "0.8", optional = true }
+
+[features]
+default = []
+encryption = ["aes-gcm", "hkdf", "rand"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 criterion = "0.5"

@@ -46,6 +46,11 @@ pub mod reader;
 pub mod store;
 pub mod types;
 
+#[cfg(feature = "encryption")]
+pub mod crypto;
+#[cfg(feature = "encryption")]
+pub mod encrypted;
+
 // Re-exports for convenience
 pub use builder::{BuilderConfig, BuilderError, MerkleAlgorithm, PutFileResult, StreamBuilder, StreamStats, TreeBuilder};
 pub use builder::{BEP52_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_LINKS};
@@ -58,3 +63,15 @@ pub use hashtree::{HashTree, HashTreeConfig, HashTreeError, PutFileResult as Has
 pub use reader::{verify_tree, ReaderError, TreeEntry, TreeReader, VerifyResult, WalkEntry};
 pub use store::{MemoryStore, Store, StoreError};
 pub use types::{from_hex, hash_equals, to_hex, DirEntry, Hash, Link, PutResult, TreeNode};
+
+#[cfg(feature = "encryption")]
+pub use crypto::{
+    content_hash, could_be_encrypted, decrypt, decrypt_chk, encrypt, encrypt_chk, encrypted_size,
+    encrypted_size_chk, generate_key, key_from_hex, key_to_hex, plaintext_size, CryptoError,
+    EncryptionKey,
+};
+#[cfg(feature = "encryption")]
+pub use encrypted::{
+    put_file_encrypted, read_file_encrypted, EncryptedError, EncryptedPutResult,
+    EncryptedTreeConfig,
+};
