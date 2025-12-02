@@ -1,0 +1,31 @@
+[package]
+name = "hashtree-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nostr relay implementation using nostrdb"
+
+[dependencies]
+# Core
+nostrdb = { git = "https://github.com/mmalmi/nostrdb-rs" }
+enostr = { git = "https://github.com/mmalmi/notedeck" }
+nostr = "0.37"
+
+# Async/Web
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.24"

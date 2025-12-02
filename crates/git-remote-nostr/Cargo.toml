@@ -1,0 +1,47 @@
+[package]
+name = "git-remote-nostr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Git remote helper for nostr - push/pull git repos via nostr and hashtree"
+
+[[bin]]
+name = "git-remote-nostr"
+path = "src/main.rs"
+
+[dependencies]
+# Git protocol
+hashtree-git.workspace = true
+
+# Content-addressed storage
+hashtree.workspace = true
+hashtree-lmdb.workspace = true
+dirs = "5"
+
+# Nostr
+nostr.workspace = true
+secp256k1 = { version = "0.29", features = ["global-context"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Utilities
+anyhow.workspace = true
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# HTTP client for fetching blobs
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+
+# CLI
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

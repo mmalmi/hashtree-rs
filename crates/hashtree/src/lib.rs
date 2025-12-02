@@ -41,6 +41,7 @@
 pub mod builder;
 pub mod codec;
 pub mod hash;
+pub mod hashtree;
 pub mod reader;
 pub mod store;
 pub mod types;
@@ -53,6 +54,7 @@ pub use codec::{
     CodecError,
 };
 pub use hash::{sha256, verify};
+pub use hashtree::{HashTree, HashTreeConfig, HashTreeError, PutFileResult as HashTreePutFileResult, verify_tree as hashtree_verify_tree};
 pub use reader::{verify_tree, ReaderError, TreeEntry, TreeReader, VerifyResult, WalkEntry};
 pub use store::{MemoryStore, Store, StoreError};
 pub use types::{from_hex, hash_equals, to_hex, DirEntry, Hash, Link, PutResult, TreeNode};

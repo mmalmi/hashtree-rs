@@ -1,0 +1,65 @@
+[package]
+name = "hashtree-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hashtree daemon and CLI - content-addressed storage with P2P sync"
+
+[[bin]]
+name = "htree"
+path = "src/main.rs"
+
+[dependencies]
+# Core hashtree crates
+hashtree.workspace = true
+hashtree-lmdb.workspace = true
+hashtree-relay.workspace = true
+hashtree-git.workspace = true
+
+# Storage
+heed.workspace = true
+tempfile.workspace = true
+
+# HTTP/Web
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# Nostr
+nostr.workspace = true
+nostr-sdk.workspace = true
+nostrdb.workspace = true
+enostr.workspace = true
+
+# WebRTC
+webrtc = "0.11"
+webrtc-stun = "0.1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures = "0.3"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Utilities
+anyhow.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+sha2.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64 = "0.22"
+rand = "0.8"
+secp256k1 = { version = "0.29", features = ["global-context"] }
+
+# CLI
+clap.workspace = true
+dirs = "5"
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
