@@ -24,6 +24,9 @@ pub struct ServerConfig {
     /// Port for the built-in STUN server (0 = disabled)
     #[serde(default = "default_stun_port")]
     pub stun_port: u16,
+    /// Enable WebRTC P2P connections
+    #[serde(default = "default_enable_webrtc")]
+    pub enable_webrtc: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +77,10 @@ fn default_stun_port() -> u16 {
     3478 // Standard STUN port (RFC 5389)
 }
 
+fn default_enable_webrtc() -> bool {
+    true
+}
+
 fn default_data_dir() -> String {
     get_hashtree_dir()
         .join("data")
@@ -91,6 +98,7 @@ impl Default for ServerConfig {
             bind_address: default_bind_address(),
             enable_auth: default_enable_auth(),
             stun_port: default_stun_port(),
+            enable_webrtc: default_enable_webrtc(),
         }
     }
 }

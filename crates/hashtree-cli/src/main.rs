@@ -1,7 +1,7 @@
 //! Hashtree CLI and daemon
 //!
 //! Usage:
-//!   htree start [--addr 127.0.0.1:8080] [--webrtc]
+//!   htree start [--addr 127.0.0.1:8080]
 //!   htree upload <file>
 //!   htree upload-dir <dir>
 //!   htree pins
@@ -36,9 +36,6 @@ enum Commands {
     Start {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Enable WebRTC P2P connections
-        #[arg(long)]
-        webrtc: bool,
     },
     /// Upload a file and get its CID
     Upload {
@@ -78,7 +75,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { addr, webrtc } => {
+        Commands::Start { addr } => {
             // Load or create config
             let config = Config::load()?;
 
@@ -141,9 +138,8 @@ async fn main() -> Result<()> {
                 None
             };
 
-            // WebRTC is not yet supported in the daemon (enostr RelayPool is not Send)
-            // Use the standalone webrtc-test binary for testing
-            let _ = webrtc;
+            // WebRTC is not yet fully supported in the daemon (enostr RelayPool is not Send)
+            // WebRTC config is in config.server.enable_webrtc
 
             // Set up server with nostr relay (inbound) and query sender
             let mut server = HashtreeServer::new(store, addr.clone())
@@ -176,7 +172,7 @@ async fn main() -> Result<()> {
             if let Some(ref handle) = stun_handle {
                 println!("STUN server: {}", handle.addr);
             }
-            if webrtc {
+            if config.server.enable_webrtc {
                 println!("WebRTC: enabled (P2P connections)");
             }
 
