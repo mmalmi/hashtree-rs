@@ -2,8 +2,7 @@
 //!
 //! Usage:
 //!   htree start [--addr 127.0.0.1:8080]
-//!   htree upload <file>
-//!   htree upload-dir <dir>
+//!   htree add <path> [--only-hash]
 //!   htree pins
 //!   htree pin <cid>
 //!   htree unpin <cid>
@@ -37,15 +36,13 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
-    /// Upload a file and get its CID
-    Upload {
-        /// Path to the file to upload
-        file: PathBuf,
-    },
-    /// Upload a directory and get its CID
-    UploadDir {
-        /// Path to the directory to upload
-        dir: PathBuf,
+    /// Add file or directory to hashtree (like ipfs add)
+    Add {
+        /// Path to file or directory
+        path: PathBuf,
+        /// Only compute hash, don't store
+        #[arg(long)]
+        only_hash: bool,
     },
     /// List all pinned CIDs
     Pins,
@@ -196,21 +193,42 @@ async fn main() -> Result<()> {
             // Shutdown relay thread
             relay_handle.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        Commands::Upload { file } => {
-            let store = HashtreeStore::new(&cli.data_dir)?;
-            let cid = store.upload_file(&file)
-                .context("Failed to upload file")?;
-            println!("Uploaded: {}", file.display());
-            println!("CID: {}", cid);
-            println!("Retrieve: http://127.0.0.1:8080/{}", cid);
-        }
-        Commands::UploadDir { dir } => {
-            let store = HashtreeStore::new(&cli.data_dir)?;
-            let cid = store.upload_dir(&dir)
-                .context("Failed to upload directory")?;
-            println!("Uploaded directory: {}", dir.display());
-            println!("CID: {}", cid);
-            println!("Retrieve: http://127.0.0.1:8080/{}", cid);
+        Commands::Add { path, only_hash } => {
+            let is_dir = path.is_dir();
+
+            if only_hash {
+                // Use in-memory store for hash-only mode
+                use hashtree::store::MemoryStore;
+                use hashtree::builder::{TreeBuilder, BuilderConfig};
+                use std::sync::Arc;
+
+                let store = Arc::new(MemoryStore::new());
+                let config = BuilderConfig::new(store.clone());
+                let builder = TreeBuilder::new(config);
+
+                let cid = if is_dir {
+                    add_directory_recursive(&builder, &path).await?
+                } else {
+                    let data = std::fs::read(&path)?;
+                    let result = builder.put_file(&data).await
+                        .map_err(|e| anyhow::anyhow!("Failed to hash file: {}", e))?;
+                    hashtree::to_hex(&result.hash)
+                };
+
+                println!("{}", cid);
+            } else {
+                // Store in local hashtree
+                let store = HashtreeStore::new(&cli.data_dir)?;
+                let cid = if is_dir {
+                    store.upload_dir(&path)
+                        .context("Failed to add directory")?
+                } else {
+                    store.upload_file(&path)
+                        .context("Failed to add file")?
+                };
+
+                println!("added {} {}", cid, path.display());
+            }
         }
         Commands::Pins => {
             let store = HashtreeStore::new(&cli.data_dir)?;
@@ -302,4 +320,56 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Recursively add a directory and return its hash (for --only-hash mode)
+async fn add_directory_recursive<S: hashtree::store::Store>(
+    builder: &hashtree::builder::TreeBuilder<S>,
+    dir: &std::path::Path,
+) -> Result<String> {
+    use hashtree::types::DirEntry;
+
+    let mut entries = Vec::new();
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if path.is_dir() {
+            // Recursively hash subdirectory
+            let hash_hex = Box::pin(add_directory_recursive(builder, &path)).await?;
+            let hash = hashtree::from_hex(&hash_hex)?;
+
+            // Get directory size by summing contents
+            let size = dir_size(&path)?;
+            entries.push(DirEntry::new(name, hash).with_size(size));
+        } else {
+            let data = std::fs::read(&path)?;
+            let size = data.len() as u64;
+            let result = builder.put_file(&data).await
+                .map_err(|e| anyhow::anyhow!("Failed to hash file {}: {}", path.display(), e))?;
+            entries.push(DirEntry::new(name, result.hash).with_size(size));
+        }
+    }
+
+    let hash = builder.put_directory(entries, None).await
+        .map_err(|e| anyhow::anyhow!("Failed to hash directory: {}", e))?;
+
+    Ok(hashtree::to_hex(&hash))
+}
+
+/// Calculate total size of a directory
+fn dir_size(path: &std::path::Path) -> Result<u64> {
+    let mut size = 0;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            size += dir_size(&path)?;
+        } else {
+            size += entry.metadata()?.len();
+        }
+    }
+    Ok(size)
 }
