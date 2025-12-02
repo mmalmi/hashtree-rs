@@ -3,6 +3,8 @@
 //! Usage:
 //!   htree start [--addr 127.0.0.1:8080]
 //!   htree add <path> [--only-hash]
+//!   htree get <cid> [-o output]
+//!   htree cat <cid>
 //!   htree pins
 //!   htree pin <cid>
 //!   htree unpin <cid>
@@ -43,6 +45,19 @@ enum Commands {
         /// Only compute hash, don't store
         #[arg(long)]
         only_hash: bool,
+    },
+    /// Get/download content by CID
+    Get {
+        /// CID to retrieve
+        cid: String,
+        /// Output path (default: current dir, uses CID as filename)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Output file content to stdout (like cat)
+    Cat {
+        /// CID to read
+        cid: String,
     },
     /// List all pinned CIDs
     Pins,
@@ -228,6 +243,53 @@ async fn main() -> Result<()> {
                 };
 
                 println!("added {} {}", cid, path.display());
+            }
+        }
+        Commands::Get { cid, output } => {
+            let store = HashtreeStore::new(&cli.data_dir)?;
+
+            // Check if it's a directory
+            if let Ok(Some(_)) = store.get_directory_listing(&cid) {
+                // It's a directory - create it and download contents
+                let out_dir = output.unwrap_or_else(|| PathBuf::from(&cid));
+                std::fs::create_dir_all(&out_dir)?;
+
+                fn download_dir(store: &HashtreeStore, cid: &str, dir: &std::path::Path) -> Result<()> {
+                    if let Some(listing) = store.get_directory_listing(cid)? {
+                        for entry in listing.entries {
+                            let entry_path = dir.join(&entry.name);
+                            if entry.is_directory {
+                                std::fs::create_dir_all(&entry_path)?;
+                                download_dir(store, &entry.cid, &entry_path)?;
+                            } else if let Some(content) = store.get_file(&entry.cid)? {
+                                std::fs::write(&entry_path, content)?;
+                                println!("  {} -> {}", entry.cid, entry_path.display());
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+
+                println!("Downloading directory to {}", out_dir.display());
+                download_dir(&store, &cid, &out_dir)?;
+                println!("Done.");
+            } else if let Some(content) = store.get_file(&cid)? {
+                // It's a file
+                let out_path = output.unwrap_or_else(|| PathBuf::from(&cid));
+                std::fs::write(&out_path, content)?;
+                println!("{} -> {}", cid, out_path.display());
+            } else {
+                anyhow::bail!("CID not found: {}", cid);
+            }
+        }
+        Commands::Cat { cid } => {
+            let store = HashtreeStore::new(&cli.data_dir)?;
+
+            if let Some(content) = store.get_file(&cid)? {
+                use std::io::Write;
+                std::io::stdout().write_all(&content)?;
+            } else {
+                anyhow::bail!("CID not found: {}", cid);
             }
         }
         Commands::Pins => {
