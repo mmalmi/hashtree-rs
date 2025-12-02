@@ -107,6 +107,32 @@ impl NostrRootResolver {
     pub fn pubkey(&self) -> Option<PublicKey> {
         self.config.secret_key.as_ref().map(|k| k.public_key())
     }
+
+    /// Resolve a key, waiting indefinitely until found.
+    ///
+    /// Unlike `resolve()` which returns `None` after timeout, this method
+    /// subscribes and waits until a hash is found. Caller should apply their
+    /// own timeout if needed (e.g., via `tokio::time::timeout`).
+    ///
+    /// This matches the behavior of hashtree-ts NostrRootResolver.
+    pub async fn resolve_wait(&self, key: &str) -> Result<Hash, ResolverError> {
+        // First try a quick resolve
+        if let Some(hash) = self.resolve(key).await? {
+            return Ok(hash);
+        }
+
+        // Not found, subscribe and wait
+        let mut rx = self.subscribe(key).await?;
+
+        // Wait for first non-None value
+        while let Some(maybe_hash) = rx.recv().await {
+            if let Some(hash) = maybe_hash {
+                return Ok(hash);
+            }
+        }
+
+        Err(ResolverError::Stopped)
+    }
 }
 
 #[async_trait]

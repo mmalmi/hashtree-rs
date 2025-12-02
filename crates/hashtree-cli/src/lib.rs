@@ -1,5 +1,4 @@
 pub mod config;
-pub mod resolver;
 pub mod server;
 pub mod storage;
 pub mod webrtc;
@@ -10,7 +9,8 @@ pub use hashtree_relay::{
     spawn_relay_thread, NdbQuerySender, RelayConfig, RelayManager, RelayState,
     RelayThreadHandle, SocialGraphStats, DEFAULT_RELAYS,
 };
-pub use resolver::NostrResolver;
+pub use hashtree_resolver::nostr::{NostrRootResolver, NostrResolverConfig};
+pub use hashtree_resolver::{ResolverEntry, ResolverError, RootResolver};
 pub use server::HashtreeServer;
 pub use storage::HashtreeStore;
 pub use webrtc::{ContentStore, DataMessage, WebRTCConfig, WebRTCManager, PeerId};

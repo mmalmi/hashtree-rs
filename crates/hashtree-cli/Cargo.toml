@@ -15,6 +15,7 @@ hashtree.workspace = true
 hashtree-lmdb.workspace = true
 hashtree-relay.workspace = true
 hashtree-git.workspace = true
+hashtree-resolver = { path = "../hashtree-resolver", features = ["nostr"] }
 
 # Storage
 heed.workspace = true

@@ -6,13 +6,14 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
+use hashtree::to_hex;
+use hashtree_resolver::{nostr::{NostrRootResolver, NostrResolverConfig}, RootResolver};
 use serde_json::json;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use super::auth::AppState;
 use super::mime::get_mime_type;
 use super::ui::{root_page, serve_directory_html, serve_directory_json};
-use crate::resolver::NostrResolver;
 
 pub async fn serve_root() -> impl IntoResponse {
     root_page()
@@ -426,15 +427,16 @@ pub async fn socialgraph_stats(State(state): State<AppState>) -> impl IntoRespon
     }
 }
 
-/// Default relays for resolver
-const RESOLVER_RELAYS: &[&str] = &[
-    "wss://relay.damus.io",
-    "wss://relay.primal.net",
-    "wss://nos.lol",
-];
-
 /// Timeout for HTTP resolver requests
 const HTTP_RESOLVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Create resolver config with HTTP timeout
+fn resolver_config() -> NostrResolverConfig {
+    NostrResolverConfig {
+        resolve_timeout: HTTP_RESOLVER_TIMEOUT,
+        ..Default::default()
+    }
+}
 
 /// Resolve npub/treename to hash and serve content
 /// Route: /n/:pubkey/:treename or /n/:pubkey/:treename/*path
@@ -444,21 +446,33 @@ pub async fn resolve_and_serve(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let (pubkey, treename) = params;
-
-    let resolver = NostrResolver::new(
-        RESOLVER_RELAYS.iter().map(|s| s.to_string()).collect()
-    );
-
-    // Resolve the key with timeout on caller side
     let key = format!("{}/{}", pubkey, treename);
-    let resolve_future = resolver.resolve(&key);
 
-    match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolve_future).await {
+    let resolver = match NostrRootResolver::new(resolver_config()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(json!({
+                    "error": format!("Failed to create resolver: {}", e),
+                    "key": key
+                }).to_string()))
+                .unwrap()
+                .into_response();
+        }
+    };
+
+    // Use resolve_wait with timeout - waits for key to appear
+    match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
         Ok(Ok(hash)) => {
-            // Got a hash, now serve the content
-            serve_content_internal(&state, &hash, headers).await
+            let hash_hex = to_hex(&hash);
+            let _ = resolver.stop().await;
+            serve_content_internal(&state, &hash_hex, headers).await
         }
         Ok(Err(e)) => {
+            let _ = resolver.stop().await;
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -471,7 +485,7 @@ pub async fn resolve_and_serve(
                 .into_response()
         }
         Err(_) => {
-            // Timeout - key not resolved in time
+            let _ = resolver.stop().await;
             Response::builder()
                 .status(StatusCode::GATEWAY_TIMEOUT)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -491,19 +505,23 @@ pub async fn resolve_to_hash(
     Path(params): Path<(String, String)>,
 ) -> impl IntoResponse {
     let (pubkey, treename) = params;
-
-    let resolver = NostrResolver::new(
-        RESOLVER_RELAYS.iter().map(|s| s.to_string()).collect()
-    );
-
     let key = format!("{}/{}", pubkey, treename);
-    let resolve_future = resolver.resolve(&key);
 
-    match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolve_future).await {
+    let resolver = match NostrRootResolver::new(resolver_config()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "error": format!("Failed to create resolver: {}", e),
+                "key": key
+            }));
+        }
+    };
+
+    let result = match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
         Ok(Ok(hash)) => {
             Json(json!({
                 "key": key,
-                "hash": hash
+                "hash": to_hex(&hash)
             }))
         }
         Ok(Err(e)) => {
@@ -518,24 +536,34 @@ pub async fn resolve_to_hash(
                 "key": key
             }))
         }
-    }
+    };
+
+    let _ = resolver.stop().await;
+    result
 }
 
 /// List all trees for a pubkey
 pub async fn list_trees(
     Path(pubkey): Path<String>,
 ) -> impl IntoResponse {
-    let resolver = NostrResolver::new(
-        RESOLVER_RELAYS.iter().map(|s| s.to_string()).collect()
-    );
+    let resolver = match NostrRootResolver::new(resolver_config()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "error": format!("Failed to create resolver: {}", e),
+                "pubkey": pubkey
+            }));
+        }
+    };
 
-    match resolver.list(&pubkey, HTTP_RESOLVER_TIMEOUT).await {
-        Ok(trees) => {
+    // list() uses the configured timeout internally
+    let result = match resolver.list(&pubkey).await {
+        Ok(entries) => {
             Json(json!({
                 "pubkey": pubkey,
-                "trees": trees.iter().map(|(name, hash)| json!({
-                    "name": name,
-                    "hash": hash
+                "trees": entries.iter().map(|e| json!({
+                    "name": e.key.split('/').last().unwrap_or(&e.key),
+                    "hash": to_hex(&e.hash)
                 })).collect::<Vec<_>>()
             }))
         }
@@ -545,5 +573,8 @@ pub async fn list_trees(
                 "pubkey": pubkey
             }))
         }
-    }
+    };
+
+    let _ = resolver.stop().await;
+    result
 }
