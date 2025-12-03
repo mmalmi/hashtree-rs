@@ -599,27 +599,7 @@ impl<S: Store> HashTree<S> {
 
     /// Build a directory from entries
     /// Returns Cid with key if encrypted
-    pub async fn put_dir(
-        &self,
-        entries: Vec<DirEntry>,
-        metadata: Option<HashMap<String, serde_json::Value>>,
-    ) -> Result<Cid, HashTreeError> {
-        self.put_directory_internal(entries, metadata).await
-    }
-
-    /// Build a directory from entries (returns Hash for backwards compatibility)
     pub async fn put_directory(
-        &self,
-        entries: Vec<DirEntry>,
-        metadata: Option<HashMap<String, serde_json::Value>>,
-    ) -> Result<Hash, HashTreeError> {
-        let cid = self.put_directory_internal(entries, metadata).await?;
-        Ok(cid.hash)
-    }
-
-    /// Internal directory builder
-    /// Directory CBOR is encrypted if encryption is enabled
-    async fn put_directory_internal(
         &self,
         entries: Vec<DirEntry>,
         metadata: Option<HashMap<String, serde_json::Value>>,
@@ -656,7 +636,7 @@ impl<S: Store> HashTree<S> {
         }
 
         // Large directory - create sub-trees
-        self.build_directory_by_chunks_internal(links, total_size, metadata).await
+        self.build_directory_by_chunks(links, total_size, metadata).await
     }
 
     /// Build a balanced tree from links
@@ -716,7 +696,7 @@ impl<S: Store> HashTree<S> {
 
     /// Split directory into numeric chunks
     /// Directory chunks are encrypted if encryption is enabled
-    async fn build_directory_by_chunks_internal(
+    async fn build_directory_by_chunks(
         &self,
         links: Vec<Link>,
         total_size: u64,
@@ -759,7 +739,7 @@ impl<S: Store> HashTree<S> {
         }
 
         // Recursively build more levels
-        Box::pin(self.build_directory_by_chunks_internal(sub_trees, total_size, metadata)).await
+        Box::pin(self.build_directory_by_chunks(sub_trees, total_size, metadata)).await
     }
 
     /// Create a tree node with custom links and metadata
@@ -1077,9 +1057,9 @@ impl<S: Store> HashTree<S> {
         Ok(entries)
     }
 
-    /// List directory entries (low-level, Hash-based, no decryption)
-    pub async fn list_directory(&self, hash: &Hash) -> Result<Vec<TreeEntry>, HashTreeError> {
-        let node = match self.get_tree_node(hash).await? {
+    /// List directory entries using Cid (with decryption if key present)
+    pub async fn list_directory(&self, cid: &Cid) -> Result<Vec<TreeEntry>, HashTreeError> {
+        let node = match self.get_node(cid).await? {
             Some(n) => n,
             None => return Ok(vec![]),
         };
@@ -1090,13 +1070,17 @@ impl<S: Store> HashTree<S> {
             // Skip internal chunk nodes
             if let Some(ref name) = link.name {
                 if name.starts_with("_chunk_") || name.starts_with('_') {
-                    let sub_entries = Box::pin(self.list_directory(&link.hash)).await?;
+                    // Internal nodes inherit parent's key for decryption
+                    let sub_cid = Cid { hash: link.hash, key: cid.key, size: 0 };
+                    let sub_entries = Box::pin(self.list_directory(&sub_cid)).await?;
                     entries.extend(sub_entries);
                     continue;
                 }
             }
 
-            let child_is_dir = self.is_directory(&link.hash).await?;
+            // Check if child is a directory (using its own key if present)
+            let child_cid = Cid { hash: link.hash, key: link.key, size: link.size.unwrap_or(0) };
+            let child_is_dir = self.is_dir(&child_cid).await.unwrap_or(false);
             entries.push(TreeEntry {
                 name: link.name.clone().unwrap_or_else(|| to_hex(&link.hash)),
                 hash: link.hash,
@@ -1146,13 +1130,9 @@ impl<S: Store> HashTree<S> {
         Ok(Some(Cid { hash: current_hash, key, size }))
     }
 
-    /// Resolve a path within a tree (low-level, returns Hash only)
-    pub async fn resolve_path(&self, root_hash: &Hash, path: &str) -> Result<Option<Hash>, HashTreeError> {
-        let cid = Cid { hash: *root_hash, key: None, size: 0 };
-        match self.resolve(&cid, path).await? {
-            Some(resolved) => Ok(Some(resolved.hash)),
-            None => Ok(None),
-        }
+    /// Resolve a path within a tree using Cid (with decryption if key present)
+    pub async fn resolve_path(&self, cid: &Cid, path: &str) -> Result<Option<Cid>, HashTreeError> {
+        self.resolve(cid, path).await
     }
 
     fn find_link(&self, node: &TreeNode, name: &str) -> Option<Link> {
@@ -1213,30 +1193,38 @@ impl<S: Store> HashTree<S> {
     }
 
     /// Walk entire tree depth-first (returns Vec)
-    pub async fn walk(&self, hash: &Hash, path: &str) -> Result<Vec<WalkEntry>, HashTreeError> {
+    pub async fn walk(&self, cid: &Cid, path: &str) -> Result<Vec<WalkEntry>, HashTreeError> {
         let mut entries = Vec::new();
-        self.walk_recursive(hash, path, &mut entries).await?;
+        self.walk_recursive(cid, path, &mut entries).await?;
         Ok(entries)
     }
 
     async fn walk_recursive(
         &self,
-        hash: &Hash,
+        cid: &Cid,
         path: &str,
         entries: &mut Vec<WalkEntry>,
     ) -> Result<(), HashTreeError> {
-        let data = match self.store.get(hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
+        let data = match self.store.get(&cid.hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
             Some(d) => d,
             None => return Ok(()),
+        };
+
+        // Decrypt if key is present
+        #[cfg(feature = "encryption")]
+        let data = if let Some(key) = &cid.key {
+            decrypt_chk(&data, key).map_err(|e| HashTreeError::Decryption(e.to_string()))?
+        } else {
+            data
         };
 
         if !is_tree_node(&data) {
             entries.push(WalkEntry {
                 path: path.to_string(),
-                hash: *hash,
+                hash: cid.hash,
                 is_tree: false,
                 size: Some(data.len() as u64),
-                key: None, // TODO: track keys through walk
+                key: cid.key,
             });
             return Ok(());
         }
@@ -1244,17 +1232,19 @@ impl<S: Store> HashTree<S> {
         let node = decode_tree_node(&data)?;
         entries.push(WalkEntry {
             path: path.to_string(),
-            hash: *hash,
+            hash: cid.hash,
             is_tree: true,
             size: node.total_size,
-            key: None, // directories are not encrypted
+            key: cid.key,
         });
 
         for link in &node.links {
             let child_path = match &link.name {
                 Some(name) => {
                     if name.starts_with("_chunk_") || name.starts_with('_') {
-                        Box::pin(self.walk_recursive(&link.hash, path, entries)).await?;
+                        // Internal nodes inherit parent's key
+                        let sub_cid = Cid { hash: link.hash, key: cid.key, size: 0 };
+                        Box::pin(self.walk_recursive(&sub_cid, path, entries)).await?;
                         continue;
                     }
                     if path.is_empty() {
@@ -1266,7 +1256,9 @@ impl<S: Store> HashTree<S> {
                 None => path.to_string(),
             };
 
-            Box::pin(self.walk_recursive(&link.hash, &child_path, entries)).await?;
+            // Child nodes use their own key from link
+            let child_cid = Cid { hash: link.hash, key: link.key, size: link.size.unwrap_or(0) };
+            Box::pin(self.walk_recursive(&child_cid, &child_path, entries)).await?;
         }
 
         Ok(())
@@ -1275,15 +1267,15 @@ impl<S: Store> HashTree<S> {
     /// Walk tree as stream
     pub fn walk_stream(
         &self,
-        hash: Hash,
+        cid: Cid,
         initial_path: String,
     ) -> Pin<Box<dyn Stream<Item = Result<WalkEntry, HashTreeError>> + Send + '_>> {
         Box::pin(stream::unfold(
-            WalkStreamState::Init { hash, path: initial_path, tree: self },
+            WalkStreamState::Init { cid, path: initial_path, tree: self },
             |state| async move {
                 match state {
-                    WalkStreamState::Init { hash, path, tree } => {
-                        let data = match tree.store.get(&hash).await {
+                    WalkStreamState::Init { cid, path, tree } => {
+                        let data = match tree.store.get(&cid.hash).await {
                             Ok(Some(d)) => d,
                             Ok(None) => return None,
                             Err(e) => {
@@ -1294,13 +1286,24 @@ impl<S: Store> HashTree<S> {
                             }
                         };
 
+                        // Decrypt if key is present
+                        #[cfg(feature = "encryption")]
+                        let data = if let Some(key) = &cid.key {
+                            match decrypt_chk(&data, key) {
+                                Ok(d) => d,
+                                Err(e) => return Some((Err(HashTreeError::Decryption(e.to_string())), WalkStreamState::Done)),
+                            }
+                        } else {
+                            data
+                        };
+
                         if !is_tree_node(&data) {
                             let entry = WalkEntry {
                                 path,
-                                hash,
+                                hash: cid.hash,
                                 is_tree: false,
                                 size: Some(data.len() as u64),
-                                key: None, // TODO: track keys through walk
+                                key: cid.key,
                             };
                             return Some((Ok(entry), WalkStreamState::Done));
                         }
@@ -1312,10 +1315,10 @@ impl<S: Store> HashTree<S> {
 
                         let entry = WalkEntry {
                             path: path.clone(),
-                            hash,
+                            hash: cid.hash,
                             is_tree: true,
                             size: node.total_size,
-                            key: None, // directories are not encrypted
+                            key: cid.key,
                         };
 
                         // Create stack with children to process
@@ -1331,6 +1334,7 @@ impl<S: Store> HashTree<S> {
                                 }
                                 _ => path.clone(),
                             };
+                            // Child nodes use their own key from link
                             stack.push(WalkStackItem { hash: link.hash, path: child_path, key: link.key });
                         }
 
@@ -1408,19 +1412,18 @@ impl<S: Store> HashTree<S> {
     // ============ EDIT ============
 
     /// Add or update an entry in a directory
-    /// Returns new root hash (immutable operation)
+    /// Returns new root Cid (immutable operation)
     pub async fn set_entry(
         &self,
-        root_hash: &Hash,
+        root: &Cid,
         path: &[&str],
         name: &str,
-        hash: Hash,
-        size: u64,
-    ) -> Result<Hash, HashTreeError> {
-        let dir_hash = self.resolve_path_array(root_hash, path).await?;
-        let dir_hash = dir_hash.ok_or_else(|| HashTreeError::PathNotFound(path.join("/")))?;
+        entry_cid: &Cid,
+    ) -> Result<Cid, HashTreeError> {
+        let dir_cid = self.resolve_path_array(root, path).await?;
+        let dir_cid = dir_cid.ok_or_else(|| HashTreeError::PathNotFound(path.join("/")))?;
 
-        let entries = self.list_directory(&dir_hash).await?;
+        let entries = self.list_directory(&dir_cid).await?;
         let mut new_entries: Vec<DirEntry> = entries
             .into_iter()
             .filter(|e| e.name != name)
@@ -1434,27 +1437,27 @@ impl<S: Store> HashTree<S> {
 
         new_entries.push(DirEntry {
             name: name.to_string(),
-            hash,
-            size: Some(size),
-            key: None,
+            hash: entry_cid.hash,
+            size: Some(entry_cid.size),
+            key: entry_cid.key,
         });
 
-        let new_dir_hash = self.put_directory(new_entries, None).await?;
-        self.rebuild_path(root_hash, path, new_dir_hash).await
+        let new_dir_cid = self.put_directory(new_entries, None).await?;
+        self.rebuild_path(root, path, new_dir_cid).await
     }
 
     /// Remove an entry from a directory
-    /// Returns new root hash
+    /// Returns new root Cid
     pub async fn remove_entry(
         &self,
-        root_hash: &Hash,
+        root: &Cid,
         path: &[&str],
         name: &str,
-    ) -> Result<Hash, HashTreeError> {
-        let dir_hash = self.resolve_path_array(root_hash, path).await?;
-        let dir_hash = dir_hash.ok_or_else(|| HashTreeError::PathNotFound(path.join("/")))?;
+    ) -> Result<Cid, HashTreeError> {
+        let dir_cid = self.resolve_path_array(root, path).await?;
+        let dir_cid = dir_cid.ok_or_else(|| HashTreeError::PathNotFound(path.join("/")))?;
 
-        let entries = self.list_directory(&dir_hash).await?;
+        let entries = self.list_directory(&dir_cid).await?;
         let new_entries: Vec<DirEntry> = entries
             .into_iter()
             .filter(|e| e.name != name)
@@ -1466,27 +1469,27 @@ impl<S: Store> HashTree<S> {
             })
             .collect();
 
-        let new_dir_hash = self.put_directory(new_entries, None).await?;
-        self.rebuild_path(root_hash, path, new_dir_hash).await
+        let new_dir_cid = self.put_directory(new_entries, None).await?;
+        self.rebuild_path(root, path, new_dir_cid).await
     }
 
     /// Rename an entry in a directory
-    /// Returns new root hash
+    /// Returns new root Cid
     pub async fn rename_entry(
         &self,
-        root_hash: &Hash,
+        root: &Cid,
         path: &[&str],
         old_name: &str,
         new_name: &str,
-    ) -> Result<Hash, HashTreeError> {
+    ) -> Result<Cid, HashTreeError> {
         if old_name == new_name {
-            return Ok(*root_hash);
+            return Ok(root.clone());
         }
 
-        let dir_hash = self.resolve_path_array(root_hash, path).await?;
-        let dir_hash = dir_hash.ok_or_else(|| HashTreeError::PathNotFound(path.join("/")))?;
+        let dir_cid = self.resolve_path_array(root, path).await?;
+        let dir_cid = dir_cid.ok_or_else(|| HashTreeError::PathNotFound(path.join("/")))?;
 
-        let entries = self.list_directory(&dir_hash).await?;
+        let entries = self.list_directory(&dir_cid).await?;
         let entry = entries
             .iter()
             .find(|e| e.name == old_name)
@@ -1513,80 +1516,83 @@ impl<S: Store> HashTree<S> {
             }))
             .collect();
 
-        let new_dir_hash = self.put_directory(new_entries, None).await?;
-        self.rebuild_path(root_hash, path, new_dir_hash).await
+        let new_dir_cid = self.put_directory(new_entries, None).await?;
+        self.rebuild_path(root, path, new_dir_cid).await
     }
 
     /// Move an entry to a different directory
-    /// Returns new root hash
+    /// Returns new root Cid
     pub async fn move_entry(
         &self,
-        root_hash: &Hash,
+        root: &Cid,
         source_path: &[&str],
         name: &str,
         target_path: &[&str],
-    ) -> Result<Hash, HashTreeError> {
-        let source_dir_hash = self.resolve_path_array(root_hash, source_path).await?;
-        let source_dir_hash = source_dir_hash.ok_or_else(|| HashTreeError::PathNotFound(source_path.join("/")))?;
+    ) -> Result<Cid, HashTreeError> {
+        let source_dir_cid = self.resolve_path_array(root, source_path).await?;
+        let source_dir_cid = source_dir_cid.ok_or_else(|| HashTreeError::PathNotFound(source_path.join("/")))?;
 
-        let source_entries = self.list_directory(&source_dir_hash).await?;
+        let source_entries = self.list_directory(&source_dir_cid).await?;
         let entry = source_entries
             .iter()
             .find(|e| e.name == name)
             .ok_or_else(|| HashTreeError::EntryNotFound(name.to_string()))?;
 
-        let entry_hash = entry.hash;
-        let entry_size = entry.size.unwrap_or(0);
+        let entry_cid = Cid {
+            hash: entry.hash,
+            key: entry.key,
+            size: entry.size.unwrap_or(0),
+        };
 
         // Remove from source
-        let new_root = self.remove_entry(root_hash, source_path, name).await?;
+        let new_root = self.remove_entry(root, source_path, name).await?;
 
         // Add to target
-        self.set_entry(&new_root, target_path, name, entry_hash, entry_size).await
+        self.set_entry(&new_root, target_path, name, &entry_cid).await
     }
 
-    async fn resolve_path_array(&self, root_hash: &Hash, path: &[&str]) -> Result<Option<Hash>, HashTreeError> {
+    async fn resolve_path_array(&self, root: &Cid, path: &[&str]) -> Result<Option<Cid>, HashTreeError> {
         if path.is_empty() {
-            return Ok(Some(*root_hash));
+            return Ok(Some(root.clone()));
         }
-        self.resolve_path(root_hash, &path.join("/")).await
+        self.resolve_path(root, &path.join("/")).await
     }
 
     async fn rebuild_path(
         &self,
-        root_hash: &Hash,
+        root: &Cid,
         path: &[&str],
-        new_child_hash: Hash,
-    ) -> Result<Hash, HashTreeError> {
+        new_child: Cid,
+    ) -> Result<Cid, HashTreeError> {
         if path.is_empty() {
-            return Ok(new_child_hash);
+            return Ok(new_child);
         }
 
-        let mut child_hash = new_child_hash;
+        let mut child_cid = new_child;
         let parts: Vec<&str> = path.to_vec();
 
         for i in (0..parts.len()).rev() {
             let child_name = parts[i];
             let parent_path = &parts[..i];
 
-            let parent_hash = if parent_path.is_empty() {
-                *root_hash
+            let parent_cid = if parent_path.is_empty() {
+                root.clone()
             } else {
-                self.resolve_path_array(root_hash, parent_path)
+                self.resolve_path_array(root, parent_path)
                     .await?
                     .ok_or_else(|| HashTreeError::PathNotFound(parent_path.join("/")))?
             };
 
-            let parent_entries = self.list_directory(&parent_hash).await?;
+            let parent_entries = self.list_directory(&parent_cid).await?;
             let new_parent_entries: Vec<DirEntry> = parent_entries
                 .into_iter()
                 .map(|e| {
                     if e.name == child_name {
                         DirEntry {
                             name: e.name,
-                            hash: child_hash,
-                            size: e.size,
-                            key: e.key,
+                            hash: child_cid.hash,
+                            size: Some(child_cid.size),
+                            key: child_cid.key,
                         }
                     } else {
                         DirEntry {
@@ -1599,10 +1605,10 @@ impl<S: Store> HashTree<S> {
                 })
                 .collect();
 
-            child_hash = self.put_directory(new_parent_entries, None).await?;
+            child_cid = self.put_directory(new_parent_entries, None).await?;
         }
 
-        Ok(child_hash)
+        Ok(child_cid)
     }
 
     // ============ UTILITY ============
@@ -1642,7 +1648,7 @@ struct WalkStackItem {
 }
 
 enum WalkStreamState<'a, S: Store> {
-    Init { hash: Hash, path: String, tree: &'a HashTree<S> },
+    Init { cid: Cid, path: String, tree: &'a HashTree<S> },
     Processing { stack: Vec<WalkStackItem>, tree: &'a HashTree<S> },
     Done,
 }
@@ -1750,7 +1756,7 @@ mod tests {
         let file1 = tree.put_blob(b"content1").await.unwrap();
         let file2 = tree.put_blob(b"content2").await.unwrap();
 
-        let dir_hash = tree
+        let dir_cid = tree
             .put_directory(
                 vec![
                     DirEntry::new("a.txt", file1).with_size(8),
@@ -1761,7 +1767,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = tree.list_directory(&dir_hash).await.unwrap();
+        let entries = tree.list_directory(&dir_cid).await.unwrap();
         assert_eq!(entries.len(), 2);
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"a.txt"));
@@ -1773,10 +1779,10 @@ mod tests {
         let (_store, tree) = make_tree();
 
         let file_hash = tree.put_blob(b"data").await.unwrap();
-        let dir_hash = tree.put_directory(vec![], None).await.unwrap();
+        let dir_cid = tree.put_directory(vec![], None).await.unwrap();
 
         assert!(!tree.is_directory(&file_hash).await.unwrap());
-        assert!(tree.is_directory(&dir_hash).await.unwrap());
+        assert!(tree.is_directory(&dir_cid.hash).await.unwrap());
     }
 
     #[tokio::test]
@@ -1789,12 +1795,12 @@ mod tests {
             None,
         ).await.unwrap();
         let root_dir = tree.put_directory(
-            vec![DirEntry::new("subdir", sub_dir)],
+            vec![DirEntry::new("subdir", sub_dir.hash)],
             None,
         ).await.unwrap();
 
         let resolved = tree.resolve_path(&root_dir, "subdir/file.txt").await.unwrap();
-        assert_eq!(resolved, Some(file_hash));
+        assert_eq!(resolved.map(|c| c.hash), Some(file_hash));
     }
 
     // ============ UNIFIED API TESTS ============

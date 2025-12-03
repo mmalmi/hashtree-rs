@@ -15,7 +15,7 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use hashtree::{sha256, HashTree, HashTreeConfig, DirEntry, Store};
+use hashtree::{sha256, HashTree, HashTreeConfig, DirEntry, Store, Cid};
 use hashtree_lmdb::LmdbBlobStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -325,12 +325,12 @@ impl GitStorage {
                 DirEntry::new("refs", refs_hash),
             ];
 
-            let root = tree
+            let root_cid = tree
                 .put_directory(root_entries, None)
                 .await
                 .map_err(|e| Error::StorageError(format!("build tree: {}", e)))?;
 
-            Ok::<[u8; 32], Error>(root)
+            Ok::<[u8; 32], Error>(root_cid.hash)
         })?;
 
         self.state.write().map_err(|e| Error::StorageError(format!("lock: {}", e)))?.root_hash = Some(root_hash);
@@ -409,6 +409,7 @@ async fn build_objects_dir<S: Store>(
     tree
         .put_directory(entries, None)
         .await
+        .map(|cid| cid.hash)
         .map_err(|e| Error::StorageError(format!("put objects dir: {}", e)))
 }
 
@@ -458,11 +459,11 @@ async fn build_refs_dir<S: Store>(
                     .map_err(|e| Error::StorageError(format!("put ref: {}", e)))?;
                 cat_entries.push(DirEntry::new(name, hash).with_size(value.len() as u64));
             }
-            let cat_hash = tree
+            let cat_cid = tree
                 .put_directory(cat_entries, None)
                 .await
                 .map_err(|e| Error::StorageError(format!("put {} dir: {}", category, e)))?;
-            ref_entries.push(DirEntry::new(category, cat_hash));
+            ref_entries.push(DirEntry::new(category, cat_cid.hash));
         }
     }
 
@@ -478,6 +479,7 @@ async fn build_refs_dir<S: Store>(
     tree
         .put_directory(ref_entries, None)
         .await
+        .map(|cid| cid.hash)
         .map_err(|e| Error::StorageError(format!("put refs dir: {}", e)))
 }
 
@@ -488,9 +490,10 @@ async fn load_tree_recursive<S: Store>(
     objects: &mut HashMap<String, Vec<u8>>,
     refs: &mut HashMap<String, String>,
 ) -> Result<()> {
-    // Walk the entire tree
+    // Walk the entire tree (public mode - no encryption key)
+    let root_cid = Cid::public(root, 0);
     let entries = tree
-        .walk(&root, "")
+        .walk(&root_cid, "")
         .await
         .map_err(|e| Error::StorageError(format!("walk tree: {}", e)))?;
 

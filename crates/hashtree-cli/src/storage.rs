@@ -267,10 +267,10 @@ impl HashtreeStore {
                 }
             }
 
-            let hash = tree.put_directory(entries, None).await
+            let cid = tree.put_directory(entries, None).await
                 .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))?;
 
-            dir_hashes.insert(dir_path, hash);
+            dir_hashes.insert(dir_path, cid.hash);
         }
 
         // Return root hash
@@ -677,8 +677,9 @@ impl HashtreeStore {
                 return Ok(None);
             }
 
-            // Get directory entries
-            let tree_entries = tree.list_directory(&hash).await
+            // Get directory entries (public Cid - no encryption key)
+            let cid = hashtree::Cid::public(hash, 0);
+            let tree_entries = tree.list_directory(&cid).await
                 .map_err(|e| anyhow::anyhow!("Failed to list directory: {}", e))?;
 
             let entries: Vec<DirEntry> = tree_entries.into_iter().map(|e| DirEntry {
