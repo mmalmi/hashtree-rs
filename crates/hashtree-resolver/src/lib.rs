@@ -39,3 +39,7 @@ mod traits;
 pub mod nostr;
 
 pub use traits::*;
+
+// Re-export nostr-sdk types for use in NostrResolverConfig
+#[cfg(feature = "nostr")]
+pub use nostr_sdk::prelude::{Keys, ToBech32};

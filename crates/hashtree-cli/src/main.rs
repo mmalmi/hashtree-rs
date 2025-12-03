@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   htree start [--addr 127.0.0.1:8080]
-//!   htree add <path> [--only-hash]
+//!   htree add <path> [--only-hash] [--public] [--no-ignore] [--publish <ref_name>]
 //!   htree get <cid> [-o output]
 //!   htree cat <cid>
 //!   htree pins
@@ -11,14 +11,19 @@
 //!   htree info <cid>
 //!   htree stats
 //!   htree gc
+//!   htree publish <ref_name> <hash> [--key <key>]
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, parse_npub, pubkey_bytes};
-use hashtree_cli::{init_nostrdb_at, spawn_relay_thread, Config, GitStorage, HashtreeServer, HashtreeStore, RelayConfig};
+use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
+use hashtree_cli::{
+    init_nostrdb_at, spawn_relay_thread, Config, GitStorage, HashtreeServer, HashtreeStore,
+    NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RelayConfig, RootResolver,
+};
 use nostr::nips::nip19::ToBech32;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "htree")]
@@ -51,6 +56,9 @@ enum Commands {
         /// Include files ignored by .gitignore (default: respect .gitignore)
         #[arg(long)]
         no_ignore: bool,
+        /// Publish to Nostr under this ref name (e.g., "mydata" -> npub.../mydata)
+        #[arg(long)]
+        publish: Option<String>,
     },
     /// Get/download content by CID
     Get {
@@ -86,6 +94,16 @@ enum Commands {
     Stats,
     /// Run garbage collection
     Gc,
+    /// Publish a hash to Nostr under a ref name
+    Publish {
+        /// The ref name to publish under (e.g., "mydata" -> npub.../mydata)
+        ref_name: String,
+        /// The hash to publish (hex encoded)
+        hash: String,
+        /// Optional decryption key (hex encoded, for encrypted content)
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -214,7 +232,7 @@ async fn main() -> Result<()> {
             // Shutdown relay thread
             relay_handle.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        Commands::Add { path, only_hash, public, no_ignore } => {
+        Commands::Add { path, only_hash, public, no_ignore, publish } => {
             let is_dir = path.is_dir();
 
             if only_hash {
@@ -250,10 +268,12 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Store in local hashtree
-                use hashtree::{nhash_encode, nhash_encode_full, NHashData, from_hex, key_from_hex};
+                use hashtree::{nhash_encode, nhash_encode_full, NHashData, from_hex, key_from_hex, Cid};
 
                 let store = HashtreeStore::new(&cli.data_dir)?;
-                if public {
+
+                // Store and capture hash/key for potential publishing
+                let (hash_hex, key_hex): (String, Option<String>) = if public {
                     let hash_hex = if is_dir {
                         store.upload_dir_with_options(&path, !no_ignore)
                             .context("Failed to add directory")?
@@ -267,6 +287,7 @@ async fn main() -> Result<()> {
                     println!("added {}", path.display());
                     println!("  nhash: {}", nhash);
                     println!("  hash:  {}", hash_hex);
+                    (hash_hex, None)
                 } else {
                     let cid_str = if is_dir {
                         store.upload_dir_encrypted_with_options(&path, !no_ignore)
@@ -294,9 +315,62 @@ async fn main() -> Result<()> {
                     println!("added {}", path.display());
                     println!("  nhash: {}", nhash);
                     println!("  hash:  {}", hash_hex);
-                    if let Some(k) = key_hex {
+                    if let Some(ref k) = key_hex {
                         println!("  key:   {}", k);
                     }
+                    (hash_hex, key_hex)
+                };
+
+                // Publish to Nostr if --publish was specified
+                if let Some(ref_name) = publish {
+                    // Load config for relay list
+                    let config = Config::load()?;
+
+                    // Ensure nsec exists (generate if needed)
+                    let (nsec_str, was_generated) = ensure_nsec_string()?;
+
+                    // Create Keys using nostr-sdk's version (via NostrKeys re-export)
+                    let keys = NostrKeys::parse(&nsec_str)
+                        .context("Failed to parse nsec")?;
+                    let npub = NostrToBech32::to_bech32(&keys.public_key())
+                        .context("Failed to encode npub")?;
+
+                    if was_generated {
+                        println!("  identity: {} (new)", npub);
+                    }
+
+                    // Create resolver config with secret key for publishing
+                    let resolver_config = NostrResolverConfig {
+                        relays: config.nostr.relays.clone(),
+                        resolve_timeout: Duration::from_secs(5),
+                        secret_key: Some(keys),
+                    };
+
+                    // Create resolver
+                    let resolver = NostrRootResolver::new(resolver_config).await
+                        .context("Failed to create Nostr resolver")?;
+
+                    // Build Cid from computed hash
+                    let hash = from_hex(&hash_hex).context("Invalid hash")?;
+                    let key = key_hex.as_ref().map(|k| key_from_hex(k)).transpose()
+                        .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
+                    let cid = Cid { hash, key, size: 0 };
+
+                    // Build Nostr key: "npub.../ref_name"
+                    let nostr_key = format!("{}/{}", npub, ref_name);
+
+                    // Publish
+                    match resolver.publish(&nostr_key, &cid).await {
+                        Ok(_) => {
+                            println!("  published: {}", nostr_key);
+                        }
+                        Err(e) => {
+                            eprintln!("  publish failed: {}", e);
+                        }
+                    }
+
+                    // Clean up
+                    let _ = resolver.stop().await;
                 }
             }
         }
@@ -433,6 +507,71 @@ async fn main() -> Result<()> {
             println!("Freed {} bytes ({:.2} KB)",
                 gc_stats.freed_bytes,
                 gc_stats.freed_bytes as f64 / 1024.0);
+        }
+        Commands::Publish { ref_name, hash, key } => {
+            use hashtree::{from_hex, key_from_hex, Cid};
+
+            // Load config for relay list
+            let config = Config::load()?;
+
+            // Ensure nsec exists (generate if needed)
+            let (nsec_str, was_generated) = ensure_nsec_string()?;
+
+            // Create Keys using nostr-sdk's version
+            let keys = NostrKeys::parse(&nsec_str)
+                .context("Failed to parse nsec")?;
+            let npub = NostrToBech32::to_bech32(&keys.public_key())
+                .context("Failed to encode npub")?;
+
+            if was_generated {
+                println!("Identity: {} (new)", npub);
+            }
+
+            // Parse hash and optional key
+            let hash_bytes = from_hex(&hash)
+                .context("Invalid hash (expected hex)")?;
+            let key_bytes = key.as_ref()
+                .map(|k| key_from_hex(k))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
+
+            let cid = Cid {
+                hash: hash_bytes,
+                key: key_bytes,
+                size: 0,
+            };
+
+            // Create resolver config with secret key for publishing
+            let resolver_config = NostrResolverConfig {
+                relays: config.nostr.relays.clone(),
+                resolve_timeout: Duration::from_secs(5),
+                secret_key: Some(keys),
+            };
+
+            // Create resolver
+            let resolver = NostrRootResolver::new(resolver_config).await
+                .context("Failed to create Nostr resolver")?;
+
+            // Build Nostr key: "npub.../ref_name"
+            let nostr_key = format!("{}/{}", npub, ref_name);
+
+            // Publish
+            match resolver.publish(&nostr_key, &cid).await {
+                Ok(_) => {
+                    println!("Published: {}", nostr_key);
+                    println!("  hash: {}", hash);
+                    if let Some(k) = key {
+                        println!("  key:  {}", k);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Publish failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+
+            // Clean up
+            let _ = resolver.stop().await;
         }
     }
 

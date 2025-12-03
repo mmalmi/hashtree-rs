@@ -10,7 +10,7 @@ pub use hashtree_relay::{
     RelayThreadHandle, SocialGraphStats, DEFAULT_RELAYS,
 };
 pub use hashtree_resolver::nostr::{NostrRootResolver, NostrResolverConfig};
-pub use hashtree_resolver::{ResolverEntry, ResolverError, RootResolver};
+pub use hashtree_resolver::{Keys as NostrKeys, ResolverEntry, ResolverError, RootResolver, ToBech32 as NostrToBech32};
 pub use server::HashtreeServer;
 pub use storage::HashtreeStore;
 pub use webrtc::{ContentStore, DataMessage, WebRTCConfig, WebRTCManager, PeerId};

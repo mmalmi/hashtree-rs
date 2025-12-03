@@ -275,6 +275,23 @@ pub fn read_nsec() -> Result<Keys> {
     Ok(Keys::new(secret_key))
 }
 
+/// Get nsec string, ensuring it exists (generate if needed)
+/// Returns (nsec_string, was_generated)
+pub fn ensure_nsec_string() -> Result<(String, bool)> {
+    let nsec_path = get_nsec_path();
+
+    if nsec_path.exists() {
+        let nsec_str = fs::read_to_string(&nsec_path)
+            .context("Failed to read nsec file")?;
+        Ok((nsec_str.trim().to_string(), false))
+    } else {
+        let keys = generate_nsec()?;
+        let nsec = keys.secret_key().to_bech32()
+            .context("Failed to encode nsec")?;
+        Ok((nsec, true))
+    }
+}
+
 /// Generate new nsec and save to file
 pub fn generate_nsec() -> Result<Keys> {
     let nsec_path = get_nsec_path();
