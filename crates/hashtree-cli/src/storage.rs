@@ -495,6 +495,7 @@ impl HashtreeStore {
     }
 
     /// Get file content by hash (hex)
+    /// Returns raw bytes (caller handles decryption if needed)
     pub fn get_file(&self, hash_hex: &str) -> Result<Option<Vec<u8>>> {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
