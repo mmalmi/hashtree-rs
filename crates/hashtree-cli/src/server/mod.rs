@@ -87,6 +87,9 @@ impl HashtreeServer {
             .route("/", get(handlers::serve_root))
             // Nostr resolver endpoints - resolve npub/treename to content
             .route("/n/:pubkey/:treename", get(handlers::resolve_and_serve))
+            // Direct npub/nhash routes (cleaner URLs without /n/ prefix)
+            .route("/npub1:rest", get(handlers::serve_npub))
+            .route("/nhash1:rest", get(handlers::serve_nhash))
             // Blossom endpoints (BUD-01, BUD-02)
             .route("/:id", get(handlers::serve_content_or_blob)
                 .head(blossom::head_blob)

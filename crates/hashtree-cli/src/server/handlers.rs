@@ -6,7 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use hashtree::to_hex;
+use hashtree::{nhash_decode, to_hex};
 use hashtree_resolver::{nostr::{NostrRootResolver, NostrResolverConfig}, RootResolver};
 use serde_json::json;
 use std::time::Duration;
@@ -244,6 +244,92 @@ pub async fn serve_content_or_blob(
         .body(Body::from("Not found"))
         .unwrap()
         .into_response()
+}
+
+/// Serve content by nhash (bech32 encoded hash)
+/// Route: /nhash1... (the "nhash1" prefix is matched by the route, :rest captures the remainder)
+pub async fn serve_nhash(
+    State(state): State<AppState>,
+    Path(rest): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Reconstruct full nhash (route strips the prefix)
+    let nhash = format!("nhash1{}", rest);
+
+    match nhash_decode(&nhash) {
+        Ok(nhash_data) => {
+            let hash_hex = to_hex(&nhash_data.hash);
+            // TODO: handle decryption key if present in nhash_data.decrypt_key
+            serve_content_internal(&state, &hash_hex, headers).await
+        }
+        Err(e) => {
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(format!("Invalid nhash: {}", e)))
+                .unwrap()
+                .into_response()
+        }
+    }
+}
+
+/// Serve content by npub/ref_name (Nostr resolver)
+/// Route: /npub1... (the "npub1" prefix is matched by the route, :rest captures pubkey remainder + /ref)
+pub async fn serve_npub(
+    State(state): State<AppState>,
+    Path(rest): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Reconstruct full key: "npub1" + rest (e.g., "abc.../mydata")
+    let key = format!("npub1{}", rest);
+
+    // Validate format: must have a / for ref name
+    if !key.contains('/') {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(Body::from("Missing ref name: use /npub1.../ref_name"))
+            .unwrap()
+            .into_response();
+    }
+
+    let resolver = match NostrRootResolver::new(resolver_config()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(format!("Failed to create resolver: {}", e)))
+                .unwrap()
+                .into_response();
+        }
+    };
+
+    match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
+        Ok(Ok(cid)) => {
+            let hash_hex = to_hex(&cid.hash);
+            let _ = resolver.stop().await;
+            serve_content_internal(&state, &hash_hex, headers).await
+        }
+        Ok(Err(e)) => {
+            let _ = resolver.stop().await;
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(format!("Resolution failed: {}", e)))
+                .unwrap()
+                .into_response()
+        }
+        Err(_) => {
+            let _ = resolver.stop().await;
+            Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from("Resolution timeout"))
+                .unwrap()
+                .into_response()
+        }
+    }
 }
 
 pub async fn upload_file(
