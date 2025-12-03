@@ -3,7 +3,7 @@ use heed::{Database, EnvOpenOptions};
 use heed::types::*;
 use hashtree_lmdb::LmdbBlobStore;
 use hashtree::{
-    HashTree, HashTreeConfig,
+    HashTree, HashTreeConfig, Cid,
     sha256, to_hex, from_hex, Hash, TreeNode, DirEntry as HashTreeDirEntry,
 };
 use hashtree::store::Store;
@@ -150,18 +150,18 @@ impl HashtreeStore {
         self.upload_dir_with_options(dir_path, true)
     }
 
-    /// Upload a directory with options
+    /// Upload a directory with options (public mode - no encryption)
     pub fn upload_dir_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
 
         let store = Arc::clone(&self.blobs);
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
-        let root_hash = sync_block_on(async {
+        let root_cid = sync_block_on(async {
             self.upload_dir_recursive(&tree, dir_path, dir_path, respect_gitignore).await
         }).context("Failed to upload directory")?;
 
-        let root_hex = to_hex(&root_hash);
+        let root_hex = to_hex(&root_cid.hash);
 
         let mut wtxn = self.env.write_txn()?;
         self.pins.put(&mut wtxn, &root_hex, &())?;
@@ -176,12 +176,12 @@ impl HashtreeStore {
         _root_path: &Path,
         current_path: &Path,
         respect_gitignore: bool,
-    ) -> Result<Hash> {
+    ) -> Result<Cid> {
         use ignore::WalkBuilder;
         use std::collections::HashMap;
 
-        // Build directory structure from flat file list
-        let mut dir_contents: HashMap<String, Vec<(String, Hash, u64)>> = HashMap::new();
+        // Build directory structure from flat file list - store full Cid with key
+        let mut dir_contents: HashMap<String, Vec<(String, Cid)>> = HashMap::new();
         dir_contents.insert(String::new(), Vec::new()); // Root
 
         let walker = WalkBuilder::new(current_path)
@@ -216,8 +216,7 @@ impl HashtreeStore {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
 
-                dir_contents.entry(parent).or_default()
-                    .push((name, cid.hash, cid.size));
+                dir_contents.entry(parent).or_default().push((name, cid));
             } else if path.is_dir() {
                 // Ensure directory entry exists
                 let dir_path = relative.to_string_lossy().to_string();
@@ -232,8 +231,8 @@ impl HashtreeStore {
     async fn build_directory_tree<S: Store>(
         &self,
         tree: &HashTree<S>,
-        dir_contents: &mut std::collections::HashMap<String, Vec<(String, Hash, u64)>>,
-    ) -> Result<Hash> {
+        dir_contents: &mut std::collections::HashMap<String, Vec<(String, Cid)>>,
+    ) -> Result<Cid> {
         // Sort directories by depth (deepest first) to build bottom-up
         let mut dirs: Vec<String> = dir_contents.keys().cloned().collect();
         dirs.sort_by(|a, b| {
@@ -242,17 +241,17 @@ impl HashtreeStore {
             depth_b.cmp(&depth_a) // Deepest first
         });
 
-        let mut dir_hashes: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
+        let mut dir_cids: std::collections::HashMap<String, Cid> = std::collections::HashMap::new();
 
         for dir_path in dirs {
             let files = dir_contents.get(&dir_path).cloned().unwrap_or_default();
 
             let mut entries: Vec<HashTreeDirEntry> = files.into_iter()
-                .map(|(name, hash, size)| HashTreeDirEntry::new(name, hash).with_size(size))
+                .map(|(name, cid)| HashTreeDirEntry::from_cid(name, &cid))
                 .collect();
 
             // Add subdirectory entries
-            for (subdir_path, hash) in &dir_hashes {
+            for (subdir_path, cid) in &dir_cids {
                 let parent = std::path::Path::new(subdir_path)
                     .parent()
                     .map(|p| p.to_string_lossy().to_string())
@@ -263,19 +262,19 @@ impl HashtreeStore {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    entries.push(HashTreeDirEntry::new(name, *hash));
+                    entries.push(HashTreeDirEntry::from_cid(name, cid));
                 }
             }
 
             let cid = tree.put_directory(entries, None).await
                 .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))?;
 
-            dir_hashes.insert(dir_path, cid.hash);
+            dir_cids.insert(dir_path, cid);
         }
 
-        // Return root hash
-        dir_hashes.get("")
-            .copied()
+        // Return root Cid
+        dir_cids.get("")
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("No root directory"))
     }
 
@@ -308,6 +307,7 @@ impl HashtreeStore {
     }
 
     /// Upload a directory with CHK encryption and options
+    /// Returns CID as "hash:key" format for encrypted directories
     pub fn upload_dir_encrypted_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
         let store = Arc::clone(&self.blobs);
@@ -315,17 +315,18 @@ impl HashtreeStore {
         // Use unified API with encryption enabled (default)
         let tree = HashTree::new(HashTreeConfig::new(store));
 
-        let root_hash = sync_block_on(async {
+        let root_cid = sync_block_on(async {
             self.upload_dir_recursive(&tree, dir_path, dir_path, respect_gitignore).await
         }).context("Failed to upload encrypted directory")?;
 
-        let root_hex = to_hex(&root_hash);
+        let cid_str = root_cid.to_string(); // Returns "hash:key" or "hash"
 
         let mut wtxn = self.env.write_txn()?;
-        self.pins.put(&mut wtxn, &root_hex, &())?;
+        // Pin by hash only (the key is for decryption, not identification)
+        self.pins.put(&mut wtxn, &to_hex(&root_cid.hash), &())?;
         wtxn.commit()?;
 
-        Ok(root_hex)
+        Ok(cid_str)
     }
 
     /// Get tree node by hash (hex)
