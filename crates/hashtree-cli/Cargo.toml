@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Hashtree daemon and CLI - content-addressed storage with P2P sync"
+default-run = "htree"
 
 [[bin]]
 name = "htree"
