@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use crate::codec::{decode_tree_node, is_directory_node, is_tree_node};
 use crate::store::Store;
-use crate::types::{to_hex, Hash, Link, TreeNode};
+use crate::types::{to_hex, Cid, Hash, Link, TreeNode};
+
+#[cfg(feature = "encryption")]
+use crate::crypto::{decrypt_chk, EncryptionKey};
 
 /// Tree entry for directory listings
 #[derive(Debug, Clone)]
@@ -78,7 +81,94 @@ impl<S: Store> TreeReader<S> {
         Ok(is_directory_node(&data))
     }
 
+    /// Read content by CID (handles both encrypted and public content)
+    ///
+    /// This is the unified read method that handles decryption automatically
+    /// when the CID contains an encryption key.
+    pub async fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>, ReaderError> {
+        if let Some(key) = cid.key {
+            self.get_encrypted(&cid.hash, &key).await
+        } else {
+            self.read_file(&cid.hash).await
+        }
+    }
+
+    /// Read encrypted content by hash and key (internal)
+    #[cfg(feature = "encryption")]
+    async fn get_encrypted(
+        &self,
+        hash: &Hash,
+        key: &EncryptionKey,
+    ) -> Result<Option<Vec<u8>>, ReaderError> {
+        let encrypted_data = match self.store.get(hash).await.map_err(|e| ReaderError::Store(e.to_string()))? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Decrypt the data
+        let decrypted = decrypt_chk(&encrypted_data, key)
+            .map_err(|e| ReaderError::Decryption(e.to_string()))?;
+
+        // Check if it's a tree node
+        if is_tree_node(&decrypted) {
+            let node = decode_tree_node(&decrypted)?;
+            let assembled = self.assemble_encrypted_chunks(&node).await?;
+            return Ok(Some(assembled));
+        }
+
+        // Single chunk data
+        Ok(Some(decrypted))
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    async fn get_encrypted(
+        &self,
+        _hash: &Hash,
+        _key: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, ReaderError> {
+        Err(ReaderError::Decryption("encryption feature not enabled".to_string()))
+    }
+
+    /// Assemble encrypted chunks from tree
+    #[cfg(feature = "encryption")]
+    async fn assemble_encrypted_chunks(&self, node: &TreeNode) -> Result<Vec<u8>, ReaderError> {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+
+        for link in &node.links {
+            let chunk_key = link.key.ok_or(ReaderError::MissingKey)?;
+
+            let encrypted_child = self
+                .store
+                .get(&link.hash)
+                .await
+                .map_err(|e| ReaderError::Store(e.to_string()))?
+                .ok_or_else(|| ReaderError::MissingChunk(to_hex(&link.hash)))?;
+
+            let decrypted = decrypt_chk(&encrypted_child, &chunk_key)
+                .map_err(|e| ReaderError::Decryption(e.to_string()))?;
+
+            if is_tree_node(&decrypted) {
+                // Intermediate tree node - recurse
+                let child_node = decode_tree_node(&decrypted)?;
+                let child_data = Box::pin(self.assemble_encrypted_chunks(&child_node)).await?;
+                parts.push(child_data);
+            } else {
+                // Leaf data chunk
+                parts.push(decrypted);
+            }
+        }
+
+        let total_len: usize = parts.iter().map(|p| p.len()).sum();
+        let mut result = Vec::with_capacity(total_len);
+        for part in parts {
+            result.extend_from_slice(&part);
+        }
+
+        Ok(result)
+    }
+
     /// Read a complete file (reassemble chunks if needed)
+    /// For unencrypted content only - use `get()` for unified access
     pub async fn read_file(&self, hash: &Hash) -> Result<Option<Vec<u8>>, ReaderError> {
         let data = match self.store.get(hash).await.map_err(|e| ReaderError::Store(e.to_string()))? {
             Some(d) => d,
@@ -96,7 +186,7 @@ impl<S: Store> TreeReader<S> {
         Ok(Some(assembled))
     }
 
-    /// Recursively assemble chunks from tree
+    /// Recursively assemble chunks from tree (unencrypted)
     async fn assemble_chunks(&self, node: &TreeNode) -> Result<Vec<u8>, ReaderError> {
         let mut parts: Vec<Vec<u8>> = Vec::new();
 
@@ -413,6 +503,10 @@ pub enum ReaderError {
     Codec(#[from] crate::codec::CodecError),
     #[error("Missing chunk: {0}")]
     MissingChunk(String),
+    #[error("Decryption error: {0}")]
+    Decryption(String),
+    #[error("Missing decryption key")]
+    MissingKey,
 }
 
 #[cfg(test)]
@@ -496,20 +590,21 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_small() {
         let store = make_store();
-        let builder = TreeBuilder::new(BuilderConfig::new(store.clone()));
+        // Use public() for tests that check raw data storage
+        let builder = TreeBuilder::new(BuilderConfig::new(store.clone()).public());
         let reader = TreeReader::new(store);
 
         let data = vec![1u8, 2, 3, 4, 5];
-        let file_result = builder.put_file(&data).await.unwrap();
+        let cid = builder.put(&data).await.unwrap();
 
-        let result = reader.read_file(&file_result.hash).await.unwrap();
+        let result = reader.read_file(&cid.hash).await.unwrap();
         assert_eq!(result, Some(data));
     }
 
     #[tokio::test]
     async fn test_read_file_chunked() {
         let store = make_store();
-        let config = BuilderConfig::new(store.clone()).with_chunk_size(100);
+        let config = BuilderConfig::new(store.clone()).with_chunk_size(100).public();
         let builder = TreeBuilder::new(config);
         let reader = TreeReader::new(store);
 
@@ -518,8 +613,8 @@ mod tests {
             data[i] = (i % 256) as u8;
         }
 
-        let file_result = builder.put_file(&data).await.unwrap();
-        let result = reader.read_file(&file_result.hash).await.unwrap();
+        let cid = builder.put(&data).await.unwrap();
+        let result = reader.read_file(&cid.hash).await.unwrap();
 
         assert_eq!(result, Some(data));
     }
@@ -648,13 +743,13 @@ mod tests {
     #[tokio::test]
     async fn test_verify_tree_valid() {
         let store = make_store();
-        let config = BuilderConfig::new(store.clone()).with_chunk_size(100);
+        let config = BuilderConfig::new(store.clone()).with_chunk_size(100).public();
         let builder = TreeBuilder::new(config);
 
         let data = vec![0u8; 350];
-        let file_result = builder.put_file(&data).await.unwrap();
+        let cid = builder.put(&data).await.unwrap();
 
-        let result = verify_tree(store, &file_result.hash).await.unwrap();
+        let result = verify_tree(store, &cid.hash).await.unwrap();
         assert!(result.valid);
         assert!(result.missing.is_empty());
     }
@@ -662,19 +757,19 @@ mod tests {
     #[tokio::test]
     async fn test_verify_tree_missing() {
         let store = make_store();
-        let config = BuilderConfig::new(store.clone()).with_chunk_size(100);
+        let config = BuilderConfig::new(store.clone()).with_chunk_size(100).public();
         let builder = TreeBuilder::new(config);
 
         let data = vec![0u8; 350];
-        let file_result = builder.put_file(&data).await.unwrap();
+        let cid = builder.put(&data).await.unwrap();
 
         // Delete one of the chunks
         let keys = store.keys();
-        if let Some(chunk_to_delete) = keys.iter().find(|k| **k != file_result.hash) {
+        if let Some(chunk_to_delete) = keys.iter().find(|k| **k != cid.hash) {
             store.delete(chunk_to_delete).await.unwrap();
         }
 
-        let result = verify_tree(store, &file_result.hash).await.unwrap();
+        let result = verify_tree(store, &cid.hash).await.unwrap();
         assert!(!result.valid);
         assert!(!result.missing.is_empty());
     }

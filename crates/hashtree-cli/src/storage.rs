@@ -70,7 +70,7 @@ impl HashtreeStore {
         Arc::clone(&self.blobs)
     }
 
-    /// Upload a file and return its hash (hex)
+    /// Upload a file and return its CID (public/unencrypted)
     pub fn upload_file<P: AsRef<Path>>(&self, file_path: P) -> Result<String> {
         let file_path = file_path.as_ref();
         let file_content = std::fs::read(file_path)?;
@@ -79,15 +79,15 @@ impl HashtreeStore {
         let content_sha256 = sha256(&file_content);
         let sha256_hex = to_hex(&content_sha256);
 
-        // Use hashtree to store the file (handles chunking if needed)
+        // Use hashtree to store the file (public mode - no encryption)
         let store = Arc::clone(&self.blobs);
-        let builder = TreeBuilder::new(BuilderConfig::new(store));
+        let builder = TreeBuilder::new(BuilderConfig::new(store).public());
 
-        let result = sync_block_on(async {
-            builder.put_file(&file_content).await
+        let cid = sync_block_on(async {
+            builder.put(&file_content).await
         }).context("Failed to store file")?;
 
-        let root_hex = to_hex(&result.hash);
+        let root_hex = to_hex(&cid.hash);
 
         let mut wtxn = self.env.write_txn()?;
 
@@ -186,9 +186,9 @@ impl HashtreeStore {
 
             if file_type.is_file() {
                 let content = std::fs::read(entry.path())?;
-                let result = builder.put_file(&content).await
+                let cid = builder.put(&content).await
                     .map_err(|e| anyhow::anyhow!("Failed to upload file {}: {}", name, e))?;
-                entries.push(HashTreeDirEntry::new(name, result.hash).with_size(result.size));
+                entries.push(HashTreeDirEntry::new(name, cid.hash).with_size(cid.size));
             } else if file_type.is_dir() {
                 let hash = Box::pin(self.upload_dir_recursive(builder, &entry.path())).await?;
                 entries.push(HashTreeDirEntry::new(name, hash));
@@ -201,42 +201,36 @@ impl HashtreeStore {
 
     /// Upload a file with CHK encryption, returns CID in format "hash:key"
     pub fn upload_file_encrypted<P: AsRef<Path>>(&self, file_path: P) -> Result<String> {
-        use hashtree::{put_file_encrypted, EncryptedTreeConfig, DEFAULT_CHUNK_SIZE};
-
         let file_path = file_path.as_ref();
         let file_content = std::fs::read(file_path)?;
 
+        // Use unified API with encryption enabled (default)
         let store = Arc::clone(&self.blobs);
-        let config = EncryptedTreeConfig {
-            store,
-            chunk_size: DEFAULT_CHUNK_SIZE,
-            max_links: 174,
-        };
+        let builder = TreeBuilder::new(BuilderConfig::new(store));
 
-        let result = sync_block_on(async {
-            put_file_encrypted(&config, &file_content).await
+        let cid = sync_block_on(async {
+            builder.put(&file_content).await
         }).map_err(|e| anyhow::anyhow!("Failed to encrypt file: {}", e))?;
 
-        // CID format: hash:key (both needed for decryption)
-        let cid = format!("{}:{}", to_hex(&result.hash), hashtree::crypto::key_to_hex(&result.key));
+        let cid_str = cid.to_string();
 
         let mut wtxn = self.env.write_txn()?;
-        // Pin using full CID (hash:key)
-        self.pins.put(&mut wtxn, &cid, &())?;
+        self.pins.put(&mut wtxn, &cid_str, &())?;
         wtxn.commit()?;
 
-        Ok(cid)
+        Ok(cid_str)
     }
 
-    /// Upload a directory with CHK encryption, returns CID in format "hash:key"
+    /// Upload a directory with CHK encryption, returns CID
     pub fn upload_dir_encrypted<P: AsRef<Path>>(&self, dir_path: P) -> Result<String> {
         let dir_path = dir_path.as_ref();
         let store = Arc::clone(&self.blobs);
 
-        // For now, encrypt each file individually and return a list
-        // TODO: Implement encrypted directory nodes
+        // Use unified API with encryption enabled (default)
+        let builder = TreeBuilder::new(BuilderConfig::new(store));
+
         let result = sync_block_on(async {
-            self.upload_dir_encrypted_recursive(&store, dir_path).await
+            self.upload_dir_encrypted_recursive(&builder, dir_path).await
         })?;
 
         let mut wtxn = self.env.write_txn()?;
@@ -246,13 +240,11 @@ impl HashtreeStore {
         Ok(result)
     }
 
-    async fn upload_dir_encrypted_recursive(
+    async fn upload_dir_encrypted_recursive<S: Store>(
         &self,
-        store: &Arc<hashtree_lmdb::LmdbBlobStore>,
+        builder: &TreeBuilder<S>,
         path: &Path,
     ) -> Result<String> {
-        use hashtree::{put_file_encrypted, EncryptedTreeConfig, DEFAULT_CHUNK_SIZE};
-
         let mut file_cids = Vec::new();
 
         for entry in std::fs::read_dir(path)? {
@@ -262,17 +254,11 @@ impl HashtreeStore {
 
             if file_type.is_file() {
                 let content = std::fs::read(entry.path())?;
-                let config = EncryptedTreeConfig {
-                    store: Arc::clone(store),
-                    chunk_size: DEFAULT_CHUNK_SIZE,
-                    max_links: 174,
-                };
-                let result = put_file_encrypted(&config, &content).await
+                let cid = builder.put(&content).await
                     .map_err(|e| anyhow::anyhow!("Failed to encrypt file {}: {}", name, e))?;
-                let cid = format!("{}:{}", to_hex(&result.hash), hashtree::crypto::key_to_hex(&result.key));
-                file_cids.push((name, cid));
+                file_cids.push((name, cid.to_string()));
             } else if file_type.is_dir() {
-                let cid = Box::pin(self.upload_dir_encrypted_recursive(store, &entry.path())).await?;
+                let cid = Box::pin(self.upload_dir_encrypted_recursive(builder, &entry.path())).await?;
                 file_cids.push((name, cid));
             }
         }

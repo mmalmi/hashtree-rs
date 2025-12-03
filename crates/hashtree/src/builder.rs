@@ -4,6 +4,7 @@
 //! - Large directories are split into sub-trees
 //! - Supports streaming appends
 //! - Supports CBOR or binary (BEP52-style) merkle algorithms
+//! - Encryption enabled by default (CHK - Content Hash Key)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +12,10 @@ use std::sync::Arc;
 use crate::codec::encode_and_hash;
 use crate::hash::sha256;
 use crate::store::Store;
-use crate::types::{DirEntry, Hash, Link, TreeNode};
+use crate::types::{Cid, DirEntry, Hash, Link, TreeNode};
+
+#[cfg(feature = "encryption")]
+use crate::crypto::{encrypt_chk, EncryptionKey};
 
 /// Default chunk size: 256KB
 pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
@@ -39,6 +43,8 @@ pub struct BuilderConfig<S: Store> {
     pub chunk_size: usize,
     pub max_links: usize,
     pub merkle_algorithm: MerkleAlgorithm,
+    /// Whether to encrypt content (default: true when encryption feature enabled)
+    pub encrypted: bool,
 }
 
 impl<S: Store> BuilderConfig<S> {
@@ -48,6 +54,10 @@ impl<S: Store> BuilderConfig<S> {
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_links: DEFAULT_MAX_LINKS,
             merkle_algorithm: MerkleAlgorithm::default(),
+            #[cfg(feature = "encryption")]
+            encrypted: true,
+            #[cfg(not(feature = "encryption"))]
+            encrypted: false,
         }
     }
 
@@ -63,6 +73,19 @@ impl<S: Store> BuilderConfig<S> {
 
     pub fn with_merkle_algorithm(mut self, algorithm: MerkleAlgorithm) -> Self {
         self.merkle_algorithm = algorithm;
+        self
+    }
+
+    /// Disable encryption (store content publicly)
+    pub fn public(mut self) -> Self {
+        self.encrypted = false;
+        self
+    }
+
+    /// Enable encryption (CHK - Content Hash Key)
+    #[cfg(feature = "encryption")]
+    pub fn encrypted(mut self) -> Self {
+        self.encrypted = true;
         self
     }
 }
@@ -84,6 +107,7 @@ pub struct TreeBuilder<S: Store> {
     chunk_size: usize,
     max_links: usize,
     merkle_algorithm: MerkleAlgorithm,
+    encrypted: bool,
 }
 
 impl<S: Store> TreeBuilder<S> {
@@ -93,10 +117,16 @@ impl<S: Store> TreeBuilder<S> {
             chunk_size: config.chunk_size,
             max_links: config.max_links,
             merkle_algorithm: config.merkle_algorithm,
+            encrypted: config.encrypted,
         }
     }
 
-    /// Store a blob directly (small data)
+    /// Check if encryption is enabled
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    /// Store a blob directly (small data, no encryption)
     /// Returns the content hash
     pub async fn put_blob(&self, data: &[u8]) -> Result<Hash, BuilderError> {
         let hash = sha256(data);
@@ -107,63 +137,128 @@ impl<S: Store> TreeBuilder<S> {
         Ok(hash)
     }
 
+    /// Store a chunk with optional encryption
+    /// Returns (hash, optional_key) where hash is of stored data
+    #[cfg(feature = "encryption")]
+    async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<EncryptionKey>), BuilderError> {
+        if self.encrypted {
+            let (encrypted, key) = encrypt_chk(data)
+                .map_err(|e| BuilderError::Encryption(e.to_string()))?;
+            let hash = sha256(&encrypted);
+            self.store
+                .put(hash, encrypted)
+                .await
+                .map_err(|e| BuilderError::Store(e.to_string()))?;
+            Ok((hash, Some(key)))
+        } else {
+            let hash = self.put_blob(data).await?;
+            Ok((hash, None))
+        }
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<[u8; 32]>), BuilderError> {
+        let hash = self.put_blob(data).await?;
+        Ok((hash, None))
+    }
+
     /// Store a file, chunking if necessary
-    /// Returns PutFileResult with root hash, size, and leaf hashes
-    pub async fn put_file(&self, data: &[u8]) -> Result<PutFileResult, BuilderError> {
+    /// Returns Cid with hash, optional encryption key, and size
+    ///
+    /// When encryption is enabled (default), each chunk is CHK encrypted
+    /// and the result contains the decryption key.
+    pub async fn put(&self, data: &[u8]) -> Result<Cid, BuilderError> {
         let size = data.len() as u64;
 
-        // Small file - store as single blob
+        // Small file - store as single chunk
         if data.len() <= self.chunk_size {
-            let hash = self.put_blob(data).await?;
-            return Ok(PutFileResult {
-                hash,
-                size,
-                leaf_hashes: vec![hash],
-            });
+            let (hash, key) = self.put_chunk_internal(data).await?;
+            return Ok(Cid { hash, key, size });
         }
 
         // Large file - chunk it
-        let mut chunk_hashes: Vec<Hash> = Vec::new();
+        let mut links: Vec<Link> = Vec::new();
         let mut offset = 0;
 
         while offset < data.len() {
             let end = (offset + self.chunk_size).min(data.len());
             let chunk = &data[offset..end];
-            let hash = self.put_blob(chunk).await?;
-            chunk_hashes.push(hash);
+            let chunk_size = chunk.len() as u64;
+            let (hash, key) = self.put_chunk_internal(chunk).await?;
+            links.push(Link {
+                hash,
+                name: None,
+                size: Some(chunk_size),
+                key,
+            });
             offset = end;
         }
 
-        // Build tree from chunks using selected algorithm
-        let root_hash = match self.merkle_algorithm {
-            MerkleAlgorithm::Binary => self.build_binary_tree(&chunk_hashes),
-            MerkleAlgorithm::Cbor => {
-                let chunks: Vec<Link> = chunk_hashes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &hash)| {
-                        let chunk_size = if i < chunk_hashes.len() - 1 {
-                            self.chunk_size as u64
-                        } else {
-                            (data.len() - i * self.chunk_size) as u64
-                        };
-                        Link {
-                            hash,
-                            name: None,
-                            size: Some(chunk_size),
-                            key: None,
-                        }
-                    })
-                    .collect();
-                self.build_tree(chunks, Some(size)).await?
-            }
-        };
+        // Build tree from chunks
+        let (root_hash, root_key) = self.build_tree_internal(links, Some(size)).await?;
 
-        Ok(PutFileResult {
-            hash: root_hash,
-            size,
-            leaf_hashes: chunk_hashes,
-        })
+        Ok(Cid { hash: root_hash, key: root_key, size })
+    }
+
+    /// Build tree and return (hash, optional_key)
+    /// When encrypted, tree nodes are also CHK encrypted
+    async fn build_tree_internal(
+        &self,
+        links: Vec<Link>,
+        total_size: Option<u64>,
+    ) -> Result<(Hash, Option<[u8; 32]>), BuilderError> {
+        // Single link with matching size - return directly
+        if links.len() == 1 {
+            if let Some(ts) = total_size {
+                if links[0].size == Some(ts) {
+                    return Ok((links[0].hash, links[0].key));
+                }
+            }
+        }
+
+        if links.len() <= self.max_links {
+            let node = TreeNode {
+                links,
+                total_size,
+                metadata: None,
+            };
+            let (data, _) = encode_and_hash(&node)?;
+
+            #[cfg(feature = "encryption")]
+            if self.encrypted {
+                let (encrypted, key) = encrypt_chk(&data)
+                    .map_err(|e| BuilderError::Encryption(e.to_string()))?;
+                let hash = sha256(&encrypted);
+                self.store
+                    .put(hash, encrypted)
+                    .await
+                    .map_err(|e| BuilderError::Store(e.to_string()))?;
+                return Ok((hash, Some(key)));
+            }
+
+            // Unencrypted path
+            let hash = sha256(&data);
+            self.store
+                .put(hash, data)
+                .await
+                .map_err(|e| BuilderError::Store(e.to_string()))?;
+            return Ok((hash, None));
+        }
+
+        // Too many links - create subtrees
+        let mut sub_links = Vec::new();
+        for batch in links.chunks(self.max_links) {
+            let batch_size: u64 = batch.iter().filter_map(|l| l.size).sum();
+            let (hash, key) = Box::pin(self.build_tree_internal(batch.to_vec(), Some(batch_size))).await?;
+            sub_links.push(Link {
+                hash,
+                name: None,
+                size: Some(batch_size),
+                key,
+            });
+        }
+
+        Box::pin(self.build_tree_internal(sub_links, total_size)).await
     }
 
     /// Build a binary merkle tree (BEP52 style)
@@ -624,6 +719,8 @@ pub enum BuilderError {
     Store(String),
     #[error("Codec error: {0}")]
     Codec(#[from] crate::codec::CodecError),
+    #[error("Encryption error: {0}")]
+    Encryption(String),
 }
 
 /// Hash two 32-byte values together
@@ -680,22 +777,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_file_small() {
+    async fn test_put_small() {
         let store = make_store();
-        let builder = TreeBuilder::new(BuilderConfig::new(store.clone()));
+        // Use public() to disable encryption for this test
+        let builder = TreeBuilder::new(BuilderConfig::new(store.clone()).public());
 
         let data = vec![1u8, 2, 3, 4, 5];
-        let result = builder.put_file(&data).await.unwrap();
+        let cid = builder.put(&data).await.unwrap();
 
-        assert_eq!(result.size, 5);
-        let retrieved = store.get(&result.hash).await.unwrap();
+        assert_eq!(cid.size, 5);
+        assert!(cid.key.is_none()); // public content
+        let retrieved = store.get(&cid.hash).await.unwrap();
         assert_eq!(retrieved, Some(data));
     }
 
     #[tokio::test]
-    async fn test_put_file_chunked() {
+    async fn test_put_chunked() {
         let store = make_store();
-        let config = BuilderConfig::new(store.clone()).with_chunk_size(1024);
+        let config = BuilderConfig::new(store.clone()).with_chunk_size(1024).public();
         let builder = TreeBuilder::new(config);
 
         let mut data = vec![0u8; 1024 * 2 + 100];
@@ -703,8 +802,8 @@ mod tests {
             data[i] = (i % 256) as u8;
         }
 
-        let result = builder.put_file(&data).await.unwrap();
-        assert_eq!(result.size, data.len() as u64);
+        let cid = builder.put(&data).await.unwrap();
+        assert_eq!(cid.size, data.len() as u64);
 
         // Verify store has multiple items (chunks + tree node)
         assert!(store.size() > 1);
@@ -854,5 +953,82 @@ mod tests {
         let (hash, size) = stream.finalize().await.unwrap();
         assert_eq!(size, 0);
         assert!(store.has(&hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_unified_put_public() {
+        let store = make_store();
+        // Use .public() to disable encryption
+        let config = BuilderConfig::new(store.clone()).public();
+        let builder = TreeBuilder::new(config);
+
+        let data = b"Hello, World!";
+        let cid = builder.put(data).await.unwrap();
+
+        assert_eq!(cid.size, data.len() as u64);
+        assert!(cid.key.is_none()); // No encryption key for public content
+        assert!(store.has(&cid.hash).await.unwrap());
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn test_unified_put_encrypted() {
+        use crate::reader::TreeReader;
+
+        let store = make_store();
+        // Default config has encryption enabled
+        let config = BuilderConfig::new(store.clone());
+        let builder = TreeBuilder::new(config);
+
+        let data = b"Hello, encrypted world!";
+        let cid = builder.put(data).await.unwrap();
+
+        assert_eq!(cid.size, data.len() as u64);
+        assert!(cid.key.is_some()); // Has encryption key
+
+        // Verify we can read it back
+        let reader = TreeReader::new(store);
+        let retrieved = reader.get(&cid).await.unwrap().unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn test_unified_put_encrypted_chunked() {
+        use crate::reader::TreeReader;
+
+        let store = make_store();
+        let config = BuilderConfig::new(store.clone()).with_chunk_size(100);
+        let builder = TreeBuilder::new(config);
+
+        // Data larger than chunk size
+        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        let cid = builder.put(&data).await.unwrap();
+
+        assert_eq!(cid.size, data.len() as u64);
+        assert!(cid.key.is_some());
+
+        // Verify roundtrip
+        let reader = TreeReader::new(store);
+        let retrieved = reader.get(&cid).await.unwrap().unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn test_cid_deterministic() {
+        let store = make_store();
+        let config = BuilderConfig::new(store.clone());
+        let builder = TreeBuilder::new(config);
+
+        let data = b"Same content produces same CID";
+
+        let cid1 = builder.put(data).await.unwrap();
+        let cid2 = builder.put(data).await.unwrap();
+
+        // CHK: same content = same hash AND same key
+        assert_eq!(cid1.hash, cid2.hash);
+        assert_eq!(cid1.key, cid2.key);
+        assert_eq!(cid1.to_string(), cid2.to_string());
     }
 }

@@ -153,25 +153,26 @@ async fn test_file_vectors() {
         let data = hex::decode(vector.input.data.as_ref().unwrap()).unwrap();
 
         // Use small chunk size to match TS chunked file test
+        // Use public() since interop vectors are for unencrypted content
         let store = Arc::new(MemoryStore::new());
         let config = if vector.name == "chunked_file" {
-            BuilderConfig::new(store.clone()).with_chunk_size(10)
+            BuilderConfig::new(store.clone()).with_chunk_size(10).public()
         } else {
-            BuilderConfig::new(store.clone())
+            BuilderConfig::new(store.clone()).public()
         };
         let builder = TreeBuilder::new(config);
 
-        let result = builder.put_file(&data).await.unwrap();
+        let cid = builder.put(&data).await.unwrap();
 
         assert_eq!(
-            to_hex(&result.hash),
+            to_hex(&cid.hash),
             vector.expected.hash,
             "File hash mismatch for {}",
             vector.name
         );
 
         if let Some(expected_size) = vector.expected.size {
-            assert_eq!(result.size, expected_size, "File size mismatch for {}", vector.name);
+            assert_eq!(cid.size, expected_size, "File size mismatch for {}", vector.name);
         }
 
         println!("✓ {}: hash and size match", vector.name);
@@ -201,6 +202,7 @@ fn test_hex_roundtrip() {
     assert_eq!(result, original);
 }
 
+#[cfg(feature = "encryption")]
 #[test]
 fn test_chk_encryption_vectors() {
     use hashtree::crypto::{encrypt_chk, decrypt_chk};
@@ -242,6 +244,7 @@ fn test_chk_encryption_vectors() {
 }
 
 /// Generate CHK test vectors - run with: cargo test generate_chk_vectors -- --nocapture --ignored
+#[cfg(feature = "encryption")]
 #[test]
 #[ignore]
 fn generate_chk_vectors() {

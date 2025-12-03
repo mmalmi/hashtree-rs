@@ -466,8 +466,8 @@ pub async fn resolve_and_serve(
 
     // Use resolve_wait with timeout - waits for key to appear
     match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
-        Ok(Ok(hash)) => {
-            let hash_hex = to_hex(&hash);
+        Ok(Ok(cid)) => {
+            let hash_hex = to_hex(&cid.hash);
             let _ = resolver.stop().await;
             serve_content_internal(&state, &hash_hex, headers).await
         }
@@ -518,10 +518,11 @@ pub async fn resolve_to_hash(
     };
 
     let result = match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
-        Ok(Ok(hash)) => {
+        Ok(Ok(cid)) => {
             Json(json!({
                 "key": key,
-                "hash": to_hex(&hash)
+                "hash": to_hex(&cid.hash),
+                "cid": cid.to_string()
             }))
         }
         Ok(Err(e)) => {
@@ -563,7 +564,8 @@ pub async fn list_trees(
                 "pubkey": pubkey,
                 "trees": entries.iter().map(|e| json!({
                     "name": e.key.split('/').last().unwrap_or(&e.key),
-                    "hash": to_hex(&e.hash)
+                    "hash": to_hex(&e.cid.hash),
+                    "cid": e.cid.to_string()
                 })).collect::<Vec<_>>()
             }))
         }

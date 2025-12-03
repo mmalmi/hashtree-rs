@@ -1,7 +1,7 @@
 //! Core traits for root resolvers
 
 use async_trait::async_trait;
-use hashtree::Hash;
+use hashtree::Cid;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -28,42 +28,62 @@ pub enum ResolverError {
 #[derive(Debug, Clone)]
 pub struct ResolverEntry {
     pub key: String,
-    pub hash: Hash,
+    pub cid: Cid,
 }
 
-/// RootResolver - Maps human-readable keys to merkle root hashes
+/// RootResolver - Maps human-readable keys to content identifiers (Cid)
 ///
 /// This abstraction allows different backends (Nostr, DNS, HTTP, local storage)
 /// to provide mutable pointers to immutable content-addressed data.
+///
+/// The Cid contains:
+/// - hash: content hash (always present)
+/// - key: optional decryption key (for CHK encrypted content)
+/// - size: content size
 ///
 /// Unlike the TypeScript version which uses callbacks, this Rust version uses
 /// channels which are more idiomatic for async Rust.
 #[async_trait]
 pub trait RootResolver: Send + Sync {
-    /// Resolve a key to its current root hash (one-shot)
+    /// Resolve a key to its current Cid (one-shot)
     ///
     /// Returns None if the key doesn't exist or can't be resolved.
-    async fn resolve(&self, key: &str) -> Result<Option<Hash>, ResolverError>;
+    /// For shared content, pass the share_secret to decrypt the encrypted_key.
+    async fn resolve(&self, key: &str) -> Result<Option<Cid>, ResolverError>;
 
-    /// Subscribe to root hash changes for a key.
+    /// Resolve with a share secret (for encrypted_key decryption)
+    async fn resolve_shared(&self, key: &str, share_secret: &[u8; 32]) -> Result<Option<Cid>, ResolverError> {
+        let _ = share_secret;
+        self.resolve(key).await
+    }
+
+    /// Subscribe to Cid changes for a key.
     ///
     /// Returns a channel receiver that will receive the current value immediately,
     /// then subsequent updates. The channel is closed when the subscription ends.
     ///
     /// To unsubscribe, simply drop the receiver.
-    async fn subscribe(&self, key: &str) -> Result<mpsc::Receiver<Option<Hash>>, ResolverError>;
+    async fn subscribe(&self, key: &str) -> Result<mpsc::Receiver<Option<Cid>>, ResolverError>;
 
-    /// Publish/update a root hash (optional - only for writable backends)
+    /// Publish/update a Cid (optional - only for writable backends)
     ///
     /// Returns true if published successfully.
-    async fn publish(&self, key: &str, hash: Hash) -> Result<bool, ResolverError> {
-        let _ = (key, hash);
+    async fn publish(&self, key: &str, cid: &Cid) -> Result<bool, ResolverError> {
+        let _ = (key, cid);
+        Err(ResolverError::NotAuthorized)
+    }
+
+    /// Publish with encrypted key for sharing
+    ///
+    /// The key is encrypted with share_secret, allowing anyone with the secret to decrypt.
+    async fn publish_shared(&self, key: &str, cid: &Cid, share_secret: &[u8; 32]) -> Result<bool, ResolverError> {
+        let _ = (key, cid, share_secret);
         Err(ResolverError::NotAuthorized)
     }
 
     /// List all keys matching a prefix (one-shot)
     ///
-    /// Returns array of matching keys with their current hashes.
+    /// Returns array of matching keys with their current Cids.
     async fn list(&self, prefix: &str) -> Result<Vec<ResolverEntry>, ResolverError> {
         let _ = prefix;
         Ok(vec![])

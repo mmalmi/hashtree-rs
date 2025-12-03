@@ -113,6 +113,79 @@ pub struct PutResult {
     pub size: u64,
 }
 
+/// Content identifier with hash and optional encryption key
+///
+/// For encrypted content: contains both hash (to locate) and key (to decrypt)
+/// For public content: contains only hash
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cid {
+    /// SHA256 hash of the (possibly encrypted) content
+    pub hash: Hash,
+    /// Encryption key (content hash of plaintext for CHK)
+    /// None for unencrypted/public content
+    pub key: Option<[u8; 32]>,
+    /// Size of the original plaintext data
+    pub size: u64,
+}
+
+impl Cid {
+    /// Create a new CID for public (unencrypted) content
+    pub fn public(hash: Hash, size: u64) -> Self {
+        Self { hash, key: None, size }
+    }
+
+    /// Create a new CID for encrypted content
+    pub fn encrypted(hash: Hash, key: [u8; 32], size: u64) -> Self {
+        Self { hash, key: Some(key), size }
+    }
+
+    /// Check if this CID refers to encrypted content
+    pub fn is_encrypted(&self) -> bool {
+        self.key.is_some()
+    }
+
+    /// Parse a CID from string format
+    /// Accepts "hash" or "hash:key"
+    pub fn parse(s: &str) -> Result<Self, CidParseError> {
+        if let Some((hash_hex, key_hex)) = s.split_once(':') {
+            let hash = from_hex(hash_hex).map_err(|_| CidParseError::InvalidHash)?;
+            let key = from_hex(key_hex).map_err(|_| CidParseError::InvalidKey)?;
+            Ok(Self { hash, key: Some(key), size: 0 })
+        } else {
+            let hash = from_hex(s).map_err(|_| CidParseError::InvalidHash)?;
+            Ok(Self { hash, key: None, size: 0 })
+        }
+    }
+}
+
+impl std::fmt::Display for Cid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(key) = &self.key {
+            write!(f, "{}:{}", to_hex(&self.hash), to_hex(key))
+        } else {
+            write!(f, "{}", to_hex(&self.hash))
+        }
+    }
+}
+
+/// Error parsing a CID string
+#[derive(Debug, Clone, PartialEq)]
+pub enum CidParseError {
+    InvalidHash,
+    InvalidKey,
+}
+
+impl std::fmt::Display for CidParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CidParseError::InvalidHash => write!(f, "invalid hash in CID"),
+            CidParseError::InvalidKey => write!(f, "invalid key in CID"),
+        }
+    }
+}
+
+impl std::error::Error for CidParseError {}
+
 /// Directory entry for building directory trees
 #[derive(Debug, Clone)]
 pub struct DirEntry {

@@ -18,49 +18,63 @@ Content-addressed merkle tree storage library for Rust.
 - Directory support with nested trees
 - Streaming append for large files
 - Tree verification
+- CHK (Content Hash Key) encryption (enabled by default)
 - BEP52 (BitTorrent v2) compatible binary merkle algorithm (experimental)
-- CHK (Content Hash Key) deterministic encryption (experimental)
 
 ## Usage
 
 ```rust
-use hashtree::{TreeBuilder, TreeReader, MemoryStore, BuilderConfig};
+use hashtree::{HashTree, HashTreeConfig, MemoryStore};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::new());
+    let tree = HashTree::new(HashTreeConfig::new(store));
 
-    // Build a tree
-    let builder = TreeBuilder::new(BuilderConfig::new(store.clone()));
-    let result = builder.put_file(b"Hello, World!").await?;
+    // Store content (encrypted by default)
+    let cid = tree.put(b"Hello, World!").await?;
+
+    // cid contains hash + encryption key
+    // Share cid.to_string() ("hash:key") to allow decryption
 
     // Read it back
-    let reader = TreeReader::new(store);
-    let data = reader.read_file(&result.hash).await?;
+    let data = tree.get(&cid).await?;
 
     Ok(())
 }
 ```
 
-### BEP52 Binary Merkle Algorithm
+### Public (Unencrypted) Content
 
-For BitTorrent v2 compatibility exploration:
+For content that should be publicly readable without a key:
 
 ```rust
-use hashtree::{TreeBuilder, BuilderConfig, MerkleAlgorithm, BEP52_CHUNK_SIZE};
+let tree = HashTree::new(HashTreeConfig::new(store).public());
+let cid = tree.put(b"Public content").await?;
 
-let config = BuilderConfig::new(store)
-    .with_chunk_size(BEP52_CHUNK_SIZE)      // 16KB
-    .with_merkle_algorithm(MerkleAlgorithm::Binary);
-
-let builder = TreeBuilder::new(config);
-let result = builder.put_file(&data).await?;
-
-// result.leaf_hashes contains chunk hashes for verification
+// cid.key is None, cid.to_string() is just the hash
 ```
 
-Note: Binary mode computes root hashes only (no intermediate nodes stored). Use CBOR mode (default) for full tree traversal with TreeReader.
+### Directory Operations
+
+```rust
+use hashtree::DirEntry;
+
+// Create files
+let file1 = tree.put(b"content1").await?;
+let file2 = tree.put(b"content2").await?;
+
+// Create directory
+let dir = tree.put_directory(vec![
+    DirEntry::new("a.txt", file1.hash).with_size(file1.size),
+    DirEntry::new("b.txt", file2.hash).with_size(file2.size),
+], None).await?;
+
+// List, resolve paths, walk trees
+let entries = tree.list_directory(&dir).await?;
+let resolved = tree.resolve_path(&dir, "a.txt").await?;
+```
 
 ## Crates
 

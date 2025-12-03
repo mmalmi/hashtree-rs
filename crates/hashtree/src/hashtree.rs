@@ -14,7 +14,10 @@ use crate::codec::{decode_tree_node, encode_and_hash, is_directory_node, is_tree
 use crate::hash::sha256;
 use crate::reader::{ReaderError, TreeEntry, WalkEntry};
 use crate::store::Store;
-use crate::types::{to_hex, DirEntry, Hash, Link, TreeNode};
+use crate::types::{to_hex, Cid, DirEntry, Hash, Link, TreeNode};
+
+#[cfg(feature = "encryption")]
+use crate::crypto::{decrypt_chk, encrypt_chk, EncryptionKey};
 
 /// HashTree configuration
 #[derive(Clone)]
@@ -22,6 +25,8 @@ pub struct HashTreeConfig<S: Store> {
     pub store: Arc<S>,
     pub chunk_size: usize,
     pub max_links: usize,
+    /// Whether to encrypt content (default: true when encryption feature enabled)
+    pub encrypted: bool,
 }
 
 impl<S: Store> HashTreeConfig<S> {
@@ -30,6 +35,10 @@ impl<S: Store> HashTreeConfig<S> {
             store,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_links: DEFAULT_MAX_LINKS,
+            #[cfg(feature = "encryption")]
+            encrypted: true,
+            #[cfg(not(feature = "encryption"))]
+            encrypted: false,
         }
     }
 
@@ -40,6 +49,12 @@ impl<S: Store> HashTreeConfig<S> {
 
     pub fn with_max_links(mut self, max_links: usize) -> Self {
         self.max_links = max_links;
+        self
+    }
+
+    /// Disable encryption (store content publicly)
+    pub fn public(mut self) -> Self {
+        self.encrypted = false;
         self
     }
 }
@@ -64,6 +79,8 @@ pub enum HashTreeError {
     PathNotFound(String),
     #[error("Entry not found: {0}")]
     EntryNotFound(String),
+    #[error("Encryption error: {0}")]
+    Encryption(String),
 }
 
 impl From<BuilderError> for HashTreeError {
@@ -71,6 +88,7 @@ impl From<BuilderError> for HashTreeError {
         match e {
             BuilderError::Store(s) => HashTreeError::Store(s),
             BuilderError::Codec(c) => HashTreeError::Codec(c),
+            BuilderError::Encryption(s) => HashTreeError::Encryption(s),
         }
     }
 }
@@ -81,6 +99,8 @@ impl From<ReaderError> for HashTreeError {
             ReaderError::Store(s) => HashTreeError::Store(s),
             ReaderError::Codec(c) => HashTreeError::Codec(c),
             ReaderError::MissingChunk(s) => HashTreeError::MissingChunk(s),
+            ReaderError::Decryption(s) => HashTreeError::Encryption(s),
+            ReaderError::MissingKey => HashTreeError::Encryption("missing decryption key".to_string()),
         }
     }
 }
@@ -90,6 +110,7 @@ pub struct HashTree<S: Store> {
     store: Arc<S>,
     chunk_size: usize,
     max_links: usize,
+    encrypted: bool,
 }
 
 impl<S: Store> HashTree<S> {
@@ -98,12 +119,221 @@ impl<S: Store> HashTree<S> {
             store: config.store,
             chunk_size: config.chunk_size,
             max_links: config.max_links,
+            encrypted: config.encrypted,
         }
     }
 
-    // ============ CREATE ============
+    /// Check if encryption is enabled
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
 
-    /// Store a blob directly (small data)
+    // ============ UNIFIED API ============
+
+    /// Store content, returns Cid (hash + optional key)
+    /// Encrypts by default when encryption feature is enabled
+    pub async fn put(&self, data: &[u8]) -> Result<Cid, HashTreeError> {
+        let size = data.len() as u64;
+
+        // Small data - store as single chunk
+        if data.len() <= self.chunk_size {
+            let (hash, key) = self.put_chunk_internal(data).await?;
+            return Ok(Cid { hash, key, size });
+        }
+
+        // Large data - chunk it
+        let mut links: Vec<Link> = Vec::new();
+        let mut offset = 0;
+
+        while offset < data.len() {
+            let end = (offset + self.chunk_size).min(data.len());
+            let chunk = &data[offset..end];
+            let chunk_size = chunk.len() as u64;
+            let (hash, key) = self.put_chunk_internal(chunk).await?;
+            links.push(Link {
+                hash,
+                name: None,
+                size: Some(chunk_size),
+                key,
+            });
+            offset = end;
+        }
+
+        // Build tree from chunks
+        let (root_hash, root_key) = self.build_tree_internal(links, Some(size)).await?;
+        Ok(Cid { hash: root_hash, key: root_key, size })
+    }
+
+    /// Get content by Cid (handles decryption automatically)
+    pub async fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>, HashTreeError> {
+        if let Some(key) = cid.key {
+            self.get_encrypted(&cid.hash, &key).await
+        } else {
+            self.read_file(&cid.hash).await
+        }
+    }
+
+    /// Store a chunk with optional encryption
+    #[cfg(feature = "encryption")]
+    async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<EncryptionKey>), HashTreeError> {
+        if self.encrypted {
+            let (encrypted, key) = encrypt_chk(data)
+                .map_err(|e| HashTreeError::Encryption(e.to_string()))?;
+            let hash = sha256(&encrypted);
+            self.store
+                .put(hash, encrypted)
+                .await
+                .map_err(|e| HashTreeError::Store(e.to_string()))?;
+            Ok((hash, Some(key)))
+        } else {
+            let hash = self.put_blob(data).await?;
+            Ok((hash, None))
+        }
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<[u8; 32]>), HashTreeError> {
+        let hash = self.put_blob(data).await?;
+        Ok((hash, None))
+    }
+
+    /// Build tree and return (hash, optional_key)
+    async fn build_tree_internal(
+        &self,
+        links: Vec<Link>,
+        total_size: Option<u64>,
+    ) -> Result<(Hash, Option<[u8; 32]>), HashTreeError> {
+        // Single link with matching size - return directly
+        if links.len() == 1 {
+            if let Some(ts) = total_size {
+                if links[0].size == Some(ts) {
+                    return Ok((links[0].hash, links[0].key));
+                }
+            }
+        }
+
+        if links.len() <= self.max_links {
+            let node = TreeNode {
+                links,
+                total_size,
+                metadata: None,
+            };
+            let (data, _) = encode_and_hash(&node)?;
+
+            #[cfg(feature = "encryption")]
+            if self.encrypted {
+                let (encrypted, key) = encrypt_chk(&data)
+                    .map_err(|e| HashTreeError::Encryption(e.to_string()))?;
+                let hash = sha256(&encrypted);
+                self.store
+                    .put(hash, encrypted)
+                    .await
+                    .map_err(|e| HashTreeError::Store(e.to_string()))?;
+                return Ok((hash, Some(key)));
+            }
+
+            // Unencrypted path
+            let hash = sha256(&data);
+            self.store
+                .put(hash, data)
+                .await
+                .map_err(|e| HashTreeError::Store(e.to_string()))?;
+            return Ok((hash, None));
+        }
+
+        // Too many links - create subtrees
+        let mut sub_links = Vec::new();
+        for batch in links.chunks(self.max_links) {
+            let batch_size: u64 = batch.iter().filter_map(|l| l.size).sum();
+            let (hash, key) = Box::pin(self.build_tree_internal(batch.to_vec(), Some(batch_size))).await?;
+            sub_links.push(Link {
+                hash,
+                name: None,
+                size: Some(batch_size),
+                key,
+            });
+        }
+
+        Box::pin(self.build_tree_internal(sub_links, total_size)).await
+    }
+
+    /// Get encrypted content by hash and key
+    #[cfg(feature = "encryption")]
+    async fn get_encrypted(
+        &self,
+        hash: &Hash,
+        key: &EncryptionKey,
+    ) -> Result<Option<Vec<u8>>, HashTreeError> {
+        let encrypted_data = match self.store.get(hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Decrypt the data
+        let decrypted = decrypt_chk(&encrypted_data, key)
+            .map_err(|e| HashTreeError::Encryption(e.to_string()))?;
+
+        // Check if it's a tree node
+        if is_tree_node(&decrypted) {
+            let node = decode_tree_node(&decrypted)?;
+            let assembled = self.assemble_encrypted_chunks(&node).await?;
+            return Ok(Some(assembled));
+        }
+
+        // Single chunk data
+        Ok(Some(decrypted))
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    async fn get_encrypted(
+        &self,
+        _hash: &Hash,
+        _key: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, HashTreeError> {
+        Err(HashTreeError::Encryption("encryption feature not enabled".to_string()))
+    }
+
+    /// Assemble encrypted chunks from tree
+    #[cfg(feature = "encryption")]
+    async fn assemble_encrypted_chunks(&self, node: &TreeNode) -> Result<Vec<u8>, HashTreeError> {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+
+        for link in &node.links {
+            let chunk_key = link.key.ok_or_else(|| HashTreeError::Encryption("missing chunk key".to_string()))?;
+
+            let encrypted_child = self
+                .store
+                .get(&link.hash)
+                .await
+                .map_err(|e| HashTreeError::Store(e.to_string()))?
+                .ok_or_else(|| HashTreeError::MissingChunk(to_hex(&link.hash)))?;
+
+            let decrypted = decrypt_chk(&encrypted_child, &chunk_key)
+                .map_err(|e| HashTreeError::Encryption(e.to_string()))?;
+
+            if is_tree_node(&decrypted) {
+                // Intermediate tree node - recurse
+                let child_node = decode_tree_node(&decrypted)?;
+                let child_data = Box::pin(self.assemble_encrypted_chunks(&child_node)).await?;
+                parts.push(child_data);
+            } else {
+                // Leaf data chunk
+                parts.push(decrypted);
+            }
+        }
+
+        let total_len: usize = parts.iter().map(|p| p.len()).sum();
+        let mut result = Vec::with_capacity(total_len);
+        for part in parts {
+            result.extend_from_slice(&part);
+        }
+
+        Ok(result)
+    }
+
+    // ============ LOW-LEVEL CREATE ============
+
+    /// Store a blob directly (small data, no encryption)
     /// Returns the content hash
     pub async fn put_blob(&self, data: &[u8]) -> Result<Hash, HashTreeError> {
         let hash = sha256(data);
@@ -1207,5 +1437,101 @@ mod tests {
 
         let resolved = tree.resolve_path(&root_dir, "subdir/file.txt").await.unwrap();
         assert_eq!(resolved, Some(file_hash));
+    }
+
+    // ============ UNIFIED API TESTS ============
+
+    #[tokio::test]
+    async fn test_unified_put_get_public() {
+        let store = Arc::new(MemoryStore::new());
+        // Use .public() to disable encryption
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
+
+        let data = b"Hello, public world!";
+        let cid = tree.put(data).await.unwrap();
+
+        assert_eq!(cid.size, data.len() as u64);
+        assert!(cid.key.is_none()); // No key for public content
+
+        let retrieved = tree.get(&cid).await.unwrap().unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn test_unified_put_get_encrypted() {
+        let store = Arc::new(MemoryStore::new());
+        // Default config has encryption enabled
+        let tree = HashTree::new(HashTreeConfig::new(store));
+
+        let data = b"Hello, encrypted world!";
+        let cid = tree.put(data).await.unwrap();
+
+        assert_eq!(cid.size, data.len() as u64);
+        assert!(cid.key.is_some()); // Has encryption key
+
+        let retrieved = tree.get(&cid).await.unwrap().unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn test_unified_put_get_encrypted_chunked() {
+        let store = Arc::new(MemoryStore::new());
+        let tree = HashTree::new(HashTreeConfig::new(store).with_chunk_size(100));
+
+        // Data larger than chunk size
+        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        let cid = tree.put(&data).await.unwrap();
+
+        assert_eq!(cid.size, data.len() as u64);
+        assert!(cid.key.is_some());
+
+        let retrieved = tree.get(&cid).await.unwrap().unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn test_cid_deterministic() {
+        let store = Arc::new(MemoryStore::new());
+        let tree = HashTree::new(HashTreeConfig::new(store));
+
+        let data = b"Same content produces same CID";
+
+        let cid1 = tree.put(data).await.unwrap();
+        let cid2 = tree.put(data).await.unwrap();
+
+        // CHK: same content = same hash AND same key
+        assert_eq!(cid1.hash, cid2.hash);
+        assert_eq!(cid1.key, cid2.key);
+        assert_eq!(cid1.to_string(), cid2.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_cid_to_string_public() {
+        let store = Arc::new(MemoryStore::new());
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
+
+        let cid = tree.put(b"test").await.unwrap();
+        let s = cid.to_string();
+
+        // Public CID is just the hash (64 hex chars)
+        assert_eq!(s.len(), 64);
+        assert!(!s.contains(':'));
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn test_cid_to_string_encrypted() {
+        let store = Arc::new(MemoryStore::new());
+        let tree = HashTree::new(HashTreeConfig::new(store));
+
+        let cid = tree.put(b"test").await.unwrap();
+        let s = cid.to_string();
+
+        // Encrypted CID is "hash:key" (64 + 1 + 64 = 129 chars)
+        assert_eq!(s.len(), 129);
+        assert!(s.contains(':'));
     }
 }
