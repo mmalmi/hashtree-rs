@@ -145,14 +145,20 @@ impl HashtreeStore {
     }
 
     /// Upload a directory and return its root hash (hex)
+    /// Respects .gitignore by default
     pub fn upload_dir<P: AsRef<Path>>(&self, dir_path: P) -> Result<String> {
+        self.upload_dir_with_options(dir_path, true)
+    }
+
+    /// Upload a directory with options
+    pub fn upload_dir_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
 
         let store = Arc::clone(&self.blobs);
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let root_hash = sync_block_on(async {
-            self.upload_dir_recursive(&tree, dir_path).await
+            self.upload_dir_recursive(&tree, dir_path, dir_path, respect_gitignore).await
         }).context("Failed to upload directory")?;
 
         let root_hex = to_hex(&root_hash);
@@ -164,27 +170,113 @@ impl HashtreeStore {
         Ok(root_hex)
     }
 
-    async fn upload_dir_recursive<S: Store>(&self, tree: &HashTree<S>, path: &Path) -> Result<Hash> {
-        let mut entries = Vec::new();
+    async fn upload_dir_recursive<S: Store>(
+        &self,
+        tree: &HashTree<S>,
+        _root_path: &Path,
+        current_path: &Path,
+        respect_gitignore: bool,
+    ) -> Result<Hash> {
+        use ignore::WalkBuilder;
+        use std::collections::HashMap;
 
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let name = entry.file_name().to_string_lossy().to_string();
+        // Build directory structure from flat file list
+        let mut dir_contents: HashMap<String, Vec<(String, Hash, u64)>> = HashMap::new();
+        dir_contents.insert(String::new(), Vec::new()); // Root
 
-            if file_type.is_file() {
-                let content = std::fs::read(entry.path())?;
+        let walker = WalkBuilder::new(current_path)
+            .git_ignore(respect_gitignore)
+            .git_global(respect_gitignore)
+            .git_exclude(respect_gitignore)
+            .hidden(false)
+            .build();
+
+        for result in walker {
+            let entry = result?;
+            let path = entry.path();
+
+            // Skip the root directory itself
+            if path == current_path {
+                continue;
+            }
+
+            let relative = path.strip_prefix(current_path)
+                .unwrap_or(path);
+
+            if path.is_file() {
+                let content = std::fs::read(path)?;
                 let cid = tree.put(&content).await
-                    .map_err(|e| anyhow::anyhow!("Failed to upload file {}: {}", name, e))?;
-                entries.push(HashTreeDirEntry::new(name, cid.hash).with_size(cid.size));
-            } else if file_type.is_dir() {
-                let hash = Box::pin(self.upload_dir_recursive(tree, &entry.path())).await?;
-                entries.push(HashTreeDirEntry::new(name, hash));
+                    .map_err(|e| anyhow::anyhow!("Failed to upload file {}: {}", path.display(), e))?;
+
+                // Get parent directory path and file name
+                let parent = relative.parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let name = relative.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                dir_contents.entry(parent).or_default()
+                    .push((name, cid.hash, cid.size));
+            } else if path.is_dir() {
+                // Ensure directory entry exists
+                let dir_path = relative.to_string_lossy().to_string();
+                dir_contents.entry(dir_path).or_default();
             }
         }
 
-        tree.put_directory(entries, None).await
-            .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))
+        // Build directory tree bottom-up
+        self.build_directory_tree(tree, &mut dir_contents).await
+    }
+
+    async fn build_directory_tree<S: Store>(
+        &self,
+        tree: &HashTree<S>,
+        dir_contents: &mut std::collections::HashMap<String, Vec<(String, Hash, u64)>>,
+    ) -> Result<Hash> {
+        // Sort directories by depth (deepest first) to build bottom-up
+        let mut dirs: Vec<String> = dir_contents.keys().cloned().collect();
+        dirs.sort_by(|a, b| {
+            let depth_a = a.matches('/').count() + if a.is_empty() { 0 } else { 1 };
+            let depth_b = b.matches('/').count() + if b.is_empty() { 0 } else { 1 };
+            depth_b.cmp(&depth_a) // Deepest first
+        });
+
+        let mut dir_hashes: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
+
+        for dir_path in dirs {
+            let files = dir_contents.get(&dir_path).cloned().unwrap_or_default();
+
+            let mut entries: Vec<HashTreeDirEntry> = files.into_iter()
+                .map(|(name, hash, size)| HashTreeDirEntry::new(name, hash).with_size(size))
+                .collect();
+
+            // Add subdirectory entries
+            for (subdir_path, hash) in &dir_hashes {
+                let parent = std::path::Path::new(subdir_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                if parent == dir_path {
+                    let name = std::path::Path::new(subdir_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    entries.push(HashTreeDirEntry::new(name, *hash));
+                }
+            }
+
+            let hash = tree.put_directory(entries, None).await
+                .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))?;
+
+            dir_hashes.insert(dir_path, hash);
+        }
+
+        // Return root hash
+        dir_hashes.get("")
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("No root directory"))
     }
 
     /// Upload a file with CHK encryption, returns CID in format "hash:key"
@@ -210,7 +302,13 @@ impl HashtreeStore {
     }
 
     /// Upload a directory with CHK encryption, returns CID
+    /// Respects .gitignore by default
     pub fn upload_dir_encrypted<P: AsRef<Path>>(&self, dir_path: P) -> Result<String> {
+        self.upload_dir_encrypted_with_options(dir_path, true)
+    }
+
+    /// Upload a directory with CHK encryption and options
+    pub fn upload_dir_encrypted_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
         let store = Arc::clone(&self.blobs);
 
@@ -218,7 +316,7 @@ impl HashtreeStore {
         let tree = HashTree::new(HashTreeConfig::new(store));
 
         let result = sync_block_on(async {
-            self.upload_dir_encrypted_recursive(&tree, dir_path).await
+            self.upload_dir_encrypted_recursive(&tree, dir_path, respect_gitignore).await
         })?;
 
         let mut wtxn = self.env.write_txn()?;
@@ -232,22 +330,38 @@ impl HashtreeStore {
         &self,
         tree: &HashTree<S>,
         path: &Path,
+        respect_gitignore: bool,
     ) -> Result<String> {
+        use ignore::WalkBuilder;
+
         let mut file_cids = Vec::new();
 
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let name = entry.file_name().to_string_lossy().to_string();
+        let walker = WalkBuilder::new(path)
+            .git_ignore(respect_gitignore)
+            .git_global(respect_gitignore)
+            .git_exclude(respect_gitignore)
+            .hidden(false)
+            .build();
 
-            if file_type.is_file() {
-                let content = std::fs::read(entry.path())?;
+        for result in walker {
+            let entry = result?;
+            let entry_path = entry.path();
+
+            // Skip the root directory itself
+            if entry_path == path {
+                continue;
+            }
+
+            if entry_path.is_file() {
+                let relative = entry_path.strip_prefix(path)
+                    .unwrap_or(entry_path)
+                    .to_string_lossy()
+                    .to_string();
+
+                let content = std::fs::read(entry_path)?;
                 let cid = tree.put(&content).await
-                    .map_err(|e| anyhow::anyhow!("Failed to encrypt file {}: {}", name, e))?;
-                file_cids.push((name, cid.to_string()));
-            } else if file_type.is_dir() {
-                let cid = Box::pin(self.upload_dir_encrypted_recursive(tree, &entry.path())).await?;
-                file_cids.push((name, cid));
+                    .map_err(|e| anyhow::anyhow!("Failed to encrypt file {}: {}", relative, e))?;
+                file_cids.push((relative, cid.to_string()));
             }
         }
 

@@ -18,6 +18,8 @@ pub struct TreeEntry {
     pub hash: Hash,
     pub size: Option<u64>,
     pub is_tree: bool,
+    /// Optional decryption key (for encrypted content)
+    pub key: Option<[u8; 32]>,
 }
 
 /// Walk entry for tree traversal
@@ -27,6 +29,8 @@ pub struct WalkEntry {
     pub hash: Hash,
     pub is_tree: bool,
     pub size: Option<u64>,
+    /// Optional decryption key (for encrypted content)
+    pub key: Option<[u8; 32]>,
 }
 
 /// TreeReader - reads and traverses merkle trees
@@ -289,6 +293,7 @@ impl<S: Store> TreeReader<S> {
                 hash: link.hash,
                 size: link.size,
                 is_tree: child_is_dir,
+                key: link.key,
             });
         }
 
@@ -407,6 +412,7 @@ impl<S: Store> TreeReader<S> {
                 hash: *hash,
                 is_tree: false,
                 size: Some(data.len() as u64),
+                key: None, // TreeReader doesn't track keys
             });
             return Ok(());
         }
@@ -417,6 +423,7 @@ impl<S: Store> TreeReader<S> {
             hash: *hash,
             is_tree: true,
             size: node.total_size,
+            key: None, // directories are not encrypted
         });
 
         for link in &node.links {

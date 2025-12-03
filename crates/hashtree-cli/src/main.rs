@@ -48,6 +48,9 @@ enum Commands {
         /// Store without encryption (public, unencrypted)
         #[arg(long)]
         public: bool,
+        /// Include files ignored by .gitignore (default: respect .gitignore)
+        #[arg(long)]
+        no_ignore: bool,
     },
     /// Get/download content by CID
     Get {
@@ -211,7 +214,7 @@ async fn main() -> Result<()> {
             // Shutdown relay thread
             relay_handle.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        Commands::Add { path, only_hash, public } => {
+        Commands::Add { path, only_hash, public, no_ignore } => {
             let is_dir = path.is_dir();
 
             if only_hash {
@@ -231,7 +234,7 @@ async fn main() -> Result<()> {
 
                 if is_dir {
                     // For directories, use the recursive helper
-                    let cid = add_directory_unified(&tree, &path).await?;
+                    let cid = add_directory_unified(&tree, &path, !no_ignore).await?;
                     println!("{}", cid);
                 } else {
                     let data = std::fs::read(&path)?;
@@ -244,7 +247,7 @@ async fn main() -> Result<()> {
                 let store = HashtreeStore::new(&cli.data_dir)?;
                 if public {
                     let cid = if is_dir {
-                        store.upload_dir(&path)
+                        store.upload_dir_with_options(&path, !no_ignore)
                             .context("Failed to add directory")?
                     } else {
                         store.upload_file(&path)
@@ -253,7 +256,7 @@ async fn main() -> Result<()> {
                     println!("added {} {}", cid, path.display());
                 } else {
                     let cid = if is_dir {
-                        store.upload_dir_encrypted(&path)
+                        store.upload_dir_encrypted_with_options(&path, !no_ignore)
                             .context("Failed to add directory")?
                     } else {
                         store.upload_file_encrypted(&path)
@@ -407,24 +410,41 @@ async fn main() -> Result<()> {
 async fn add_directory_unified<S: hashtree::store::Store>(
     tree: &hashtree::HashTree<S>,
     dir: &std::path::Path,
+    respect_gitignore: bool,
 ) -> Result<String> {
+    use ignore::WalkBuilder;
+
     let mut file_cids = Vec::new();
 
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
+    // Use ignore crate for gitignore-aware walking
+    let walker = WalkBuilder::new(dir)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .hidden(false) // Don't skip hidden files by default (let gitignore decide)
+        .build();
 
-        if path.is_dir() {
-            // Recursively process subdirectory
-            let cid = Box::pin(add_directory_unified(tree, &path)).await?;
-            file_cids.push((name, cid));
-        } else {
-            let data = std::fs::read(&path)?;
+    for result in walker {
+        let entry = result?;
+        let path = entry.path();
+
+        // Skip the root directory itself
+        if path == dir {
+            continue;
+        }
+
+        let name = path.strip_prefix(dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        if path.is_file() {
+            let data = std::fs::read(path)?;
             let cid = tree.put(&data).await
                 .map_err(|e| anyhow::anyhow!("Failed to add file {}: {}", path.display(), e))?;
             file_cids.push((name, cid.to_string()));
         }
+        // Directories are handled implicitly by the walk
     }
 
     // TODO: Create a proper directory node that contains all file CIDs

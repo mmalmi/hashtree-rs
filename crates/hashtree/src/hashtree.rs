@@ -980,7 +980,12 @@ impl<S: Store> HashTree<S> {
         Ok(chunks)
     }
 
-    /// List directory entries
+    /// List directory entries (Cid-based)
+    pub async fn list(&self, cid: &Cid) -> Result<Vec<TreeEntry>, HashTreeError> {
+        self.list_directory(&cid.hash).await
+    }
+
+    /// List directory entries (low-level, Hash-based)
     pub async fn list_directory(&self, hash: &Hash) -> Result<Vec<TreeEntry>, HashTreeError> {
         let node = match self.get_tree_node(hash).await? {
             Some(n) => n,
@@ -1005,17 +1010,22 @@ impl<S: Store> HashTree<S> {
                 hash: link.hash,
                 size: link.size,
                 is_tree: child_is_dir,
+                key: link.key,
             });
         }
 
         Ok(entries)
     }
 
-    /// Resolve a path within a tree
-    pub async fn resolve_path(&self, root_hash: &Hash, path: &str) -> Result<Option<Hash>, HashTreeError> {
+    /// Resolve a path within a tree (returns Cid with key if encrypted)
+    pub async fn resolve(&self, cid: &Cid, path: &str) -> Result<Option<Cid>, HashTreeError> {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(Some(cid.clone()));
+        }
 
-        let mut current_hash = *root_hash;
+        let mut current_hash = cid.hash;
+        let mut current_link: Option<Link> = None;
 
         for part in parts {
             let node = match self.get_tree_node(&current_hash).await? {
@@ -1025,16 +1035,32 @@ impl<S: Store> HashTree<S> {
 
             if let Some(link) = self.find_link(&node, part) {
                 current_hash = link.hash;
+                current_link = Some(link);
             } else {
                 // Check internal nodes
-                match self.find_in_subtrees(&node, part).await? {
-                    Some(hash) => current_hash = hash,
+                match self.find_link_in_subtrees(&node, part).await? {
+                    Some(link) => {
+                        current_hash = link.hash;
+                        current_link = Some(link);
+                    }
                     None => return Ok(None),
                 }
             }
         }
 
-        Ok(Some(current_hash))
+        // Build Cid from final link
+        let size = current_link.as_ref().and_then(|l| l.size).unwrap_or(0);
+        let key = current_link.and_then(|l| l.key);
+        Ok(Some(Cid { hash: current_hash, key, size }))
+    }
+
+    /// Resolve a path within a tree (low-level, returns Hash only)
+    pub async fn resolve_path(&self, root_hash: &Hash, path: &str) -> Result<Option<Hash>, HashTreeError> {
+        let cid = Cid { hash: *root_hash, key: None, size: 0 };
+        match self.resolve(&cid, path).await? {
+            Some(resolved) => Ok(Some(resolved.hash)),
+            None => Ok(None),
+        }
     }
 
     fn find_link(&self, node: &TreeNode, name: &str) -> Option<Link> {
@@ -1044,7 +1070,7 @@ impl<S: Store> HashTree<S> {
             .cloned()
     }
 
-    async fn find_in_subtrees(&self, node: &TreeNode, name: &str) -> Result<Option<Hash>, HashTreeError> {
+    async fn find_link_in_subtrees(&self, node: &TreeNode, name: &str) -> Result<Option<Link>, HashTreeError> {
         for link in &node.links {
             if !link.name.as_ref().map(|n| n.starts_with('_')).unwrap_or(false) {
                 continue;
@@ -1056,10 +1082,10 @@ impl<S: Store> HashTree<S> {
             };
 
             if let Some(found) = self.find_link(&sub_node, name) {
-                return Ok(Some(found.hash));
+                return Ok(Some(found));
             }
 
-            if let Some(deep_found) = Box::pin(self.find_in_subtrees(&sub_node, name)).await? {
+            if let Some(deep_found) = Box::pin(self.find_link_in_subtrees(&sub_node, name)).await? {
                 return Ok(Some(deep_found));
             }
         }
@@ -1118,6 +1144,7 @@ impl<S: Store> HashTree<S> {
                 hash: *hash,
                 is_tree: false,
                 size: Some(data.len() as u64),
+                key: None, // TODO: track keys through walk
             });
             return Ok(());
         }
@@ -1128,6 +1155,7 @@ impl<S: Store> HashTree<S> {
             hash: *hash,
             is_tree: true,
             size: node.total_size,
+            key: None, // directories are not encrypted
         });
 
         for link in &node.links {
@@ -1180,6 +1208,7 @@ impl<S: Store> HashTree<S> {
                                 hash,
                                 is_tree: false,
                                 size: Some(data.len() as u64),
+                                key: None, // TODO: track keys through walk
                             };
                             return Some((Ok(entry), WalkStreamState::Done));
                         }
@@ -1194,6 +1223,7 @@ impl<S: Store> HashTree<S> {
                             hash,
                             is_tree: true,
                             size: node.total_size,
+                            key: None, // directories are not encrypted
                         };
 
                         // Create stack with children to process
@@ -1209,7 +1239,7 @@ impl<S: Store> HashTree<S> {
                                 }
                                 _ => path.clone(),
                             };
-                            stack.push(WalkStackItem { hash: link.hash, path: child_path });
+                            stack.push(WalkStackItem { hash: link.hash, path: child_path, key: link.key });
                         }
 
                         Some((Ok(entry), WalkStreamState::Processing { stack, tree }))
@@ -1245,6 +1275,7 @@ impl<S: Store> HashTree<S> {
                     hash: item.hash,
                     is_tree: false,
                     size: Some(data.len() as u64),
+                    key: item.key,
                 };
                 return Some((Ok(entry), WalkStreamState::Processing { stack: std::mem::take(stack), tree: self }));
             }
@@ -1259,6 +1290,7 @@ impl<S: Store> HashTree<S> {
                 hash: item.hash,
                 is_tree: true,
                 size: node.total_size,
+                key: None, // directories are not encrypted
             };
 
             // Push children to stack
@@ -1273,7 +1305,7 @@ impl<S: Store> HashTree<S> {
                     }
                     _ => item.path.clone(),
                 };
-                stack.push(WalkStackItem { hash: link.hash, path: child_path });
+                stack.push(WalkStackItem { hash: link.hash, path: child_path, key: link.key });
             }
 
             return Some((Ok(entry), WalkStreamState::Processing { stack: std::mem::take(stack), tree: self }));
@@ -1506,6 +1538,7 @@ enum ReadStreamState<'a, S: Store> {
 struct WalkStackItem {
     hash: Hash,
     path: String,
+    key: Option<[u8; 32]>,
 }
 
 enum WalkStreamState<'a, S: Store> {
