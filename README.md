@@ -66,6 +66,13 @@ Note: Binary mode computes root hashes only (no intermediate nodes stored). Use 
 
 - `hashtree` - Core merkle tree library
 - `hashtree-bep52` - BEP52 specific implementation (experimental)
+- `hashtree-lmdb` - LMDB storage backend
+- `hashtree-resolver` - Nostr-based ref resolution
+- `hashtree-webrtc` - P2P sync via WebRTC
+- `hashtree-git` - Git object compatibility layer
+- `hashtree-cli` - Command-line interface
+- `hashtree-relay` - Nostr relay for hashtree events
+- `git-remote-nostr` - Git remote helper for Nostr
 
 ## Development
 
