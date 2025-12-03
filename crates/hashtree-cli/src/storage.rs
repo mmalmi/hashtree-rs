@@ -3,7 +3,7 @@ use heed::{Database, EnvOpenOptions};
 use heed::types::*;
 use hashtree_lmdb::LmdbBlobStore;
 use hashtree::{
-    HashTree, HashTreeConfig, StreamBuilder, BuilderConfig,
+    HashTree, HashTreeConfig,
     sha256, to_hex, from_hex, Hash, TreeNode, DirEntry as HashTreeDirEntry,
 };
 use hashtree::store::Store;
@@ -112,36 +112,24 @@ impl HashtreeStore {
     where
         F: FnMut(&str),
     {
-        // Read all data first to compute SHA256 and stream to hashtree
+        // Read all data first to compute SHA256
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
 
-        // Compute SHA256 hash of file content
+        // Compute SHA256 hash of file content for blossom compatibility
         let content_sha256 = sha256(&data);
         let sha256_hex = to_hex(&content_sha256);
 
-        // Use hashtree StreamBuilder for streaming upload
+        // Use HashTree.put for upload (public mode for blossom)
         let store = Arc::clone(&self.blobs);
-        let config = BuilderConfig::new(store);
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
-        let (root_hash, _size) = sync_block_on(async {
-            let mut stream = StreamBuilder::new(config);
+        let cid = sync_block_on(async {
+            tree.put(&data).await
+        }).context("Failed to store file")?;
 
-            // Stream data in chunks
-            let chunk_size = 256 * 1024; // 256KB chunks
-            for chunk in data.chunks(chunk_size) {
-                stream.append(chunk).await?;
-
-                // Get intermediate root for progress callback
-                if let Ok(Some(intermediate_hash)) = stream.current_root().await {
-                    callback(&to_hex(&intermediate_hash));
-                }
-            }
-
-            stream.finalize().await
-        }).context("Failed to store file stream")?;
-
-        let root_hex = to_hex(&root_hash);
+        let root_hex = to_hex(&cid.hash);
+        callback(&root_hex);
 
         let mut wtxn = self.env.write_txn()?;
 

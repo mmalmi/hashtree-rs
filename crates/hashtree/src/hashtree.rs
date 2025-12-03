@@ -8,8 +8,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::stream::{self, Stream};
+use futures::io::AsyncRead;
+use futures::AsyncReadExt;
 
-use crate::builder::{BuilderConfig, BuilderError, StreamBuilder, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_LINKS};
+use crate::builder::{BuilderError, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_LINKS};
 use crate::codec::{decode_tree_node, encode_and_hash, is_directory_node, is_tree_node};
 use crate::hash::sha256;
 use crate::reader::{ReaderError, TreeEntry, WalkEntry};
@@ -81,6 +83,8 @@ pub enum HashTreeError {
     EntryNotFound(String),
     #[error("Encryption error: {0}")]
     Encryption(String),
+    #[error("Decryption error: {0}")]
+    Decryption(String),
 }
 
 impl From<BuilderError> for HashTreeError {
@@ -171,6 +175,209 @@ impl<S: Store> HashTree<S> {
         } else {
             self.read_file(&cid.hash).await
         }
+    }
+
+    /// Store content from an async reader (streaming put)
+    ///
+    /// Reads data in chunks and builds a merkle tree incrementally.
+    /// Useful for large files or streaming data sources.
+    pub async fn put_stream<R: AsyncRead + Unpin>(&self, mut reader: R) -> Result<Cid, HashTreeError> {
+        let mut buffer = vec![0u8; self.chunk_size];
+        let mut links = Vec::new();
+        let mut total_size: u64 = 0;
+        let mut consistent_key: Option<[u8; 32]> = None;
+
+        loop {
+            let mut chunk = Vec::new();
+            let mut bytes_read = 0;
+
+            // Read until we have a full chunk or EOF
+            while bytes_read < self.chunk_size {
+                let n = reader.read(&mut buffer[..self.chunk_size - bytes_read]).await
+                    .map_err(|e| HashTreeError::Store(format!("read error: {}", e)))?;
+                if n == 0 {
+                    break; // EOF
+                }
+                chunk.extend_from_slice(&buffer[..n]);
+                bytes_read += n;
+            }
+
+            if chunk.is_empty() {
+                break; // No more data
+            }
+
+            let chunk_len = chunk.len() as u64;
+            total_size += chunk_len;
+
+            let (hash, key) = self.put_chunk_internal(&chunk).await?;
+
+            // Track consistent key for single-key result
+            if links.is_empty() {
+                consistent_key = key;
+            } else if consistent_key != key {
+                consistent_key = None;
+            }
+
+            links.push(Link {
+                hash,
+                name: None,
+                size: Some(chunk_len),
+                key,
+            });
+        }
+
+        if links.is_empty() {
+            // Empty input
+            let (hash, key) = self.put_chunk_internal(&[]).await?;
+            return Ok(Cid { hash, key, size: 0 });
+        }
+
+        // Build tree from chunks
+        let (root_hash, root_key) = self.build_tree_internal(links, Some(total_size)).await?;
+        Ok(Cid { hash: root_hash, key: root_key, size: total_size })
+    }
+
+    /// Read content as a stream of chunks by Cid (handles decryption automatically)
+    ///
+    /// Returns an async stream that yields chunks as they are read.
+    /// Useful for large files or when you want to process data incrementally.
+    pub fn get_stream(
+        &self,
+        cid: &Cid,
+    ) -> Pin<Box<dyn Stream<Item = Result<Vec<u8>, HashTreeError>> + Send + '_>> {
+        let hash = cid.hash;
+        let key = cid.key;
+
+        if let Some(k) = key {
+            // Encrypted stream
+            Box::pin(self.read_file_stream_encrypted(hash, k))
+        } else {
+            // Unencrypted stream
+            self.read_file_stream(hash)
+        }
+    }
+
+    /// Read encrypted file as stream (internal)
+    #[cfg(feature = "encryption")]
+    fn read_file_stream_encrypted(
+        &self,
+        hash: Hash,
+        key: EncryptionKey,
+    ) -> impl Stream<Item = Result<Vec<u8>, HashTreeError>> + Send + '_ {
+        stream::unfold(
+            EncryptedStreamState::Init { hash, key, tree: self },
+            |state| async move {
+                match state {
+                    EncryptedStreamState::Init { hash, key, tree } => {
+                        let data = match tree.store.get(&hash).await {
+                            Ok(Some(d)) => d,
+                            Ok(None) => return None,
+                            Err(e) => return Some((Err(HashTreeError::Store(e.to_string())), EncryptedStreamState::Done)),
+                        };
+
+                        // Try to decrypt
+                        let decrypted = match decrypt_chk(&data, &key) {
+                            Ok(d) => d,
+                            Err(e) => return Some((Err(HashTreeError::Decryption(e.to_string())), EncryptedStreamState::Done)),
+                        };
+
+                        if !is_tree_node(&decrypted) {
+                            // Single blob - yield decrypted data
+                            return Some((Ok(decrypted), EncryptedStreamState::Done));
+                        }
+
+                        // Tree node - parse and traverse
+                        let node = match decode_tree_node(&decrypted) {
+                            Ok(n) => n,
+                            Err(e) => return Some((Err(HashTreeError::Codec(e)), EncryptedStreamState::Done)),
+                        };
+
+                        let mut stack: Vec<EncryptedStackItem> = Vec::new();
+                        for link in node.links.into_iter().rev() {
+                            stack.push(EncryptedStackItem { hash: link.hash, key: link.key });
+                        }
+
+                        tree.process_encrypted_stream_stack(&mut stack).await
+                    }
+                    EncryptedStreamState::Processing { mut stack, tree } => {
+                        tree.process_encrypted_stream_stack(&mut stack).await
+                    }
+                    EncryptedStreamState::Done => None,
+                }
+            },
+        )
+    }
+
+    #[cfg(feature = "encryption")]
+    async fn process_encrypted_stream_stack<'a>(
+        &'a self,
+        stack: &mut Vec<EncryptedStackItem>,
+    ) -> Option<(Result<Vec<u8>, HashTreeError>, EncryptedStreamState<'a, S>)> {
+        while let Some(item) = stack.pop() {
+            let data = match self.store.get(&item.hash).await {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    return Some((
+                        Err(HashTreeError::MissingChunk(to_hex(&item.hash))),
+                        EncryptedStreamState::Done,
+                    ))
+                }
+                Err(e) => {
+                    return Some((
+                        Err(HashTreeError::Store(e.to_string())),
+                        EncryptedStreamState::Done,
+                    ))
+                }
+            };
+
+            // Decrypt if we have a key
+            let decrypted = if let Some(key) = item.key {
+                match decrypt_chk(&data, &key) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Some((
+                            Err(HashTreeError::Decryption(e.to_string())),
+                            EncryptedStreamState::Done,
+                        ))
+                    }
+                }
+            } else {
+                data
+            };
+
+            if is_tree_node(&decrypted) {
+                // Nested tree node - add children to stack
+                let node = match decode_tree_node(&decrypted) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Some((
+                            Err(HashTreeError::Codec(e)),
+                            EncryptedStreamState::Done,
+                        ))
+                    }
+                };
+                for link in node.links.into_iter().rev() {
+                    stack.push(EncryptedStackItem { hash: link.hash, key: link.key });
+                }
+            } else {
+                // Leaf chunk - yield decrypted data
+                return Some((
+                    Ok(decrypted),
+                    EncryptedStreamState::Processing { stack: std::mem::take(stack), tree: self },
+                ));
+            }
+        }
+        None
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn read_file_stream_encrypted(
+        &self,
+        hash: Hash,
+        _key: [u8; 32],
+    ) -> impl Stream<Item = Result<Vec<u8>, HashTreeError>> + Send + '_ {
+        // Without encryption feature, just read normally
+        self.read_file_stream(hash)
     }
 
     /// Store a chunk with optional encryption
@@ -1273,11 +1480,14 @@ impl<S: Store> HashTree<S> {
         self.store.clone()
     }
 
-    /// Create a StreamBuilder for incremental file building
-    pub fn stream_builder(&self) -> StreamBuilder<S> {
-        StreamBuilder::new(BuilderConfig::new(self.store.clone())
-            .with_chunk_size(self.chunk_size)
-            .with_max_links(self.max_links))
+    /// Get chunk size configuration
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Get max links configuration
+    pub fn max_links(&self) -> usize {
+        self.max_links
     }
 }
 
@@ -1301,6 +1511,20 @@ struct WalkStackItem {
 enum WalkStreamState<'a, S: Store> {
     Init { hash: Hash, path: String, tree: &'a HashTree<S> },
     Processing { stack: Vec<WalkStackItem>, tree: &'a HashTree<S> },
+    Done,
+}
+
+// Encrypted stream state types
+#[cfg(feature = "encryption")]
+struct EncryptedStackItem {
+    hash: Hash,
+    key: Option<[u8; 32]>,
+}
+
+#[cfg(feature = "encryption")]
+enum EncryptedStreamState<'a, S: Store> {
+    Init { hash: Hash, key: [u8; 32], tree: &'a HashTree<S> },
+    Processing { stack: Vec<EncryptedStackItem>, tree: &'a HashTree<S> },
     Done,
 }
 

@@ -56,8 +56,7 @@ pub mod crypto;
 // Main API - unified HashTree
 pub use hashtree::{HashTree, HashTreeConfig, HashTreeError, verify_tree as hashtree_verify_tree};
 
-// Streaming builder
-pub use builder::{BuilderConfig, BuilderError, MerkleAlgorithm, StreamBuilder, StreamStats};
+// Constants
 pub use builder::{BEP52_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_LINKS};
 
 // Low-level codec
