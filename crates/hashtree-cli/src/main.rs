@@ -217,25 +217,25 @@ async fn main() -> Result<()> {
             if only_hash {
                 // Use in-memory store for hash-only mode
                 use hashtree::store::MemoryStore;
-                use hashtree::builder::{TreeBuilder, BuilderConfig};
+                use hashtree::{HashTree, HashTreeConfig};
                 use std::sync::Arc;
 
                 let store = Arc::new(MemoryStore::new());
                 // Use unified API: encryption by default, .public() to disable
                 let config = if public {
-                    BuilderConfig::new(store.clone()).public()
+                    HashTreeConfig::new(store.clone()).public()
                 } else {
-                    BuilderConfig::new(store.clone())
+                    HashTreeConfig::new(store.clone())
                 };
-                let builder = TreeBuilder::new(config);
+                let tree = HashTree::new(config);
 
                 if is_dir {
                     // For directories, use the recursive helper
-                    let cid = add_directory_unified(&builder, &path).await?;
+                    let cid = add_directory_unified(&tree, &path).await?;
                     println!("{}", cid);
                 } else {
                     let data = std::fs::read(&path)?;
-                    let cid = builder.put(&data).await
+                    let cid = tree.put(&data).await
                         .map_err(|e| anyhow::anyhow!("Failed to hash file: {}", e))?;
                     println!("{}", cid);
                 }
@@ -405,7 +405,7 @@ async fn main() -> Result<()> {
 /// Recursively add a directory using unified API (handles encryption automatically)
 /// Returns CID as string (hash or hash:key depending on encryption setting)
 async fn add_directory_unified<S: hashtree::store::Store>(
-    builder: &hashtree::builder::TreeBuilder<S>,
+    tree: &hashtree::HashTree<S>,
     dir: &std::path::Path,
 ) -> Result<String> {
     let mut file_cids = Vec::new();
@@ -417,11 +417,11 @@ async fn add_directory_unified<S: hashtree::store::Store>(
 
         if path.is_dir() {
             // Recursively process subdirectory
-            let cid = Box::pin(add_directory_unified(builder, &path)).await?;
+            let cid = Box::pin(add_directory_unified(tree, &path)).await?;
             file_cids.push((name, cid));
         } else {
             let data = std::fs::read(&path)?;
-            let cid = builder.put(&data).await
+            let cid = tree.put(&data).await
                 .map_err(|e| anyhow::anyhow!("Failed to add file {}: {}", path.display(), e))?;
             file_cids.push((name, cid.to_string()));
         }

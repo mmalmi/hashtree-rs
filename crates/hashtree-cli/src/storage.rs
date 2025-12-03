@@ -3,7 +3,7 @@ use heed::{Database, EnvOpenOptions};
 use heed::types::*;
 use hashtree_lmdb::LmdbBlobStore;
 use hashtree::{
-    TreeBuilder, TreeReader, StreamBuilder, BuilderConfig,
+    HashTree, HashTreeConfig, StreamBuilder, BuilderConfig,
     sha256, to_hex, from_hex, Hash, TreeNode, DirEntry as HashTreeDirEntry,
 };
 use hashtree::store::Store;
@@ -81,10 +81,10 @@ impl HashtreeStore {
 
         // Use hashtree to store the file (public mode - no encryption)
         let store = Arc::clone(&self.blobs);
-        let builder = TreeBuilder::new(BuilderConfig::new(store).public());
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let cid = sync_block_on(async {
-            builder.put(&file_content).await
+            tree.put(&file_content).await
         }).context("Failed to store file")?;
 
         let root_hex = to_hex(&cid.hash);
@@ -161,10 +161,10 @@ impl HashtreeStore {
         let dir_path = dir_path.as_ref();
 
         let store = Arc::clone(&self.blobs);
-        let builder = TreeBuilder::new(BuilderConfig::new(store));
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let root_hash = sync_block_on(async {
-            self.upload_dir_recursive(&builder, dir_path).await
+            self.upload_dir_recursive(&tree, dir_path).await
         }).context("Failed to upload directory")?;
 
         let root_hex = to_hex(&root_hash);
@@ -176,7 +176,7 @@ impl HashtreeStore {
         Ok(root_hex)
     }
 
-    async fn upload_dir_recursive<S: Store>(&self, builder: &TreeBuilder<S>, path: &Path) -> Result<Hash> {
+    async fn upload_dir_recursive<S: Store>(&self, tree: &HashTree<S>, path: &Path) -> Result<Hash> {
         let mut entries = Vec::new();
 
         for entry in std::fs::read_dir(path)? {
@@ -186,16 +186,16 @@ impl HashtreeStore {
 
             if file_type.is_file() {
                 let content = std::fs::read(entry.path())?;
-                let cid = builder.put(&content).await
+                let cid = tree.put(&content).await
                     .map_err(|e| anyhow::anyhow!("Failed to upload file {}: {}", name, e))?;
                 entries.push(HashTreeDirEntry::new(name, cid.hash).with_size(cid.size));
             } else if file_type.is_dir() {
-                let hash = Box::pin(self.upload_dir_recursive(builder, &entry.path())).await?;
+                let hash = Box::pin(self.upload_dir_recursive(tree, &entry.path())).await?;
                 entries.push(HashTreeDirEntry::new(name, hash));
             }
         }
 
-        builder.put_directory(entries, None).await
+        tree.put_directory(entries, None).await
             .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))
     }
 
@@ -206,10 +206,10 @@ impl HashtreeStore {
 
         // Use unified API with encryption enabled (default)
         let store = Arc::clone(&self.blobs);
-        let builder = TreeBuilder::new(BuilderConfig::new(store));
+        let tree = HashTree::new(HashTreeConfig::new(store));
 
         let cid = sync_block_on(async {
-            builder.put(&file_content).await
+            tree.put(&file_content).await
         }).map_err(|e| anyhow::anyhow!("Failed to encrypt file: {}", e))?;
 
         let cid_str = cid.to_string();
@@ -227,10 +227,10 @@ impl HashtreeStore {
         let store = Arc::clone(&self.blobs);
 
         // Use unified API with encryption enabled (default)
-        let builder = TreeBuilder::new(BuilderConfig::new(store));
+        let tree = HashTree::new(HashTreeConfig::new(store));
 
         let result = sync_block_on(async {
-            self.upload_dir_encrypted_recursive(&builder, dir_path).await
+            self.upload_dir_encrypted_recursive(&tree, dir_path).await
         })?;
 
         let mut wtxn = self.env.write_txn()?;
@@ -242,7 +242,7 @@ impl HashtreeStore {
 
     async fn upload_dir_encrypted_recursive<S: Store>(
         &self,
-        builder: &TreeBuilder<S>,
+        tree: &HashTree<S>,
         path: &Path,
     ) -> Result<String> {
         let mut file_cids = Vec::new();
@@ -254,11 +254,11 @@ impl HashtreeStore {
 
             if file_type.is_file() {
                 let content = std::fs::read(entry.path())?;
-                let cid = builder.put(&content).await
+                let cid = tree.put(&content).await
                     .map_err(|e| anyhow::anyhow!("Failed to encrypt file {}: {}", name, e))?;
                 file_cids.push((name, cid.to_string()));
             } else if file_type.is_dir() {
-                let cid = Box::pin(self.upload_dir_encrypted_recursive(builder, &entry.path())).await?;
+                let cid = Box::pin(self.upload_dir_encrypted_recursive(tree, &entry.path())).await?;
                 file_cids.push((name, cid));
             }
         }
@@ -274,10 +274,10 @@ impl HashtreeStore {
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
         let store = Arc::clone(&self.blobs);
-        let reader = TreeReader::new(store);
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
-            reader.get_tree_node(&hash).await
+            tree.get_tree_node(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to get tree node: {}", e))
         })
     }
@@ -439,10 +439,10 @@ impl HashtreeStore {
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
         let store = Arc::clone(&self.blobs);
-        let reader = TreeReader::new(store);
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
-            reader.read_file(&hash).await
+            tree.read_file(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to read file: {}", e))
         })
     }
@@ -453,18 +453,18 @@ impl HashtreeStore {
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
         let store = Arc::clone(&self.blobs);
-        let reader = TreeReader::new(store.clone());
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
             // Get total size
-            let total_size = reader.get_size(&hash).await
+            let total_size = tree.get_size(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to get size: {}", e))?;
 
             // Check if it's a tree (chunked) or blob
-            let is_tree = reader.is_tree(&hash).await
+            let is_tree_node = tree.is_tree(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to check tree: {}", e))?;
 
-            if !is_tree {
+            if !is_tree_node {
                 // Single blob, not chunked
                 return Ok(Some(FileChunkMetadata {
                     total_size,
@@ -475,14 +475,14 @@ impl HashtreeStore {
             }
 
             // Get tree node to extract chunk info
-            let node = match reader.get_tree_node(&hash).await
+            let node = match tree.get_tree_node(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to get tree node: {}", e))? {
                 Some(n) => n,
                 None => return Ok(None),
             };
 
             // Check if it's a directory (has named links)
-            let is_directory = reader.is_directory(&hash).await
+            let is_directory = tree.is_directory(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to check directory: {}", e))?;
 
             if is_directory {
@@ -606,11 +606,11 @@ impl HashtreeStore {
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
         let store = Arc::clone(&self.blobs);
-        let reader = TreeReader::new(store);
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
             // Check if it's a directory
-            let is_dir = reader.is_directory(&hash).await
+            let is_dir = tree.is_directory(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to check directory: {}", e))?;
 
             if !is_dir {
@@ -618,7 +618,7 @@ impl HashtreeStore {
             }
 
             // Get directory entries
-            let tree_entries = reader.list_directory(&hash).await
+            let tree_entries = tree.list_directory(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to list directory: {}", e))?;
 
             let entries: Vec<DirEntry> = tree_entries.into_iter().map(|e| DirEntry {
@@ -674,7 +674,7 @@ impl HashtreeStore {
     pub fn list_pins_with_names(&self) -> Result<Vec<PinnedItem>> {
         let rtxn = self.env.read_txn()?;
         let store = Arc::clone(&self.blobs);
-        let reader = TreeReader::new(store);
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
         let mut pins = Vec::new();
 
         for item in self.pins.iter(&rtxn)? {
@@ -684,7 +684,7 @@ impl HashtreeStore {
             // Try to determine if it's a directory
             let is_directory = if let Ok(hash) = from_hex(&hash_hex_str) {
                 sync_block_on(async {
-                    reader.is_directory(&hash).await.unwrap_or(false)
+                    tree.is_directory(&hash).await.unwrap_or(false)
                 })
             } else {
                 false

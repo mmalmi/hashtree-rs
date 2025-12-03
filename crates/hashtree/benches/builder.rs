@@ -5,11 +5,12 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hashtree::{
-    BuilderConfig, MerkleAlgorithm, MemoryStore, Store, TreeBuilder, TreeReader,
+    HashTree, HashTreeConfig, MerkleAlgorithm, MemoryStore, Store,
     BEP52_CHUNK_SIZE, DEFAULT_CHUNK_SIZE,
 };
-#[cfg(feature = "encryption")]
-use hashtree::{put_file_encrypted, read_file_encrypted, EncryptedTreeConfig};
+// For internal bench-only access to TreeBuilder/TreeReader
+use hashtree::builder::{TreeBuilder, BuilderConfig};
+use hashtree::reader::TreeReader;
 use std::sync::Arc;
 
 /// Generate random data

@@ -53,15 +53,24 @@ pub mod types;
 pub mod crypto;
 
 // Re-exports for convenience
-pub use builder::{BuilderConfig, BuilderError, MerkleAlgorithm, StreamBuilder, StreamStats, TreeBuilder};
+// Main API - unified HashTree
+pub use hashtree::{HashTree, HashTreeConfig, HashTreeError, verify_tree as hashtree_verify_tree};
+
+// Streaming builder
+pub use builder::{BuilderConfig, BuilderError, MerkleAlgorithm, StreamBuilder, StreamStats};
 pub use builder::{BEP52_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_LINKS};
+
+// Low-level codec
 pub use codec::{
     decode_tree_node, encode_and_hash, encode_tree_node, is_directory_node, is_tree_node,
     CodecError,
 };
 pub use hash::{sha256, verify};
-pub use hashtree::{HashTree, HashTreeConfig, HashTreeError, verify_tree as hashtree_verify_tree};
-pub use reader::{verify_tree, ReaderError, TreeEntry, TreeReader, VerifyResult, WalkEntry};
+
+// Reader types (used by HashTree)
+pub use reader::{verify_tree, ReaderError, TreeEntry, VerifyResult, WalkEntry};
+
+// Store
 pub use store::{MemoryStore, Store, StoreError};
 pub use types::{from_hex, hash_equals, to_hex, Cid, CidParseError, DirEntry, Hash, Link, PutResult, TreeNode};
 pub use nhash::{

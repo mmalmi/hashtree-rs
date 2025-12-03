@@ -15,7 +15,7 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use hashtree::{sha256, BuilderConfig, DirEntry, Store, TreeBuilder, TreeReader};
+use hashtree::{sha256, HashTree, HashTreeConfig, DirEntry, Store};
 use hashtree_lmdb::LmdbBlobStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -314,19 +314,18 @@ impl GitStorage {
         };
         let store = self.store.clone();
 
-        let config = BuilderConfig::new(store.clone());
-        let builder = TreeBuilder::new(config);
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
 
         let root_hash = self.runtime.block_on(async {
-            let objects_hash = build_objects_dir(&builder, &store, &objects).await?;
-            let refs_hash = build_refs_dir(&builder, &store, &refs).await?;
+            let objects_hash = build_objects_dir(&tree, &store, &objects).await?;
+            let refs_hash = build_refs_dir(&tree, &store, &refs).await?;
 
             let root_entries = vec![
                 DirEntry::new("objects", objects_hash),
                 DirEntry::new("refs", refs_hash),
             ];
 
-            let root = builder
+            let root = tree
                 .put_directory(root_entries, None)
                 .await
                 .map_err(|e| Error::StorageError(format!("build tree: {}", e)))?;
@@ -368,8 +367,8 @@ impl GitStorage {
         let mut refs = HashMap::new();
 
         self.runtime.block_on(async {
-            let reader = TreeReader::new(store);
-            load_tree_recursive(&reader, root, &mut objects, &mut refs).await
+            let tree = HashTree::new(HashTreeConfig::new(store).public());
+            load_tree_recursive(&tree, root, &mut objects, &mut refs).await
         })?;
 
         // Merge into state
@@ -384,14 +383,14 @@ impl GitStorage {
 
 /// Build objects/ directory in hashtree
 async fn build_objects_dir<S: Store>(
-    builder: &TreeBuilder<S>,
+    tree: &HashTree<S>,
     store: &Arc<S>,
     objects: &HashMap<String, Vec<u8>>,
 ) -> Result<[u8; 32]> {
     let mut entries = Vec::new();
 
     for (sha1, compressed) in objects {
-        let hash = builder
+        let hash = tree
             .put_blob(compressed)
             .await
             .map_err(|e| Error::StorageError(format!("put blob: {}", e)))?;
@@ -407,7 +406,7 @@ async fn build_objects_dir<S: Store>(
         return Ok(hash);
     }
 
-    builder
+    tree
         .put_directory(entries, None)
         .await
         .map_err(|e| Error::StorageError(format!("put objects dir: {}", e)))
@@ -415,7 +414,7 @@ async fn build_objects_dir<S: Store>(
 
 /// Build refs/ directory in hashtree
 async fn build_refs_dir<S: Store>(
-    builder: &TreeBuilder<S>,
+    tree: &HashTree<S>,
     store: &Arc<S>,
     refs: &HashMap<String, String>,
 ) -> Result<[u8; 32]> {
@@ -444,7 +443,7 @@ async fn build_refs_dir<S: Store>(
     for (category, refs_in_category) in groups {
         if category == "HEAD" {
             if let Some((_, value)) = refs_in_category.first() {
-                let hash = builder
+                let hash = tree
                     .put_blob(value.as_bytes())
                     .await
                     .map_err(|e| Error::StorageError(format!("put HEAD: {}", e)))?;
@@ -453,13 +452,13 @@ async fn build_refs_dir<S: Store>(
         } else {
             let mut cat_entries = Vec::new();
             for (name, value) in refs_in_category {
-                let hash = builder
+                let hash = tree
                     .put_blob(value.as_bytes())
                     .await
                     .map_err(|e| Error::StorageError(format!("put ref: {}", e)))?;
                 cat_entries.push(DirEntry::new(name, hash).with_size(value.len() as u64));
             }
-            let cat_hash = builder
+            let cat_hash = tree
                 .put_directory(cat_entries, None)
                 .await
                 .map_err(|e| Error::StorageError(format!("put {} dir: {}", category, e)))?;
@@ -476,21 +475,21 @@ async fn build_refs_dir<S: Store>(
         return Ok(hash);
     }
 
-    builder
+    tree
         .put_directory(ref_entries, None)
         .await
         .map_err(|e| Error::StorageError(format!("put refs dir: {}", e)))
 }
 
-/// Recursively load tree from hashtree using TreeReader walk
+/// Recursively load tree from hashtree using HashTree walk
 async fn load_tree_recursive<S: Store>(
-    reader: &TreeReader<S>,
+    tree: &HashTree<S>,
     root: [u8; 32],
     objects: &mut HashMap<String, Vec<u8>>,
     refs: &mut HashMap<String, String>,
 ) -> Result<()> {
     // Walk the entire tree
-    let entries = reader
+    let entries = tree
         .walk(&root, "")
         .await
         .map_err(|e| Error::StorageError(format!("walk tree: {}", e)))?;
@@ -502,7 +501,7 @@ async fn load_tree_recursive<S: Store>(
         }
 
         // Read the file content
-        let data = reader
+        let data = tree
             .read_file(&entry.hash)
             .await
             .map_err(|e| Error::StorageError(format!("read file: {}", e)))?

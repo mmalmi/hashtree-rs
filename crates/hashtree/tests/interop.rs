@@ -5,7 +5,7 @@
 
 use hashtree::{
     sha256, encode_tree_node, to_hex, from_hex, Link, TreeNode,
-    TreeBuilder, BuilderConfig, MemoryStore,
+    HashTree, HashTreeConfig, MemoryStore,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -156,13 +156,13 @@ async fn test_file_vectors() {
         // Use public() since interop vectors are for unencrypted content
         let store = Arc::new(MemoryStore::new());
         let config = if vector.name == "chunked_file" {
-            BuilderConfig::new(store.clone()).with_chunk_size(10).public()
+            HashTreeConfig::new(store.clone()).with_chunk_size(10).public()
         } else {
-            BuilderConfig::new(store.clone()).public()
+            HashTreeConfig::new(store.clone()).public()
         };
-        let builder = TreeBuilder::new(config);
+        let tree = HashTree::new(config);
 
-        let cid = builder.put(&data).await.unwrap();
+        let cid = tree.put(&data).await.unwrap();
 
         assert_eq!(
             to_hex(&cid.hash),
