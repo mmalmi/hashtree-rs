@@ -315,59 +315,17 @@ impl HashtreeStore {
         // Use unified API with encryption enabled (default)
         let tree = HashTree::new(HashTreeConfig::new(store));
 
-        let result = sync_block_on(async {
-            self.upload_dir_encrypted_recursive(&tree, dir_path, respect_gitignore).await
-        })?;
+        let root_hash = sync_block_on(async {
+            self.upload_dir_recursive(&tree, dir_path, dir_path, respect_gitignore).await
+        }).context("Failed to upload encrypted directory")?;
+
+        let root_hex = to_hex(&root_hash);
 
         let mut wtxn = self.env.write_txn()?;
-        self.pins.put(&mut wtxn, &result, &())?;
+        self.pins.put(&mut wtxn, &root_hex, &())?;
         wtxn.commit()?;
 
-        Ok(result)
-    }
-
-    async fn upload_dir_encrypted_recursive<S: Store>(
-        &self,
-        tree: &HashTree<S>,
-        path: &Path,
-        respect_gitignore: bool,
-    ) -> Result<String> {
-        use ignore::WalkBuilder;
-
-        let mut file_cids = Vec::new();
-
-        let walker = WalkBuilder::new(path)
-            .git_ignore(respect_gitignore)
-            .git_global(respect_gitignore)
-            .git_exclude(respect_gitignore)
-            .hidden(false)
-            .build();
-
-        for result in walker {
-            let entry = result?;
-            let entry_path = entry.path();
-
-            // Skip the root directory itself
-            if entry_path == path {
-                continue;
-            }
-
-            if entry_path.is_file() {
-                let relative = entry_path.strip_prefix(path)
-                    .unwrap_or(entry_path)
-                    .to_string_lossy()
-                    .to_string();
-
-                let content = std::fs::read(entry_path)?;
-                let cid = tree.put(&content).await
-                    .map_err(|e| anyhow::anyhow!("Failed to encrypt file {}: {}", relative, e))?;
-                file_cids.push((relative, cid.to_string()));
-            }
-        }
-
-        // TODO: Create an encrypted directory node that contains all the file CIDs
-        // For now, return a placeholder indicating this is a directory
-        Ok(format!("enc-dir:{}", file_cids.len()))
+        Ok(root_hex)
     }
 
     /// Get tree node by hash (hex)
