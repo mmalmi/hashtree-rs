@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
             if only_hash {
                 // Use in-memory store for hash-only mode
                 use hashtree::store::MemoryStore;
-                use hashtree::{HashTree, HashTreeConfig};
+                use hashtree::{HashTree, HashTreeConfig, to_hex};
                 use std::sync::Arc;
 
                 let store = Arc::new(MemoryStore::new());
@@ -234,13 +234,19 @@ async fn main() -> Result<()> {
 
                 if is_dir {
                     // For directories, use the recursive helper
-                    let cid = add_directory_unified(&tree, &path, !no_ignore).await?;
-                    println!("{}", cid);
+                    let cid = add_directory(&tree, &path, !no_ignore).await?;
+                    println!("hash: {}", to_hex(&cid.hash));
+                    if let Some(key) = cid.key {
+                        println!("key:  {}", to_hex(&key));
+                    }
                 } else {
                     let data = std::fs::read(&path)?;
                     let cid = tree.put(&data).await
                         .map_err(|e| anyhow::anyhow!("Failed to hash file: {}", e))?;
-                    println!("{}", cid);
+                    println!("hash: {}", to_hex(&cid.hash));
+                    if let Some(key) = cid.key {
+                        println!("key:  {}", to_hex(&key));
+                    }
                 }
             } else {
                 // Store in local hashtree
@@ -433,23 +439,25 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Recursively add a directory using unified API (handles encryption automatically)
-/// Returns CID as string (hash or hash:key depending on encryption setting)
-async fn add_directory_unified<S: hashtree::store::Store>(
+/// Recursively add a directory (handles encryption automatically based on tree config)
+async fn add_directory<S: hashtree::store::Store>(
     tree: &hashtree::HashTree<S>,
     dir: &std::path::Path,
     respect_gitignore: bool,
-) -> Result<String> {
+) -> Result<hashtree::Cid> {
     use ignore::WalkBuilder;
+    use hashtree::DirEntry;
+    use std::collections::HashMap;
 
-    let mut file_cids = Vec::new();
+    // Collect files by their parent directory path
+    let mut dir_contents: HashMap<String, Vec<(String, hashtree::Cid)>> = HashMap::new();
 
     // Use ignore crate for gitignore-aware walking
     let walker = WalkBuilder::new(dir)
         .git_ignore(respect_gitignore)
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
-        .hidden(false) // Don't skip hidden files by default (let gitignore decide)
+        .hidden(false)
         .build();
 
     for result in walker {
@@ -461,27 +469,71 @@ async fn add_directory_unified<S: hashtree::store::Store>(
             continue;
         }
 
-        let name = path.strip_prefix(dir)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        let relative = path.strip_prefix(dir).unwrap_or(path);
 
         if path.is_file() {
             let data = std::fs::read(path)?;
             let cid = tree.put(&data).await
                 .map_err(|e| anyhow::anyhow!("Failed to add file {}: {}", path.display(), e))?;
-            file_cids.push((name, cid.to_string()));
+
+            let parent = relative.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let name = relative.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            dir_contents.entry(parent).or_default().push((name, cid));
+        } else if path.is_dir() {
+            // Ensure directory entry exists
+            let dir_path = relative.to_string_lossy().to_string();
+            dir_contents.entry(dir_path).or_default();
         }
-        // Directories are handled implicitly by the walk
     }
 
-    // TODO: Create a proper directory node that contains all file CIDs
-    // For now, return a placeholder indicating this is a directory
-    if file_cids.is_empty() {
-        Ok("empty".to_string())
-    } else {
-        Ok(format!("dir:{}", file_cids.len()))
+    // Build directory tree bottom-up
+    let mut dirs: Vec<String> = dir_contents.keys().cloned().collect();
+    dirs.sort_by(|a, b| {
+        let depth_a = a.matches('/').count() + if a.is_empty() { 0 } else { 1 };
+        let depth_b = b.matches('/').count() + if b.is_empty() { 0 } else { 1 };
+        depth_b.cmp(&depth_a) // Deepest first
+    });
+
+    let mut dir_cids: HashMap<String, hashtree::Cid> = HashMap::new();
+
+    for dir_path in dirs {
+        let files = dir_contents.get(&dir_path).cloned().unwrap_or_default();
+
+        let mut entries: Vec<DirEntry> = files.into_iter()
+            .map(|(name, cid)| DirEntry::from_cid(name, &cid))
+            .collect();
+
+        // Add subdirectory entries
+        for (subdir_path, cid) in &dir_cids {
+            let parent = std::path::Path::new(subdir_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if parent == dir_path {
+                let name = std::path::Path::new(subdir_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                entries.push(DirEntry::from_cid(name, cid));
+            }
+        }
+
+        let cid = tree.put_directory(entries, None).await
+            .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))?;
+
+        dir_cids.insert(dir_path, cid);
     }
+
+    // Return root directory cid
+    dir_cids.get("")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("No root directory"))
 }
 
 /// Calculate total size of a directory
