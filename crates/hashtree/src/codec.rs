@@ -65,6 +65,14 @@ pub fn encode_tree_node(node: &TreeNode) -> Result<Vec<u8>, CodecError> {
                 link_map.push((Value::Text("s".to_string()), Value::Integer(size.into())));
             }
 
+            // k = key (optional, for encrypted links)
+            if let Some(ref key) = link.key {
+                link_map.push((
+                    Value::Text("k".to_string()),
+                    Value::Bytes(key.to_vec()),
+                ));
+            }
+
             Value::Map(link_map)
         })
         .collect();
@@ -244,7 +252,27 @@ pub fn decode_tree_node(data: &[u8]) -> Result<TreeNode, CodecError> {
             }
         });
 
-        links.push(Link { hash, name, size });
+        // Parse optional key (for encrypted links)
+        let key = find_link_value("k").and_then(|v| {
+            if let Value::Bytes(b) = v {
+                if b.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(b);
+                    Some(key)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        links.push(Link {
+            hash,
+            name,
+            size,
+            key,
+        });
     }
 
     // Parse optional totalSize
@@ -343,11 +371,13 @@ mod tests {
                 hash: hash1,
                 name: Some("file1.txt".to_string()),
                 size: Some(100),
+                key: None,
             },
             Link {
                 hash: hash2,
                 name: Some("dir".to_string()),
                 size: Some(500),
+                key: None,
             },
         ]);
 
@@ -418,6 +448,7 @@ mod tests {
             hash: [1u8; 32],
             name: Some("test".to_string()),
             size: None,
+            key: None,
         }]);
 
         let (_, hash1) = encode_and_hash(&node).unwrap();
@@ -452,6 +483,7 @@ mod tests {
             hash: [1u8; 32],
             name: Some("file.txt".to_string()),
             size: None,
+            key: None,
         }]);
         let encoded = encode_tree_node(&node).unwrap();
 

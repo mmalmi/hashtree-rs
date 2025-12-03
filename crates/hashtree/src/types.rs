@@ -38,6 +38,8 @@ pub struct Link {
     pub name: Option<String>,
     /// Size of subtree in bytes (for efficient seeks)
     pub size: Option<u64>,
+    /// Optional decryption key for encrypted links (CHK: content hash)
+    pub key: Option<[u8; 32]>,
 }
 
 impl Link {
@@ -46,6 +48,7 @@ impl Link {
             hash,
             name: None,
             size: None,
+            key: None,
         }
     }
 
@@ -56,6 +59,11 @@ impl Link {
 
     pub fn with_size(mut self, size: u64) -> Self {
         self.size = Some(size);
+        self
+    }
+
+    pub fn with_key(mut self, key: [u8; 32]) -> Self {
+        self.key = Some(key);
         self
     }
 }

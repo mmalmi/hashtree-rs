@@ -151,6 +151,7 @@ impl<S: Store> TreeBuilder<S> {
                             hash,
                             name: None,
                             size: Some(chunk_size),
+                            key: None,
                         }
                     })
                     .collect();
@@ -250,6 +251,7 @@ impl<S: Store> TreeBuilder<S> {
                 hash,
                 name: None,
                 size: Some(batch_size),
+                key: None,
             });
         }
 
@@ -274,6 +276,7 @@ impl<S: Store> TreeBuilder<S> {
                 hash: e.hash,
                 name: Some(e.name),
                 size: e.size,
+                key: None,
             })
             .collect();
 
@@ -383,6 +386,7 @@ impl<S: Store> TreeBuilder<S> {
                 hash,
                 name: Some(format!("_chunk_{}", i * self.max_links)),
                 size: Some(batch_size),
+                key: None,
             });
         }
 
@@ -491,6 +495,7 @@ impl<S: Store> StreamBuilder<S> {
             hash,
             name: None,
             size: Some(chunk.len() as u64),
+            key: None,
         });
 
         self.buffer = Vec::with_capacity(self.chunk_size);
@@ -517,6 +522,7 @@ impl<S: Store> StreamBuilder<S> {
                 hash,
                 name: None,
                 size: Some(chunk.len() as u64),
+                key: None,
             });
         }
 
@@ -587,6 +593,7 @@ impl<S: Store> StreamBuilder<S> {
                 hash,
                 name: None,
                 size: Some(batch_size),
+                key: None,
             });
         }
 
@@ -771,6 +778,7 @@ mod tests {
                     hash,
                     name: Some("test".to_string()),
                     size: Some(1),
+                    key: None,
                 }],
                 Some(metadata.clone()),
             )

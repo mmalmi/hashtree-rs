@@ -1,12 +1,15 @@
 //! TreeBuilder benchmark comparing CBOR vs Binary merkle algorithms
+//! and encrypted vs non-encrypted performance.
 //!
-//! Run with: cargo bench -p hashtree
+//! Run with: cargo bench -p hashtree --features encryption
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hashtree::{
     BuilderConfig, MerkleAlgorithm, MemoryStore, Store, TreeBuilder, TreeReader,
     BEP52_CHUNK_SIZE, DEFAULT_CHUNK_SIZE,
 };
+#[cfg(feature = "encryption")]
+use hashtree::{put_file_encrypted, read_file_encrypted, EncryptedTreeConfig};
 use std::sync::Arc;
 
 /// Generate random data
@@ -176,6 +179,213 @@ fn bench_roundtrip(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark encrypted vs non-encrypted write performance
+#[cfg(feature = "encryption")]
+fn bench_encrypted_write(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("encrypted_write");
+
+    let sizes = [
+        (1, "1MB"),
+        (10, "10MB"),
+    ];
+
+    for (size_mb, size_name) in sizes {
+        let size = size_mb * 1024 * 1024;
+        let data = random_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Non-encrypted
+        group.bench_with_input(
+            BenchmarkId::new("plain", size_name),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let store = Arc::new(MemoryStore::new());
+                        let config = BuilderConfig::new(store);
+                        let builder = TreeBuilder::new(config);
+                        builder.put_file(black_box(data)).await.unwrap()
+                    })
+                })
+            },
+        );
+
+        // Encrypted
+        group.bench_with_input(
+            BenchmarkId::new("encrypted", size_name),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let store = Arc::new(MemoryStore::new());
+                        let config = EncryptedTreeConfig {
+                            store,
+                            chunk_size: DEFAULT_CHUNK_SIZE,
+                            max_links: 174,
+                        };
+                        put_file_encrypted(&config, black_box(data)).await.unwrap()
+                    })
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark encrypted vs non-encrypted read performance
+#[cfg(feature = "encryption")]
+fn bench_encrypted_read(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("encrypted_read");
+
+    let sizes = [
+        (1, "1MB"),
+        (10, "10MB"),
+    ];
+
+    for (size_mb, size_name) in sizes {
+        let size = size_mb * 1024 * 1024;
+        let data = random_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Non-encrypted - pre-build
+        let (plain_store, plain_hash) = rt.block_on(async {
+            let store = Arc::new(MemoryStore::new());
+            let config = BuilderConfig::new(store.clone());
+            let builder = TreeBuilder::new(config);
+            let result = builder.put_file(&data).await.unwrap();
+            (store, result.hash)
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("plain", size_name),
+            &(plain_store.clone(), plain_hash),
+            |b, (store, hash)| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let reader = TreeReader::new(store.clone());
+                        reader.read_file(black_box(hash)).await.unwrap()
+                    })
+                })
+            },
+        );
+
+        // Encrypted - pre-build
+        let (enc_store, enc_hash, enc_key) = rt.block_on(async {
+            let store = Arc::new(MemoryStore::new());
+            let config = EncryptedTreeConfig {
+                store: store.clone(),
+                chunk_size: DEFAULT_CHUNK_SIZE,
+                max_links: 174,
+            };
+            let result = put_file_encrypted(&config, &data).await.unwrap();
+            (store, result.hash, result.key)
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("encrypted", size_name),
+            &(enc_store.clone(), enc_hash, enc_key),
+            |b, (store, hash, key)| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        read_file_encrypted(store.as_ref(), black_box(hash), black_box(key))
+                            .await
+                            .unwrap()
+                    })
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark encrypted vs non-encrypted directory write performance
+#[cfg(feature = "encryption")]
+fn bench_encrypted_dir_write(c: &mut Criterion) {
+    use hashtree::DirEntry;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("encrypted_dir_write");
+
+    // Test with different numbers of files
+    let file_counts = [100, 1000];
+    let file_size = 10 * 1024; // 10KB per file
+
+    for file_count in file_counts {
+        let total_size = file_count * file_size;
+        let files: Vec<(String, Vec<u8>)> = (0..file_count)
+            .map(|i| (format!("file_{:05}.txt", i), random_data(file_size)))
+            .collect();
+
+        group.throughput(Throughput::Bytes(total_size as u64));
+
+        // Non-encrypted directory
+        group.bench_with_input(
+            BenchmarkId::new("plain", format!("{}files", file_count)),
+            &files,
+            |b, files| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let store = Arc::new(MemoryStore::new());
+                        let config = BuilderConfig::new(store.clone());
+                        let builder = TreeBuilder::new(config);
+
+                        let mut entries = Vec::new();
+                        for (name, data) in files {
+                            let result = builder.put_file(data).await.unwrap();
+                            entries.push(DirEntry::new(name.clone(), result.hash).with_size(result.size));
+                        }
+                        builder.put_directory(entries, None).await.unwrap()
+                    })
+                })
+            },
+        );
+
+        // Encrypted directory
+        group.bench_with_input(
+            BenchmarkId::new("encrypted", format!("{}files", file_count)),
+            &files,
+            |b, files| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let store = Arc::new(MemoryStore::new());
+                        let config = EncryptedTreeConfig {
+                            store: store.clone(),
+                            chunk_size: DEFAULT_CHUNK_SIZE,
+                            max_links: 174,
+                        };
+
+                        let mut _hashes = Vec::new();
+                        for (_name, data) in files {
+                            let result = put_file_encrypted(&config, data).await.unwrap();
+                            _hashes.push((result.hash, result.key));
+                        }
+                        // Note: encrypted directories would need separate implementation
+                        // This just benchmarks encrypting all files
+                    })
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(feature = "encryption")]
+criterion_group!(
+    benches,
+    bench_tree_builder,
+    bench_tree_reader,
+    bench_roundtrip,
+    bench_encrypted_write,
+    bench_encrypted_read,
+    bench_encrypted_dir_write,
+);
+
+#[cfg(not(feature = "encryption"))]
 criterion_group!(
     benches,
     bench_tree_builder,

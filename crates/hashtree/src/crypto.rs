@@ -1,16 +1,18 @@
 //! Content Hash Key (CHK) encryption for HashTree
 //!
+//! **⚠️ EXPERIMENTAL: Encryption API is unstable and may change.**
+//!
 //! Uses convergent encryption where the key is derived from the content itself.
 //! This enables deduplication: same content → same ciphertext.
 //!
 //! Algorithm:
 //! 1. content_hash = SHA256(plaintext)
 //! 2. key = HKDF-SHA256(content_hash, salt="hashtree-chk", info="encryption-key")
-//! 3. nonce = HKDF-SHA256(content_hash, salt="hashtree-chk", info="nonce")[0..12]
-//! 4. ciphertext = AES-256-GCM(key, nonce, plaintext)
+//! 3. ciphertext = AES-256-GCM(key, zero_nonce, plaintext)
+//!
+//! Zero nonce is safe because CHK guarantees same key = same content.
 //!
 //! Format: [ciphertext][16-byte auth tag]
-//! (No IV prefix needed - it's derived from content hash which caller must store)
 //!
 //! The content_hash acts as the "decryption key" - store it securely.
 
@@ -49,19 +51,15 @@ pub enum CryptoError {
     KeyDerivationFailed,
 }
 
-/// Derive encryption key and nonce from content hash using HKDF
-fn derive_key_and_nonce(content_hash: &[u8; 32]) -> Result<([u8; 32], [u8; NONCE_SIZE]), CryptoError> {
+/// Derive encryption key from content hash using HKDF
+fn derive_key(content_hash: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(CHK_SALT), content_hash);
 
     let mut key = [0u8; 32];
     hk.expand(b"encryption-key", &mut key)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
 
-    let mut nonce = [0u8; NONCE_SIZE];
-    hk.expand(b"nonce", &mut nonce)
-        .map_err(|_| CryptoError::KeyDerivationFailed)?;
-
-    Ok((key, nonce))
+    Ok(key)
 }
 
 /// Generate a random 32-byte key (for non-CHK encryption)
@@ -79,28 +77,32 @@ pub fn content_hash(data: &[u8]) -> EncryptionKey {
     result
 }
 
-/// CHK encrypt: derive key from content, encrypt deterministically
+/// CHK encrypt: derive key from content, encrypt with zero nonce
 ///
 /// Returns: (ciphertext with auth tag, content_hash as decryption key)
+///
+/// Zero nonce is safe because CHK guarantees: same key = same content.
+/// We never encrypt different content with the same key.
 ///
 /// The content_hash is both:
 /// - The decryption key (store securely, share with authorized users)
 /// - Enables dedup: same content → same ciphertext
 pub fn encrypt_chk(plaintext: &[u8]) -> Result<(Vec<u8>, EncryptionKey), CryptoError> {
     let chash = content_hash(plaintext);
-    let (key, nonce) = derive_key_and_nonce(&chash)?;
+    let key = derive_key(&chash)?;
+    let zero_nonce = [0u8; NONCE_SIZE];
 
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(Nonce::from_slice(&zero_nonce), plaintext)
         .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
     Ok((ciphertext, chash))
 }
 
-/// CHK decrypt: derive key from content_hash, decrypt
+/// CHK decrypt: derive key from content_hash, decrypt with zero nonce
 ///
 /// The key parameter is the content_hash returned from encrypt_chk
 pub fn decrypt_chk(ciphertext: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, CryptoError> {
@@ -108,13 +110,14 @@ pub fn decrypt_chk(ciphertext: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, Cr
         return Err(CryptoError::DataTooShort);
     }
 
-    let (enc_key, nonce) = derive_key_and_nonce(key)?;
+    let enc_key = derive_key(key)?;
+    let zero_nonce = [0u8; NONCE_SIZE];
 
     let cipher = Aes256Gcm::new_from_slice(&enc_key)
         .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
 
     cipher
-        .decrypt(Nonce::from_slice(&nonce), ciphertext)
+        .decrypt(Nonce::from_slice(&zero_nonce), ciphertext)
         .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
 }
 

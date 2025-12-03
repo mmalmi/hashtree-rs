@@ -151,6 +151,7 @@ impl<S: Store> HashTree<S> {
                     hash,
                     name: None,
                     size: Some(chunk_size),
+                    key: None,
                 }
             })
             .collect();
@@ -175,6 +176,7 @@ impl<S: Store> HashTree<S> {
                 hash: e.hash,
                 name: Some(e.name),
                 size: e.size,
+                key: None,
             })
             .collect();
 
@@ -246,6 +248,7 @@ impl<S: Store> HashTree<S> {
                 hash,
                 name: None,
                 size: Some(batch_size),
+                key: None,
             });
         }
 
@@ -280,6 +283,7 @@ impl<S: Store> HashTree<S> {
                 hash,
                 name: Some(format!("_chunk_{}", i * self.max_links)),
                 size: Some(batch_size),
+                key: None,
             });
         }
 

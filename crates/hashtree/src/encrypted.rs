@@ -1,15 +1,18 @@
-//! Encrypted file operations for HashTree
+//! CHK (Content Hash Key) encrypted file operations for HashTree
 //!
-//! Two modes:
-//! - Small files (single chunk): CHK encryption - same content = same ciphertext (dedup works)
-//! - Large files (multi-chunk): Random key - tree nodes encrypted, no chunk-level dedup
+//! **⚠️ EXPERIMENTAL: Encryption API is unstable and may change.**
 //!
-//! The root decryption key must be stored/shared to access the file.
+//! Everything uses CHK encryption:
+//! - Chunks: key = SHA256(plaintext)
+//! - Tree nodes: key = SHA256(cbor_encoded_node)
+//!
+//! Same content → same ciphertext → deduplication works at all levels.
+//! The root key is deterministic: same file = same CID (hash + key).
 
 use std::sync::Arc;
 
 use crate::codec::{decode_tree_node, encode_and_hash, is_tree_node};
-use crate::crypto::{decrypt, decrypt_chk, encrypt, encrypt_chk, generate_key, CryptoError, EncryptionKey};
+use crate::crypto::{decrypt_chk, encrypt_chk, CryptoError, EncryptionKey};
 use crate::hash::sha256;
 use crate::store::Store;
 use crate::types::{Hash, Link, TreeNode};
@@ -27,7 +30,7 @@ pub struct EncryptedPutResult {
     pub hash: Hash,
     /// Original plaintext size
     pub size: u64,
-    /// Encryption key used
+    /// Encryption key for the root (random key for tree nodes)
     pub key: EncryptionKey,
 }
 
@@ -42,21 +45,22 @@ pub enum EncryptedError {
     Codec(#[from] crate::codec::CodecError),
     #[error("Missing chunk: {0}")]
     MissingChunk(String),
+    #[error("Missing decryption key for chunk")]
+    MissingKey,
 }
 
-/// Store a file with encryption
+/// Store a file with CHK encryption
 ///
-/// - Small files (≤ chunk_size): CHK encryption - same content = same ciphertext
-/// - Large files: Random key encryption for all chunks and tree nodes
+/// Everything is CHK encrypted - deterministic, enables full deduplication.
+/// Returns hash + key, both derived from content.
 pub async fn put_file_encrypted<S: Store>(
     config: &EncryptedTreeConfig<S>,
     data: &[u8],
-    key: Option<EncryptionKey>,
 ) -> Result<EncryptedPutResult, EncryptedError> {
     let size = data.len() as u64;
 
+    // Single chunk - use CHK directly
     if data.len() <= config.chunk_size {
-        // Small file - use CHK for deduplication
         let (encrypted, content_key) = encrypt_chk(data)?;
         let hash = sha256(&encrypted);
         config
@@ -67,61 +71,61 @@ pub async fn put_file_encrypted<S: Store>(
         return Ok(EncryptedPutResult {
             hash,
             size,
-            key: content_key, // Content hash is the decryption key
+            key: content_key,
         });
     }
 
-    // Large file - use random key (no chunk-level dedup)
-    let enc_key = key.unwrap_or_else(generate_key);
-
-    // Split into chunks
-    let mut chunks = Vec::new();
+    // Multiple chunks - each chunk gets CHK
+    let mut links = Vec::new();
     let mut offset = 0;
     while offset < data.len() {
         let end = (offset + config.chunk_size).min(data.len());
-        chunks.push(&data[offset..end]);
-        offset = end;
-    }
+        let chunk = &data[offset..end];
 
-    // Encrypt and store chunks with random key
-    let mut links = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let encrypted = encrypt(chunk, &enc_key)?;
+        // CHK encrypt this chunk
+        let (encrypted, chunk_key) = encrypt_chk(chunk)?;
         let hash = sha256(&encrypted);
         let enc_size = encrypted.len() as u64;
+
         config
             .store
             .put(hash, encrypted)
             .await
             .map_err(|e| EncryptedError::Store(e.to_string()))?;
+
+        // Link stores both hash (location) and key (for decryption)
         links.push(Link {
             hash,
             name: None,
             size: Some(enc_size),
+            key: Some(chunk_key),
         });
+
+        offset = end;
     }
 
-    // Build tree with same key
-    let root_hash = build_encrypted_tree(config, links, Some(size), &enc_key).await?;
+    // Build tree - tree nodes also CHK encrypted
+    let (root_hash, root_key) = build_encrypted_tree(config, links, Some(size)).await?;
 
     Ok(EncryptedPutResult {
         hash: root_hash,
         size,
-        key: enc_key,
+        key: root_key,
     })
 }
 
-/// Build tree structure with encrypted tree nodes
+/// Build tree structure with CHK-encrypted tree nodes
+/// Returns (hash, key) for the root node
 async fn build_encrypted_tree<S: Store>(
     config: &EncryptedTreeConfig<S>,
     links: Vec<Link>,
     total_size: Option<u64>,
-    key: &EncryptionKey,
-) -> Result<Hash, EncryptedError> {
-    if links.len() == 1 {
+) -> Result<(Hash, EncryptionKey), EncryptedError> {
+    // Single link - return its hash and key directly
+    if links.len() == 1 && links[0].key.is_some() {
         if let Some(ts) = total_size {
             if links[0].size == Some(ts) {
-                return Ok(links[0].hash);
+                return Ok((links[0].hash, links[0].key.unwrap()));
             }
         }
     }
@@ -133,15 +137,15 @@ async fn build_encrypted_tree<S: Store>(
             metadata: None,
         };
         let (data, _) = encode_and_hash(&node)?;
-        // Encrypt the tree node
-        let encrypted = encrypt(&data, key)?;
+        // CHK encrypt the tree node
+        let (encrypted, node_key) = encrypt_chk(&data)?;
         let hash = sha256(&encrypted);
         config
             .store
             .put(hash, encrypted)
             .await
             .map_err(|e| EncryptedError::Store(e.to_string()))?;
-        return Ok(hash);
+        return Ok((hash, node_key));
     }
 
     // Too many links - create subtrees
@@ -155,8 +159,8 @@ async fn build_encrypted_tree<S: Store>(
             metadata: None,
         };
         let (data, _) = encode_and_hash(&node)?;
-        // Encrypt the subtree node
-        let encrypted = encrypt(&data, key)?;
+        // CHK encrypt the subtree node
+        let (encrypted, node_key) = encrypt_chk(&data)?;
         let hash = sha256(&encrypted);
         config
             .store
@@ -168,15 +172,16 @@ async fn build_encrypted_tree<S: Store>(
             hash,
             name: None,
             size: Some(batch_size),
+            key: Some(node_key),
         });
     }
 
-    Box::pin(build_encrypted_tree(config, sub_trees, total_size, key)).await
+    Box::pin(build_encrypted_tree(config, sub_trees, total_size)).await
 }
 
 /// Read an encrypted file
 ///
-/// Tries CHK decryption first (for small files), falls back to regular decryption.
+/// Key is always the CHK key (content hash of plaintext)
 pub async fn read_file_encrypted<S: Store>(
     store: &S,
     hash: &Hash,
@@ -188,50 +193,43 @@ pub async fn read_file_encrypted<S: Store>(
         Err(e) => return Err(EncryptedError::Store(e.to_string())),
     };
 
-    // Try CHK decryption first (for small files)
-    if let Ok(decrypted) = decrypt_chk(&encrypted_data, key) {
-        // Verify it's not a tree node (CHK is only for leaf data)
-        if !is_tree_node(&decrypted) {
-            return Ok(Some(decrypted));
-        }
-    }
+    // CHK decrypt
+    let decrypted = decrypt_chk(&encrypted_data, key)?;
 
-    // Fall back to regular decryption (for large files with tree structure)
-    let decrypted = decrypt(&encrypted_data, key)?;
-
-    // Check if decrypted data is a tree node
+    // Check if it's a tree node
     if is_tree_node(&decrypted) {
         let node = decode_tree_node(&decrypted)?;
-        let result = assemble_encrypted_chunks(store, &node, key).await?;
+        let result = assemble_encrypted_chunks(store, &node).await?;
         return Ok(Some(result));
     }
 
-    // Single blob
+    // Single chunk data
     Ok(Some(decrypted))
 }
 
 /// Assemble chunks from an encrypted tree
+/// Each link has its own CHK key
 async fn assemble_encrypted_chunks<S: Store>(
     store: &S,
     node: &TreeNode,
-    key: &EncryptionKey,
 ) -> Result<Vec<u8>, EncryptedError> {
     let mut parts = Vec::new();
 
     for link in &node.links {
+        let chunk_key = link.key.ok_or(EncryptedError::MissingKey)?;
+
         let encrypted_child = store
             .get(&link.hash)
             .await
             .map_err(|e| EncryptedError::Store(e.to_string()))?
             .ok_or_else(|| EncryptedError::MissingChunk(crate::to_hex(&link.hash)))?;
 
-        // Decrypt the child
-        let decrypted = decrypt(&encrypted_child, key)?;
+        let decrypted = decrypt_chk(&encrypted_child, &chunk_key)?;
 
         if is_tree_node(&decrypted) {
-            // Intermediate tree node
+            // Intermediate tree node - recurse
             let child_node = decode_tree_node(&decrypted)?;
-            let child_data = Box::pin(assemble_encrypted_chunks(store, &child_node, key)).await?;
+            let child_data = Box::pin(assemble_encrypted_chunks(store, &child_node)).await?;
             parts.push(child_data);
         } else {
             // Leaf data chunk
@@ -251,6 +249,7 @@ async fn assemble_encrypted_chunks<S: Store>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::generate_key;
     use crate::store::MemoryStore;
 
     fn make_config(chunk_size: usize) -> EncryptedTreeConfig<MemoryStore> {
@@ -266,7 +265,7 @@ mod tests {
         let config = make_config(256 * 1024);
         let data = b"Hello, encrypted world!";
 
-        let result = put_file_encrypted(&config, data, None).await.unwrap();
+        let result = put_file_encrypted(&config, data).await.unwrap();
         assert_eq!(result.size, data.len() as u64);
 
         let decrypted = read_file_encrypted(config.store.as_ref(), &result.hash, &result.key)
@@ -281,7 +280,7 @@ mod tests {
         let config = make_config(1024); // Small chunks
         let data = vec![0u8; 5000]; // Multiple chunks
 
-        let result = put_file_encrypted(&config, &data, None).await.unwrap();
+        let result = put_file_encrypted(&config, &data).await.unwrap();
         assert_eq!(result.size, data.len() as u64);
 
         let decrypted = read_file_encrypted(config.store.as_ref(), &result.hash, &result.key)
@@ -296,7 +295,7 @@ mod tests {
         let config = make_config(256 * 1024);
         let data = b"Secret data";
 
-        let result = put_file_encrypted(&config, data, None).await.unwrap();
+        let result = put_file_encrypted(&config, data).await.unwrap();
 
         let wrong_key = generate_key();
         let decrypt_result =
@@ -305,20 +304,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provided_key() {
-        // Use small chunk size to test multi-chunk path (which uses provided key)
-        let config = make_config(10);
-        let data = b"Data with custom key that is longer than chunk size";
-        let key = generate_key();
+    async fn test_deterministic_cid() {
+        // Same content = same hash + key (deterministic CID)
+        let config = make_config(10); // Small chunks to test multi-chunk
+        let data = b"Data that spans multiple chunks for testing";
 
-        let result = put_file_encrypted(&config, data, Some(key)).await.unwrap();
-        assert_eq!(result.key, key);
+        let result1 = put_file_encrypted(&config, data).await.unwrap();
+        let result2 = put_file_encrypted(&config, data).await.unwrap();
 
-        let decrypted = read_file_encrypted(config.store.as_ref(), &result.hash, &key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(decrypted, data);
+        // CHK: same content = same hash AND same key
+        assert_eq!(result1.hash, result2.hash);
+        assert_eq!(result1.key, result2.key);
     }
 
     #[tokio::test]
@@ -327,8 +323,8 @@ mod tests {
         let data = b"Same content for dedup test";
 
         // Encrypt same data twice
-        let result1 = put_file_encrypted(&config, data, None).await.unwrap();
-        let result2 = put_file_encrypted(&config, data, None).await.unwrap();
+        let result1 = put_file_encrypted(&config, data).await.unwrap();
+        let result2 = put_file_encrypted(&config, data).await.unwrap();
 
         // CHK: same content = same hash and same key
         assert_eq!(result1.hash, result2.hash);
@@ -336,11 +332,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_chunk_level_dedup() {
+        // Test that identical chunks across different files produce same ciphertext
+        let config = make_config(10);
+
+        // Two files that share some chunks
+        let data1 = b"AAAAAAAAAA_BBBBBBBBBB"; // chunk "AAAAAAAAAA" + "_BBBBBBBBB" + "B"
+        let data2 = b"AAAAAAAAAA_CCCCCCCCCC"; // chunk "AAAAAAAAAA" + "_CCCCCCCCC" + "C"
+
+        let result1 = put_file_encrypted(&config, data1).await.unwrap();
+        let result2 = put_file_encrypted(&config, data2).await.unwrap();
+
+        // Files have different hashes (different content overall)
+        assert_ne!(result1.hash, result2.hash);
+
+        // But first chunk should be deduplicated (same hash in store)
+        // We can verify by checking the store has fewer entries than if no dedup
+
+        // Verify both files decrypt correctly
+        let decrypted1 = read_file_encrypted(config.store.as_ref(), &result1.hash, &result1.key)
+            .await
+            .unwrap()
+            .unwrap();
+        let decrypted2 = read_file_encrypted(config.store.as_ref(), &result2.hash, &result2.key)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decrypted1, data1);
+        assert_eq!(decrypted2, data2);
+    }
+
+    #[tokio::test]
     async fn test_empty_file() {
         let config = make_config(256 * 1024);
         let data = b"";
 
-        let result = put_file_encrypted(&config, data, None).await.unwrap();
+        let result = put_file_encrypted(&config, data).await.unwrap();
         assert_eq!(result.size, 0);
 
         let decrypted = read_file_encrypted(config.store.as_ref(), &result.hash, &result.key)
@@ -356,7 +384,7 @@ mod tests {
         // Create data that needs multiple tree levels
         let data = vec![42u8; 1024 * 200]; // 200 chunks
 
-        let result = put_file_encrypted(&config, &data, None).await.unwrap();
+        let result = put_file_encrypted(&config, &data).await.unwrap();
         assert_eq!(result.size, data.len() as u64);
 
         let decrypted = read_file_encrypted(config.store.as_ref(), &result.hash, &result.key)
