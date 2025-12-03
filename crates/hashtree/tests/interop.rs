@@ -95,6 +95,7 @@ fn test_tree_node_encoding_vectors() {
                 hash,
                 name: l.name.clone(),
                 size: l.size,
+                key: None,
             }
         }).collect();
 
@@ -198,4 +199,76 @@ fn test_hex_roundtrip() {
     let hex = to_hex(&original);
     let result = from_hex(&hex).unwrap();
     assert_eq!(result, original);
+}
+
+#[test]
+fn test_chk_encryption_vectors() {
+    use hashtree::crypto::{encrypt_chk, decrypt_chk};
+
+    let vectors = load_vectors();
+
+    for vector in vectors.iter().filter(|v| v.input.input_type == "chk") {
+        let plaintext = hex::decode(vector.input.data.as_ref().unwrap()).unwrap();
+
+        // Encrypt and verify key and ciphertext match
+        let (ciphertext, key) = encrypt_chk(&plaintext).unwrap();
+
+        // Get expected values from JSON
+        let expected = &vector.expected;
+
+        assert_eq!(
+            hex::encode(&key),
+            expected.hash, // We store key in hash field for CHK vectors
+            "CHK key mismatch for {}",
+            vector.name
+        );
+
+        if let Some(ref expected_ciphertext) = expected.cbor {
+            // We store ciphertext in cbor field for CHK vectors
+            assert_eq!(
+                hex::encode(&ciphertext),
+                *expected_ciphertext,
+                "CHK ciphertext mismatch for {}",
+                vector.name
+            );
+        }
+
+        // Verify decryption works
+        let decrypted = decrypt_chk(&ciphertext, &key).unwrap();
+        assert_eq!(decrypted, plaintext, "CHK decrypt mismatch for {}", vector.name);
+
+        println!("✓ {}: key, ciphertext, and decrypt match", vector.name);
+    }
+}
+
+/// Generate CHK test vectors - run with: cargo test generate_chk_vectors -- --nocapture --ignored
+#[test]
+#[ignore]
+fn generate_chk_vectors() {
+    use hashtree::crypto::encrypt_chk;
+
+    let test_cases = vec![
+        ("chk_empty", ""),
+        ("chk_hello", "hello"),
+        ("chk_binary", "\x01\x02\x03\x04\x05"),
+        ("chk_longer", "This is a longer message for testing CHK encryption interoperability."),
+    ];
+
+    println!("\n// Add these to interop-vectors.json:");
+    for (name, plaintext) in test_cases {
+        let data = plaintext.as_bytes();
+        let (ciphertext, key) = encrypt_chk(data).unwrap();
+
+        println!(r#"  {{
+    "name": "{}",
+    "input": {{
+      "type": "chk",
+      "data": "{}"
+    }},
+    "expected": {{
+      "hash": "{}",
+      "cbor": "{}"
+    }}
+  }},"#, name, hex::encode(data), hex::encode(&key), hex::encode(&ciphertext));
+    }
 }

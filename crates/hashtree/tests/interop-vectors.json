@@ -156,5 +156,49 @@
       "hash": "b8fea8d19986e6f5c9540991a7f13f3a6b75c7ce96f579cd53c86dc57097288a",
       "size": 46
     }
+  },
+  {
+    "name": "chk_empty",
+    "input": {
+      "type": "chk",
+      "data": ""
+    },
+    "expected": {
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "cbor": "7cd161ae8406d82cdf553c1100d012db"
+    }
+  },
+  {
+    "name": "chk_hello",
+    "input": {
+      "type": "chk",
+      "data": "68656c6c6f"
+    },
+    "expected": {
+      "hash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "cbor": "c65308d9c8649ff1c59820d0b3a030db34ad00f92d"
+    }
+  },
+  {
+    "name": "chk_binary",
+    "input": {
+      "type": "chk",
+      "data": "0102030405"
+    },
+    "expected": {
+      "hash": "74f81fe167d99b4cb41d6d0ccda82278caee9f3e2f25d5e5a3936ff3dcec60d0",
+      "cbor": "ccda50aa92b688834e3bbefe531dc17574deb4c8a8"
+    }
+  },
+  {
+    "name": "chk_longer",
+    "input": {
+      "type": "chk",
+      "data": "546869732069732061206c6f6e676572206d65737361676520666f722074657374696e672043484b20656e6372797074696f6e20696e7465726f7065726162696c6974792e"
+    },
+    "expected": {
+      "hash": "c6c3cdfd45f3161235b73e23090f2621c9af64514cd6aab0f77af347e8c161e3",
+      "cbor": "80550b15be16a63e9ed12b09b00004a4e42b33331cf15d87a6b05637cfa7b04da1906c90ec12a526c626f75105c60769cbcf9ee669c059ce710b3f80f143ca2368b91f821874edb19da6f77f98b3ca46d0edf7d1e0"
+    }
   }
 ]
