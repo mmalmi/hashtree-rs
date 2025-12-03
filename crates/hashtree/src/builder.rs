@@ -437,6 +437,7 @@ impl<S: Store> TreeBuilder<S> {
                     name: format!("_{}", key),
                     hash,
                     size: Some(group_size),
+                    key: None,
                 });
             } else {
                 // Recursively split this group
@@ -447,6 +448,7 @@ impl<S: Store> TreeBuilder<S> {
                     name: format!("_{}", key),
                     hash,
                     size: Some(group_size),
+                    key: None,
                 });
             }
         }

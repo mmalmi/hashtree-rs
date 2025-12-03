@@ -12,13 +12,15 @@ use hashtree::{
 
 fn make_tree() -> (Arc<MemoryStore>, HashTree<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
-    let tree = HashTree::new(HashTreeConfig::new(store.clone()));
+    // Use public (unencrypted) mode for these tests
+    let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
     (store, tree)
 }
 
 fn make_tree_with_chunk_size(chunk_size: usize) -> (Arc<MemoryStore>, HashTree<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
-    let tree = HashTree::new(HashTreeConfig::new(store.clone()).with_chunk_size(chunk_size));
+    // Use public (unencrypted) mode for these tests
+    let tree = HashTree::new(HashTreeConfig::new(store.clone()).public().with_chunk_size(chunk_size));
     (store, tree)
 }
 

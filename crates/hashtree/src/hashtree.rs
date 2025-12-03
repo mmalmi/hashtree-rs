@@ -598,11 +598,32 @@ impl<S: Store> HashTree<S> {
     }
 
     /// Build a directory from entries
+    /// Returns Cid with key if encrypted
+    pub async fn put_dir(
+        &self,
+        entries: Vec<DirEntry>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<Cid, HashTreeError> {
+        self.put_directory_internal(entries, metadata).await
+    }
+
+    /// Build a directory from entries (returns Hash for backwards compatibility)
     pub async fn put_directory(
         &self,
         entries: Vec<DirEntry>,
         metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<Hash, HashTreeError> {
+        let cid = self.put_directory_internal(entries, metadata).await?;
+        Ok(cid.hash)
+    }
+
+    /// Internal directory builder
+    /// Directory CBOR is encrypted if encryption is enabled
+    async fn put_directory_internal(
+        &self,
+        entries: Vec<DirEntry>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<Cid, HashTreeError> {
         // Sort entries by name for deterministic hashing
         let mut sorted = entries;
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -613,7 +634,7 @@ impl<S: Store> HashTree<S> {
                 hash: e.hash,
                 name: Some(e.name),
                 size: e.size,
-                key: None,
+                key: e.key,
             })
             .collect();
 
@@ -626,16 +647,16 @@ impl<S: Store> HashTree<S> {
                 total_size: Some(total_size),
                 metadata,
             };
-            let (data, hash) = encode_and_hash(&node)?;
-            self.store
-                .put(hash, data)
-                .await
-                .map_err(|e| HashTreeError::Store(e.to_string()))?;
-            return Ok(hash);
+            let (data, _plain_hash) = encode_and_hash(&node)?;
+
+            // Encrypt directory CBOR if encryption is enabled
+            let (hash, key) = self.put_chunk_internal(&data).await?;
+
+            return Ok(Cid { hash, key, size: total_size });
         }
 
         // Large directory - create sub-trees
-        self.build_directory_by_chunks(links, total_size, metadata).await
+        self.build_directory_by_chunks_internal(links, total_size, metadata).await
     }
 
     /// Build a balanced tree from links
@@ -694,12 +715,13 @@ impl<S: Store> HashTree<S> {
     }
 
     /// Split directory into numeric chunks
-    async fn build_directory_by_chunks(
+    /// Directory chunks are encrypted if encryption is enabled
+    async fn build_directory_by_chunks_internal(
         &self,
         links: Vec<Link>,
         total_size: u64,
         metadata: Option<HashMap<String, serde_json::Value>>,
-    ) -> Result<Hash, HashTreeError> {
+    ) -> Result<Cid, HashTreeError> {
         let mut sub_trees: Vec<Link> = Vec::new();
 
         for (i, batch) in links.chunks(self.max_links).enumerate() {
@@ -710,17 +732,16 @@ impl<S: Store> HashTree<S> {
                 total_size: Some(batch_size),
                 metadata: None,
             };
-            let (data, hash) = encode_and_hash(&node)?;
-            self.store
-                .put(hash, data)
-                .await
-                .map_err(|e| HashTreeError::Store(e.to_string()))?;
+            let (data, _plain_hash) = encode_and_hash(&node)?;
+
+            // Encrypt directory chunk if encryption is enabled
+            let (hash, key) = self.put_chunk_internal(&data).await?;
 
             sub_trees.push(Link {
                 hash,
                 name: Some(format!("_chunk_{}", i * self.max_links)),
                 size: Some(batch_size),
-                key: None,
+                key,
             });
         }
 
@@ -730,16 +751,15 @@ impl<S: Store> HashTree<S> {
                 total_size: Some(total_size),
                 metadata,
             };
-            let (data, hash) = encode_and_hash(&node)?;
-            self.store
-                .put(hash, data)
-                .await
-                .map_err(|e| HashTreeError::Store(e.to_string()))?;
-            return Ok(hash);
+            let (data, _plain_hash) = encode_and_hash(&node)?;
+
+            // Encrypt root directory if encryption is enabled
+            let (hash, key) = self.put_chunk_internal(&data).await?;
+            return Ok(Cid { hash, key, size: total_size });
         }
 
         // Recursively build more levels
-        Box::pin(self.build_directory_by_chunks(sub_trees, total_size, metadata)).await
+        Box::pin(self.build_directory_by_chunks_internal(sub_trees, total_size, metadata)).await
     }
 
     /// Create a tree node with custom links and metadata
@@ -774,7 +794,7 @@ impl<S: Store> HashTree<S> {
             .map_err(|e| HashTreeError::Store(e.to_string()))
     }
 
-    /// Get and decode a tree node
+    /// Get and decode a tree node (unencrypted)
     pub async fn get_tree_node(&self, hash: &Hash) -> Result<Option<TreeNode>, HashTreeError> {
         let data = match self.store.get(hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
             Some(d) => d,
@@ -789,7 +809,38 @@ impl<S: Store> HashTree<S> {
         Ok(Some(node))
     }
 
-    /// Check if hash points to a tree node
+    /// Get and decode a tree node using Cid (with decryption if key present)
+    pub async fn get_node(&self, cid: &Cid) -> Result<Option<TreeNode>, HashTreeError> {
+        let data = match self.store.get(&cid.hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Decrypt if key is present
+        let decrypted = if let Some(key) = &cid.key {
+            #[cfg(feature = "encryption")]
+            {
+                decrypt_chk(&data, key)
+                    .map_err(|e| HashTreeError::Decryption(e.to_string()))?
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                let _ = key;
+                return Err(HashTreeError::Decryption("encryption feature not enabled".to_string()));
+            }
+        } else {
+            data
+        };
+
+        if !is_tree_node(&decrypted) {
+            return Ok(None);
+        }
+
+        let node = decode_tree_node(&decrypted)?;
+        Ok(Some(node))
+    }
+
+    /// Check if hash points to a tree node (no decryption)
     pub async fn is_tree(&self, hash: &Hash) -> Result<bool, HashTreeError> {
         let data = match self.store.get(hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
             Some(d) => d,
@@ -798,7 +849,17 @@ impl<S: Store> HashTree<S> {
         Ok(is_tree_node(&data))
     }
 
-    /// Check if hash points to a directory (tree with named links)
+    /// Check if Cid points to a directory (with decryption)
+    pub async fn is_dir(&self, cid: &Cid) -> Result<bool, HashTreeError> {
+        let node = match self.get_node(cid).await? {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        // Directory has named links (not just internal chunks)
+        Ok(node.links.iter().any(|l| l.name.as_ref().map(|n| !n.starts_with('_')).unwrap_or(false)))
+    }
+
+    /// Check if hash points to a directory (tree with named links, no decryption)
     pub async fn is_directory(&self, hash: &Hash) -> Result<bool, HashTreeError> {
         let data = match self.store.get(hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
             Some(d) => d,
@@ -980,12 +1041,43 @@ impl<S: Store> HashTree<S> {
         Ok(chunks)
     }
 
-    /// List directory entries (Cid-based)
+    /// List directory entries (Cid-based, supports encrypted directories)
     pub async fn list(&self, cid: &Cid) -> Result<Vec<TreeEntry>, HashTreeError> {
-        self.list_directory(&cid.hash).await
+        let node = match self.get_node(cid).await? {
+            Some(n) => n,
+            None => return Ok(vec![]),
+        };
+
+        let mut entries = Vec::new();
+
+        for link in &node.links {
+            // Skip internal chunk nodes - recurse into them
+            if let Some(ref name) = link.name {
+                if name.starts_with("_chunk_") || name.starts_with('_') {
+                    let chunk_cid = Cid { hash: link.hash, key: link.key, size: link.size.unwrap_or(0) };
+                    let sub_entries = Box::pin(self.list(&chunk_cid)).await?;
+                    entries.extend(sub_entries);
+                    continue;
+                }
+            }
+
+            // For child directories, we need to check if it's a directory
+            // but we can't decrypt without the key, so check with the link's key
+            let child_cid = Cid { hash: link.hash, key: link.key, size: link.size.unwrap_or(0) };
+            let child_is_dir = self.is_dir(&child_cid).await.unwrap_or(false);
+            entries.push(TreeEntry {
+                name: link.name.clone().unwrap_or_else(|| to_hex(&link.hash)),
+                hash: link.hash,
+                size: link.size,
+                is_tree: child_is_dir,
+                key: link.key,
+            });
+        }
+
+        Ok(entries)
     }
 
-    /// List directory entries (low-level, Hash-based)
+    /// List directory entries (low-level, Hash-based, no decryption)
     pub async fn list_directory(&self, hash: &Hash) -> Result<Vec<TreeEntry>, HashTreeError> {
         let node = match self.get_tree_node(hash).await? {
             Some(n) => n,
@@ -1336,6 +1428,7 @@ impl<S: Store> HashTree<S> {
                 name: e.name,
                 hash: e.hash,
                 size: e.size,
+                key: e.key,
             })
             .collect();
 
@@ -1343,6 +1436,7 @@ impl<S: Store> HashTree<S> {
             name: name.to_string(),
             hash,
             size: Some(size),
+            key: None,
         });
 
         let new_dir_hash = self.put_directory(new_entries, None).await?;
@@ -1368,6 +1462,7 @@ impl<S: Store> HashTree<S> {
                 name: e.name,
                 hash: e.hash,
                 size: e.size,
+                key: e.key,
             })
             .collect();
 
@@ -1399,6 +1494,7 @@ impl<S: Store> HashTree<S> {
 
         let entry_hash = entry.hash;
         let entry_size = entry.size;
+        let entry_key = entry.key;
 
         let new_entries: Vec<DirEntry> = entries
             .into_iter()
@@ -1407,11 +1503,13 @@ impl<S: Store> HashTree<S> {
                 name: e.name,
                 hash: e.hash,
                 size: e.size,
+                key: e.key,
             })
             .chain(std::iter::once(DirEntry {
                 name: new_name.to_string(),
                 hash: entry_hash,
                 size: entry_size,
+                key: entry_key,
             }))
             .collect();
 
@@ -1488,12 +1586,14 @@ impl<S: Store> HashTree<S> {
                             name: e.name,
                             hash: child_hash,
                             size: e.size,
+                            key: e.key,
                         }
                     } else {
                         DirEntry {
                             name: e.name,
                             hash: e.hash,
                             size: e.size,
+                            key: e.key,
                         }
                     }
                 })
@@ -1614,7 +1714,8 @@ mod tests {
 
     fn make_tree() -> (Arc<MemoryStore>, HashTree<MemoryStore>) {
         let store = Arc::new(MemoryStore::new());
-        let tree = HashTree::new(HashTreeConfig::new(store.clone()));
+        // Use public (unencrypted) mode for these tests
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
         (store, tree)
     }
 

@@ -244,25 +244,53 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Store in local hashtree
+                use hashtree::{nhash_encode, nhash_encode_full, NHashData, from_hex, key_from_hex};
+
                 let store = HashtreeStore::new(&cli.data_dir)?;
                 if public {
-                    let cid = if is_dir {
+                    let hash_hex = if is_dir {
                         store.upload_dir_with_options(&path, !no_ignore)
                             .context("Failed to add directory")?
                     } else {
                         store.upload_file(&path)
                             .context("Failed to add file")?
                     };
-                    println!("added {} {}", cid, path.display());
+                    let hash = from_hex(&hash_hex).context("Invalid hash")?;
+                    let nhash = nhash_encode(&hash)
+                        .map_err(|e| anyhow::anyhow!("Failed to encode nhash: {}", e))?;
+                    println!("added {}", path.display());
+                    println!("  nhash: {}", nhash);
+                    println!("  hash:  {}", hash_hex);
                 } else {
-                    let cid = if is_dir {
+                    let cid_str = if is_dir {
                         store.upload_dir_encrypted_with_options(&path, !no_ignore)
                             .context("Failed to add directory")?
                     } else {
                         store.upload_file_encrypted(&path)
                             .context("Failed to add file")?
                     };
-                    println!("added {} {}", cid, path.display());
+                    // Parse cid_str which may be "hash" or "hash:key"
+                    let (hash_hex, key_hex) = if let Some((h, k)) = cid_str.split_once(':') {
+                        (h.to_string(), Some(k.to_string()))
+                    } else {
+                        (cid_str.clone(), None)
+                    };
+                    let hash = from_hex(&hash_hex).context("Invalid hash")?;
+                    let key = key_hex.as_ref().map(|k| key_from_hex(k)).transpose()
+                        .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
+                    let nhash_data = NHashData {
+                        hash,
+                        path: vec![],
+                        decrypt_key: key,
+                    };
+                    let nhash = nhash_encode_full(&nhash_data)
+                        .map_err(|e| anyhow::anyhow!("Failed to encode nhash: {}", e))?;
+                    println!("added {}", path.display());
+                    println!("  nhash: {}", nhash);
+                    println!("  hash:  {}", hash_hex);
+                    if let Some(k) = key_hex {
+                        println!("  key:   {}", k);
+                    }
                 }
             }
         }

@@ -192,6 +192,7 @@ pub struct DirEntry {
     pub name: String,
     pub hash: Hash,
     pub size: Option<u64>,
+    pub key: Option<[u8; 32]>,
 }
 
 impl DirEntry {
@@ -200,11 +201,27 @@ impl DirEntry {
             name: name.into(),
             hash,
             size: None,
+            key: None,
+        }
+    }
+
+    /// Create from Cid (hash + optional key + size)
+    pub fn from_cid(name: impl Into<String>, cid: &Cid) -> Self {
+        Self {
+            name: name.into(),
+            hash: cid.hash,
+            size: Some(cid.size),
+            key: cid.key,
         }
     }
 
     pub fn with_size(mut self, size: u64) -> Self {
         self.size = Some(size);
+        self
+    }
+
+    pub fn with_key(mut self, key: [u8; 32]) -> Self {
+        self.key = Some(key);
         self
     }
 }
