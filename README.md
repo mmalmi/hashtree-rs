@@ -19,6 +19,7 @@ Content-addressed merkle tree storage library for Rust.
 - Streaming append for large files
 - Tree verification
 - BEP52 (BitTorrent v2) compatible binary merkle algorithm (experimental)
+- CHK (Content Hash Key) deterministic encryption (experimental)
 
 ## Usage
 
