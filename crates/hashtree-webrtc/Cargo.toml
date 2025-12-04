@@ -19,6 +19,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 bytes = "1.0"
+lru.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }

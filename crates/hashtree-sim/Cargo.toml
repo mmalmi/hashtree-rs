@@ -1,0 +1,36 @@
+[package]
+name = "hashtree-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Network simulation for hashtree P2P protocols"
+
+[dependencies]
+# Core hashtree crate
+hashtree = { path = "../hashtree" }
+
+# Core
+sha2.workspace = true
+hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+# Simulation
+rand = "0.8"
+rand_distr = "0.4"
+lru = "0.12"
+
+# Async runtime
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
+
+# Metrics/stats
+hdrhistogram = "7"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "network"
+harness = false

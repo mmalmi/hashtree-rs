@@ -122,6 +122,11 @@ pub enum DataMessage {
         size: Option<u64>,
     },
 
+    /// Push data for a hash the peer previously requested but we didn't have
+    /// This happens when we get it later from another peer
+    #[serde(rename = "push")]
+    Push { hash: String },
+
     /// Announce available hashes
     #[serde(rename = "have")]
     Have { hashes: Vec<String> },

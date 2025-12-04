@@ -6,7 +6,9 @@
 use crate::types::{DataMessage, PeerId, PeerState, SignalingMessage, DATA_CHANNEL_LABEL};
 use bytes::Bytes;
 use hashtree::{from_hex, to_hex, Hash, Store};
+use lru::LruCache;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -40,12 +42,31 @@ pub enum PeerError {
     NotFound,
 }
 
-/// Pending request awaiting response
+/// Default LRU cache sizes (matching hashtree-ts)
+const THEIR_REQUESTS_SIZE: usize = 200;
+
+/// Pending request awaiting response (requests WE sent)
 struct PendingRequest {
     response_tx: oneshot::Sender<Option<Vec<u8>>>,
 }
 
+/// Request this peer sent TO US that we couldn't fulfill locally
+/// We track it so we can push data back when/if we get it from another peer
+#[derive(Debug, Clone)]
+struct TheirRequest {
+    /// Their request ID (for response correlation)
+    id: u32,
+    /// When they requested it
+    requested_at: std::time::Instant,
+}
+
 /// WebRTC peer connection wrapper
+///
+/// Each Peer is an independent agent that tracks:
+/// - `pending_requests`: requests WE sent TO this peer (awaiting response)
+/// - `their_requests`: requests THEY sent TO US that we couldn't fulfill
+///
+/// This matches the hashtree-ts Peer architecture.
 pub struct Peer<S: Store> {
     /// Remote peer identifier
     pub remote_id: PeerId,
@@ -57,8 +78,13 @@ pub struct Peer<S: Store> {
     data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
     /// Pending ICE candidates (before remote description set)
     pending_candidates: Arc<RwLock<Vec<RTCIceCandidateInit>>>,
-    /// Pending data requests
+    /// Requests WE sent TO this peer, keyed by our request ID
+    /// Similar to hashtree-ts: ourRequests = new Map<number, OurRequest>()
     pending_requests: Arc<RwLock<HashMap<u32, PendingRequest>>>,
+    /// Requests THEY sent TO US that we couldn't fulfill locally
+    /// Keyed by hash hex string, similar to hashtree-ts:
+    /// theirRequests = new LRUCache<string, TheirRequest>(THEIR_REQUESTS_SIZE)
+    their_requests: Arc<RwLock<LruCache<String, TheirRequest>>>,
     /// Request ID counter
     request_counter: AtomicU32,
     /// Channel for outgoing signaling messages
@@ -69,6 +95,8 @@ pub struct Peer<S: Store> {
     local_peer_id: String,
     /// Debug logging enabled
     debug: bool,
+    /// Callback to forward request to other peers when we don't have data locally
+    on_forward_request: Option<Arc<dyn Fn(Hash, PeerId) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync>>,
 }
 
 impl<S: Store + 'static> Peer<S> {
@@ -113,11 +141,15 @@ impl<S: Store + 'static> Peer<S> {
             data_channel: Arc::new(RwLock::new(None)),
             pending_candidates: Arc::new(RwLock::new(Vec::new())),
             pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            their_requests: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(THEIR_REQUESTS_SIZE).unwrap(),
+            ))),
             request_counter: AtomicU32::new(0),
             signaling_tx,
             local_store,
             local_peer_id,
             debug,
+            on_forward_request: None,
         };
 
         peer.setup_handlers().await?;
@@ -130,6 +162,7 @@ impl<S: Store + 'static> Peer<S> {
         let state = self.state.clone();
         let data_channel = self.data_channel.clone();
         let pending_requests = self.pending_requests.clone();
+        let their_requests = self.their_requests.clone();
         let local_store = self.local_store.clone();
         let debug = self.debug;
 
@@ -163,11 +196,13 @@ impl<S: Store + 'static> Peer<S> {
         // Handle incoming data channels
         let data_channel_clone = data_channel.clone();
         let pending_requests_clone = pending_requests.clone();
+        let their_requests_clone = their_requests.clone();
         let local_store_clone = local_store.clone();
         let state_clone = state.clone();
         self.connection.on_data_channel(Box::new(move |dc| {
             let data_channel = data_channel_clone.clone();
             let pending_requests = pending_requests_clone.clone();
+            let their_requests = their_requests_clone.clone();
             let local_store = local_store_clone.clone();
             let state = state_clone.clone();
 
@@ -176,6 +211,7 @@ impl<S: Store + 'static> Peer<S> {
                     Self::setup_data_channel_handlers(
                         dc.clone(),
                         pending_requests,
+                        their_requests,
                         local_store,
                         debug,
                     )
@@ -221,15 +257,18 @@ impl<S: Store + 'static> Peer<S> {
     async fn setup_data_channel_handlers(
         dc: Arc<RTCDataChannel>,
         pending_requests: Arc<RwLock<HashMap<u32, PendingRequest>>>,
+        their_requests: Arc<RwLock<LruCache<String, TheirRequest>>>,
         local_store: Arc<S>,
         debug: bool,
     ) {
         let pending_requests_clone = pending_requests.clone();
+        let their_requests_clone = their_requests.clone();
         let local_store_clone = local_store.clone();
         let dc_clone = dc.clone();
 
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let pending_requests = pending_requests_clone.clone();
+            let their_requests = their_requests_clone.clone();
             let local_store = local_store_clone.clone();
             let dc = dc_clone.clone();
 
@@ -294,6 +333,19 @@ impl<S: Store + 'static> Peer<S> {
                                         _ => false,
                                     };
                                     if !response {
+                                        // Track this request so we can push data later
+                                        // (like hashtree-ts theirRequests)
+                                        {
+                                            let mut their_reqs = their_requests.write().await;
+                                            their_reqs.put(
+                                                hash.clone(),
+                                                TheirRequest {
+                                                    id,
+                                                    requested_at: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+
                                         // Send not found response
                                         let res_msg = DataMessage::Response {
                                             id,
@@ -305,6 +357,13 @@ impl<S: Store + 'static> Peer<S> {
                                         let _ = dc.send(&Bytes::from(json)).await;
                                     }
                                 }
+                            }
+                            DataMessage::Push { hash } => {
+                                // Peer is pushing data we previously requested
+                                if debug {
+                                    println!("[Peer] Received push for hash: {}...", &hash[..16.min(hash.len())]);
+                                }
+                                // Binary data will follow - handled in binary message section
                             }
                             _ => {}
                         }
@@ -340,6 +399,7 @@ impl<S: Store + 'static> Peer<S> {
         Self::setup_data_channel_handlers(
             dc.clone(),
             self.pending_requests.clone(),
+            self.their_requests.clone(),
             self.local_store.clone(),
             self.debug,
         )
@@ -552,5 +612,64 @@ impl<S: Store + 'static> Peer<S> {
         self.connection.close().await?;
         *self.state.write().await = PeerState::Disconnected;
         Ok(())
+    }
+
+    /// Set the forward request callback
+    /// Called when this peer requests data we don't have locally
+    pub fn set_on_forward_request<F>(&mut self, callback: F)
+    where
+        F: Fn(Hash, PeerId) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync + 'static,
+    {
+        self.on_forward_request = Some(Arc::new(callback));
+    }
+
+    /// Send data to this peer for a hash they previously requested
+    /// Returns true if this peer had requested this hash
+    pub async fn send_data(&self, hash_hex: &str, data: &[u8]) -> Result<bool, PeerError> {
+        let their_req = {
+            let mut requests = self.their_requests.write().await;
+            requests.pop(hash_hex)
+        };
+
+        let Some(their_req) = their_req else {
+            return Ok(false);
+        };
+
+        let dc = self.data_channel.read().await;
+        let dc = dc.as_ref().ok_or(PeerError::NotReady)?;
+
+        // Send push message followed by binary data (like hashtree-ts)
+        let msg = DataMessage::Push {
+            hash: hash_hex.to_string(),
+        };
+        let json = serde_json::to_string(&msg)?;
+        dc.send(&Bytes::from(json)).await?;
+
+        // Send binary data: [4 bytes requestId LE][data]
+        let mut binary = Vec::with_capacity(4 + data.len());
+        binary.extend_from_slice(&their_req.id.to_le_bytes());
+        binary.extend_from_slice(data);
+        dc.send(&Bytes::from(binary)).await?;
+
+        if self.debug {
+            println!("[Peer] Sent push data for hash: {}...", &hash_hex[..16.min(hash_hex.len())]);
+        }
+
+        Ok(true)
+    }
+
+    /// Check if this peer has requested a hash
+    pub async fn has_requested(&self, hash_hex: &str) -> bool {
+        self.their_requests.read().await.peek(hash_hex).is_some()
+    }
+
+    /// Get count of pending requests from this peer
+    pub async fn their_request_count(&self) -> usize {
+        self.their_requests.read().await.len()
+    }
+
+    /// Get count of pending requests we sent to this peer
+    pub async fn our_request_count(&self) -> usize {
+        self.pending_requests.read().await.len()
     }
 }
