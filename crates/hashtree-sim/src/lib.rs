@@ -1,44 +1,50 @@
-//! Network simulation for hashtree P2P protocols
+//! Simulation tools for hashtree P2P protocols
 //!
-//! Discrete event simulation for testing request forwarding strategies,
-//! network topologies, and node behaviors at scale.
+//! Provides store implementations for testing different routing strategies.
+//!
+//! ## NetworkStore implementations
+//!
+//! - `FloodingStore` - sends to all peers, returns first response (high bandwidth, low latency)
+//! - `SequentialStore` - sends to one peer at a time with not_found (low bandwidth, higher latency)
 //!
 //! ## Architecture
 //!
-//! Each simulated node is an actor with:
-//! - Local HashTree-backed storage (SimStore implements hashtree::Store)
-//! - Per-peer connections via PeerAgent (like hashtree-ts Peer)
-//! - Behavior strategy (cooperative, selfish, malicious, etc.)
-//!
-//! The network uses a discrete event queue for message passing with
-//! configurable latency distributions.
-//!
-//! ## Per-Peer Agent Model
-//!
-//! Similar to hashtree-ts, each peer connection is an independent agent:
-//! - `PeerAgent::our_requests` - requests we sent TO this peer
-//! - `PeerAgent::their_requests` - requests this peer sent TO US
-//! - Each agent handles its own request/response tracking and timeouts
+//! - `SimStore` - local-only storage (implements hashtree::Store)
+//! - `NetworkStore` trait - extends Store with network fetch capability
+//! - `PeerChannel` trait - abstraction for peer communication
+//! - `PeerAgent` - per-peer request/response tracking
 
-mod node;
-mod network;
-mod behavior;
-mod config;
-mod metrics;
-mod message;
 mod store;
-mod adapter;
 mod peer_agent;
+mod message;
+mod behavior;
+mod channel;
+mod flooding;
+mod sequential;
+mod relay;
+mod node;
+mod simulation;
 
-pub use node::{SimNode, NodeId, ActiveQuery, ForwardedQuery};
-pub use network::Network;
-pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};
-pub use config::{SimConfig, LatencyDistribution};
-pub use metrics::SimMetrics;
-pub use message::{Message, Request, Response};
-pub use store::{SimStore, NetworkStore, NetworkRequest};
-pub use adapter::{NetworkAdapter, MockNetwork, FetchRequest, FetchResult};
+pub use store::{SimStore, NetworkStore};
 pub use peer_agent::{PeerAgent, OurRequest, TheirRequest};
+pub use message::{
+    Hash, RequestId, ParsedMessage, ParseError,
+    encode_request, encode_response, encode_not_found, encode_push, parse,
+    MSG_REQUEST, MSG_RESPONSE, MSG_NOT_FOUND, MSG_PUSH,
+};
+pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};
+pub use channel::{PeerChannel, ChannelError, MockChannel, LatencyChannel};
+pub use flooding::{FloodingStore, handle_request as flooding_handle_request};
+pub use sequential::{SequentialStore, handle_request as sequential_handle_request};
+pub use relay::{
+    MockRelay, RelayClient, RelayError, Event, Filter, RelayMessage, ClientMessage,
+    KIND_PRESENCE, KIND_OFFER, KIND_ANSWER, KIND_CANDIDATE,
+};
+pub use node::{SimNode, NodeConfig, SimPeer, SignalingContent};
+pub use simulation::{Simulation, SimConfig, SimEvent, SimStats, TopologyStats};
+
+/// Node identifier
+pub type NodeId = u64;
 
 // Re-export hashtree types for convenience
-pub use hashtree::{Hash, HashTree, HashTreeConfig, MemoryStore, Store, Cid};
+pub use hashtree::{HashTree, HashTreeConfig, MemoryStore, Store, Cid};

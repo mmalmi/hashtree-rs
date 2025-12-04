@@ -8,7 +8,7 @@
 //! This allows proper per-peer request tracking and response routing.
 
 use crate::message::Hash;
-use crate::node::NodeId;
+use crate::NodeId;
 use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
