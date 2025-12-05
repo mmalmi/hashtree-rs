@@ -6,7 +6,7 @@
 //!
 //! - `SimStore` - local-only storage (implements hashtree::Store)
 //! - `FloodingStore` - complete P2P node with signaling + multi-hop forwarding (like WebRTCStore)
-//! - `SequentialStore` - sends to one peer at a time with not_found (low bandwidth, higher latency)
+//! - `SequentialStore` - sends to one peer at a time, forwards if not found locally
 //! - `MockRelay` - Nostr-like relay for signaling
 //! - `PeerChannel` trait - abstraction for peer communication
 
@@ -23,11 +23,12 @@ mod store;
 pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};
 pub use channel::{ChannelError, LatencyChannel, MockChannel, PeerChannel};
 pub use flooding::{
-    handle_request as flooding_handle_request, FloodingConfig, FloodingStore, SignalingContent,
+    handle_request as flooding_handle_request, FloodingConfig, FloodingStore, RoutingStrategy,
+    SignalingContent,
 };
 pub use message::{
-    encode_not_found, encode_push, encode_request, encode_response, parse, Hash, ParseError,
-    ParsedMessage, RequestId, MSG_NOT_FOUND, MSG_PUSH, MSG_REQUEST, MSG_RESPONSE,
+    encode_push, encode_request, encode_response, parse, Hash, ParseError,
+    ParsedMessage, RequestId, MSG_PUSH, MSG_REQUEST, MSG_RESPONSE,
 };
 pub use peer_agent::{OurRequest, PeerAgent, TheirRequest};
 pub use relay::{

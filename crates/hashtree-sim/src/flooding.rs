@@ -49,6 +49,23 @@ struct PendingConnection {
     our_channel: Arc<MockChannel>,
 }
 
+/// Routing strategy for data requests
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingStrategy {
+    /// Flood requests to all peers simultaneously, first response wins
+    /// Lower latency, higher bandwidth
+    Flooding,
+    /// Try peers one at a time, wait for response before trying next
+    /// Lower bandwidth, higher latency
+    Sequential,
+}
+
+impl Default for RoutingStrategy {
+    fn default() -> Self {
+        Self::Flooding
+    }
+}
+
 /// Configuration for FloodingStore
 #[derive(Clone)]
 pub struct FloodingConfig {
@@ -63,6 +80,8 @@ pub struct FloodingConfig {
     /// Simulated network latency per hop (ms)
     /// Set to 0 for instant delivery (unit tests), ~50ms for realistic WebRTC
     pub network_latency_ms: u64,
+    /// Routing strategy for data requests
+    pub routing_strategy: RoutingStrategy,
 }
 
 impl Default for FloodingConfig {
@@ -73,6 +92,7 @@ impl Default for FloodingConfig {
             max_peers: 5,
             connect_timeout_ms: 5000,
             network_latency_ms: 0, // Instant for tests, set to ~50 for realistic simulation
+            routing_strategy: RoutingStrategy::Flooding,
         }
     }
 }
@@ -432,6 +452,14 @@ impl FloodingStore {
 
     /// Fetch from peers (optionally excluding one)
     async fn fetch_from_peers(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
+        match self.config.routing_strategy {
+            RoutingStrategy::Flooding => self.fetch_from_peers_flooding(hash, exclude).await,
+            RoutingStrategy::Sequential => self.fetch_from_peers_sequential(hash, exclude).await,
+        }
+    }
+
+    /// Flooding strategy: send to all peers at once, first response wins
+    async fn fetch_from_peers_flooding(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
         let peers = self.peers.read().await;
         if peers.is_empty() {
             return None;
@@ -483,6 +511,63 @@ impl FloodingStore {
         }
     }
 
+    /// Sequential strategy: try one peer at a time, wait for response before trying next
+    async fn fetch_from_peers_sequential(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
+        let peer_list: Vec<(u64, Arc<dyn PeerChannel>)> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .filter(|(&id, _)| Some(id) != exclude)
+                .map(|(&id, ch)| (id, ch.clone()))
+                .collect()
+        };
+
+        if peer_list.is_empty() {
+            return None;
+        }
+
+        // Try each peer sequentially
+        for (_peer_id, channel) in peer_list {
+            let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            let request_bytes = encode_request(request_id, hash);
+
+            // Send request
+            if self.send_with_latency(channel.as_ref(), request_bytes.clone()).await.is_err() {
+                continue; // Try next peer
+            }
+            self.bytes_sent
+                .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
+
+            // Setup response channel
+            let (tx, rx) = oneshot::channel();
+            self.our_requests
+                .write()
+                .await
+                .insert(request_id, OurRequest { response_tx: tx });
+
+            // Wait for response with per-peer timeout
+            let per_peer_timeout = self.config.request_timeout / 2; // Shorter timeout per peer
+            match tokio::time::timeout(per_peer_timeout, rx).await {
+                Ok(Ok(Some(data))) => {
+                    // Found it! Cache locally and return
+                    self.local.put_local(*hash, data.clone());
+                    return Some(data);
+                }
+                Ok(Ok(None)) => {
+                    // Peer responded with not found, try next
+                    continue;
+                }
+                _ => {
+                    // Timeout or error - cleanup and try next peer
+                    self.our_requests.write().await.remove(&request_id);
+                    continue;
+                }
+            }
+        }
+
+        None
+    }
+
     /// Main message processing loop
     async fn message_loop(
         self: Arc<Self>,
@@ -518,9 +603,6 @@ impl FloodingStore {
             }
             Ok(ParsedMessage::Response { id, hash, data }) => {
                 self.handle_response(id, hash, data).await;
-            }
-            Ok(ParsedMessage::NotFound { .. }) => {
-                // We don't use NOT_FOUND, but parse it for compatibility
             }
             Ok(ParsedMessage::Push { hash, data }) => {
                 // Peer is pushing data

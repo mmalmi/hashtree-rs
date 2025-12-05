@@ -12,7 +12,6 @@ pub type RequestId = u32;
 /// Message types (first byte)
 pub const MSG_REQUEST: u8 = 0x01;
 pub const MSG_RESPONSE: u8 = 0x02;
-pub const MSG_NOT_FOUND: u8 = 0x03;
 pub const MSG_PUSH: u8 = 0x04;
 
 /// Parse result
@@ -20,7 +19,6 @@ pub const MSG_PUSH: u8 = 0x04;
 pub enum ParsedMessage {
     Request { id: RequestId, hash: Hash },
     Response { id: RequestId, hash: Hash, data: Vec<u8> },
-    NotFound { id: RequestId, hash: Hash },
     Push { hash: Hash, data: Vec<u8> },
 }
 
@@ -49,16 +47,6 @@ pub fn encode_response(id: RequestId, hash: &Hash, data: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&id.to_le_bytes());
     buf.extend_from_slice(hash);
     buf.extend_from_slice(data);
-    buf
-}
-
-/// Encode a not_found message
-/// Format: [type:1][id:4][hash:32] = 37 bytes
-pub fn encode_not_found(id: RequestId, hash: &Hash) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(37);
-    buf.push(MSG_NOT_FOUND);
-    buf.extend_from_slice(&id.to_le_bytes());
-    buf.extend_from_slice(hash);
     buf
 }
 
@@ -97,15 +85,6 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedMessage, ParseError> {
             hash.copy_from_slice(&bytes[5..37]);
             let data = bytes[37..].to_vec();
             Ok(ParsedMessage::Response { id, hash, data })
-        }
-        MSG_NOT_FOUND => {
-            if bytes.len() < 37 {
-                return Err(ParseError::TooShort);
-            }
-            let id = RequestId::from_le_bytes(bytes[1..5].try_into().unwrap());
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&bytes[5..37]);
-            Ok(ParsedMessage::NotFound { id, hash })
         }
         MSG_PUSH => {
             if bytes.len() < 33 {
@@ -151,20 +130,6 @@ mod tests {
                 assert_eq!(id, 456);
                 assert_eq!(h, hash);
                 assert_eq!(d, data);
-            }
-            _ => panic!("wrong type"),
-        }
-    }
-
-    #[test]
-    fn test_not_found_roundtrip() {
-        let hash = [42u8; 32];
-        let bytes = encode_not_found(789, &hash);
-
-        match parse(&bytes).unwrap() {
-            ParsedMessage::NotFound { id, hash: h } => {
-                assert_eq!(id, 789);
-                assert_eq!(h, hash);
             }
             _ => panic!("wrong type"),
         }

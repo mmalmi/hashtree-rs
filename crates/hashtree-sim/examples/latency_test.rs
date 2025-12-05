@@ -1,6 +1,6 @@
 //! Test with simulated network latency
 
-use hashtree_sim::{SimConfig, Simulation};
+use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
 
 #[tokio::main]
@@ -16,6 +16,7 @@ async fn main() {
         churn_rate: 0.0,
         allow_rejoin: false,
         network_latency_ms: 25, // 25ms per hop
+        routing_strategy: RoutingStrategy::Flooding,
     };
 
     eprintln!("Running simulation with {}ms latency per hop...", config.network_latency_ms);
@@ -27,11 +28,11 @@ async fn main() {
         topology.node_count, topology.connection_count, topology.component_count);
 
     eprintln!("\n=== Running 10 benchmark requests ===");
-    let (flooding, _) = sim.run_benchmarks(10, 256, Duration::from_secs(2)).await;
+    let flooding = sim.run_benchmark(10, 256, Duration::from_secs(2)).await;
     eprintln!("\n");
-    
+
     flooding.print();
-    
+
     eprintln!("\nExpected latency with 25ms per hop:");
     eprintln!("  Direct peer: ~50ms (request + response)");
     eprintln!("  2-hop: ~100ms");

@@ -1,6 +1,6 @@
 //! Sequential NetworkStore implementation
 //!
-//! Sends request to one peer at a time, waits for response or not_found,
+//! Sends request to one peer at a time, waits for response or timeout,
 //! then tries next peer. Lower bandwidth, higher latency.
 
 use async_trait::async_trait;
@@ -11,12 +11,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::channel::{ChannelError, PeerChannel};
-use crate::message::{
-    encode_not_found, encode_request, encode_response, parse, ParsedMessage, RequestId,
-};
+use crate::message::{encode_request, encode_response, parse, ParsedMessage, RequestId};
 use crate::store::{NetworkStore, SimStore};
 
-/// Sequential store - tries one peer at a time with not_found responses
+/// Sequential store - tries one peer at a time, waits for response or timeout
 pub struct SequentialStore {
     /// Local storage
     local: Arc<SimStore>,
@@ -128,7 +126,7 @@ impl NetworkStore for SequentialStore {
                 continue; // Try next peer
             }
 
-            // Wait for response
+            // Wait for response (peer forwards internally if needed)
             match peer.recv(self.peer_timeout).await {
                 Ok(response_bytes) => {
                     self.bytes_received
@@ -146,12 +144,6 @@ impl NetworkStore for SequentialStore {
                             }
                             // Malicious: wrong data, try next peer
                         }
-                        Ok(ParsedMessage::NotFound { id, hash: h })
-                            if id == request_id && h == *hash =>
-                        {
-                            // Peer doesn't have it, try next
-                            continue;
-                        }
                         _ => {
                             // Garbage or wrong message, try next peer
                             continue;
@@ -159,7 +151,8 @@ impl NetworkStore for SequentialStore {
                     }
                 }
                 Err(ChannelError::Timeout) => {
-                    // Timeout, try next peer
+                    // Timeout means peer is still searching or doesn't have it
+                    // Try next peer
                     continue;
                 }
                 Err(_) => {
@@ -182,14 +175,24 @@ impl NetworkStore for SequentialStore {
 }
 
 /// Handler for responding to sequential requests (run on peer side)
-/// Unlike flooding, this always responds (with data or not_found)
-pub async fn handle_request(local: &SimStore, request_bytes: &[u8]) -> Option<Vec<u8>> {
+///
+/// If the peer has data locally, responds with data.
+/// If not, forwards the request to its own peers sequentially.
+/// Only responds when data is found - no response means "keep waiting" or timeout.
+pub async fn handle_request(store: &SequentialStore, request_bytes: &[u8]) -> Option<Vec<u8>> {
     match parse(request_bytes) {
         Ok(ParsedMessage::Request { id, hash }) => {
-            if let Some(data) = local.get_local(&hash) {
-                Some(encode_response(id, &hash, &data))
-            } else {
-                Some(encode_not_found(id, &hash))
+            // First check local storage
+            if let Some(data) = store.local.get_local(&hash) {
+                return Some(encode_response(id, &hash, &data));
+            }
+
+            // Not found locally - forward to our peers (sequential forwarding)
+            // This creates multi-hop routing: each node tries its peers one at a time
+            // Only respond if we find the data
+            match store.fetch_from_network(&hash).await {
+                Ok(Some(data)) => Some(encode_response(id, &hash, &data)),
+                _ => None, // Don't respond if not found - let timeout handle it
             }
         }
         _ => None, // Garbage, don't respond
@@ -220,6 +223,7 @@ mod tests {
         let store1 = Arc::new(SequentialStore::new(local1.clone(), Duration::from_secs(1)));
 
         let local2 = Arc::new(SimStore::new(2));
+        let store2 = Arc::new(SequentialStore::new(local2.clone(), Duration::from_secs(1)));
         let data = b"peer data";
         let hash = hashtree::sha256(data);
         local2.put_local(hash, data.to_vec());
@@ -227,10 +231,9 @@ mod tests {
         let (chan1, chan2) = MockChannel::pair(1, 2);
         store1.add_peer(Arc::new(chan1)).await;
 
-        let local2_clone = local2.clone();
         let handle = tokio::spawn(async move {
             let recv = chan2.recv(Duration::from_secs(1)).await.unwrap();
-            if let Some(response) = handle_request(&local2_clone, &recv).await {
+            if let Some(response) = handle_request(&store2, &recv).await {
                 chan2.send(response).await.unwrap();
             }
         });
@@ -243,14 +246,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sequential_not_found_tries_next() {
+    async fn test_sequential_timeout_tries_next() {
         let local1 = Arc::new(SimStore::new(1));
-        let store1 = Arc::new(SequentialStore::new(local1.clone(), Duration::from_secs(1)));
+        let store1 = Arc::new(SequentialStore::new(local1.clone(), Duration::from_millis(100)));
 
-        // Peer 2 doesn't have data
+        // Peer 2 doesn't have data and won't respond (simulating forwarding that times out)
         let local2 = Arc::new(SimStore::new(2));
+        let store2 = Arc::new(SequentialStore::new(local2.clone(), Duration::from_millis(100)));
         // Peer 3 has data
         let local3 = Arc::new(SimStore::new(3));
+        let store3 = Arc::new(SequentialStore::new(local3.clone(), Duration::from_millis(100)));
         let data = b"found on third";
         let hash = hashtree::sha256(data);
         local3.put_local(hash, data.to_vec());
@@ -260,20 +265,18 @@ mod tests {
         store1.add_peer(Arc::new(chan1_2)).await;
         store1.add_peer(Arc::new(chan1_3)).await;
 
-        // Handler for peer 2 (will send not_found)
-        let local2_clone = local2.clone();
+        // Handler for peer 2 (doesn't have it, won't respond)
         let handle2 = tokio::spawn(async move {
             let recv = chan2.recv(Duration::from_secs(1)).await.unwrap();
-            if let Some(response) = handle_request(&local2_clone, &recv).await {
-                chan2.send(response).await.unwrap();
-            }
+            // No response - simulating that peer 2 doesn't find it
+            let _ = handle_request(&store2, &recv).await;
+            // Don't send response, let it timeout
         });
 
         // Handler for peer 3 (will send data)
-        let local3_clone = local3.clone();
         let handle3 = tokio::spawn(async move {
             let recv = chan3.recv(Duration::from_secs(1)).await.unwrap();
-            if let Some(response) = handle_request(&local3_clone, &recv).await {
+            if let Some(response) = handle_request(&store3, &recv).await {
                 chan3.send(response).await.unwrap();
             }
         });
@@ -286,20 +289,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sequential_all_not_found() {
+    async fn test_sequential_all_timeout() {
         let local1 = Arc::new(SimStore::new(1));
-        let store1 = Arc::new(SequentialStore::new(local1.clone(), Duration::from_secs(1)));
+        let store1 = Arc::new(SequentialStore::new(local1.clone(), Duration::from_millis(50)));
 
         let local2 = Arc::new(SimStore::new(2));
+        let store2 = Arc::new(SequentialStore::new(local2.clone(), Duration::from_millis(50)));
         let (chan1, chan2) = MockChannel::pair(1, 2);
         store1.add_peer(Arc::new(chan1)).await;
 
-        let local2_clone = local2.clone();
         let handle = tokio::spawn(async move {
             let recv = chan2.recv(Duration::from_secs(1)).await.unwrap();
-            if let Some(response) = handle_request(&local2_clone, &recv).await {
-                chan2.send(response).await.unwrap();
-            }
+            // Peer doesn't have it, no response
+            let _ = handle_request(&store2, &recv).await;
         });
 
         let hash = [42u8; 32];
