@@ -1,17 +1,20 @@
 //! Network simulation harness
 //!
 //! Spawns and removes nodes over time (churn), forms topology through signaling,
-//! and analyzes results.
+//! and analyzes results. Can run network benchmarks measuring bandwidth, latency,
+//! and success rate.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use tokio::sync::RwLock;
 
 use crate::relay::{MockRelay, RelayClient};
 use crate::node::{NodeConfig, SimNode};
+use crate::agent::{Agent, AgentConfig};
+use crate::channel::{MockChannel, LatencyChannel};
 
 /// Simulation configuration
 #[derive(Clone)]
@@ -30,6 +33,8 @@ pub struct SimConfig {
     pub churn_rate: f64,
     /// Whether departed nodes can rejoin
     pub allow_rejoin: bool,
+    /// Simulated network latency per hop (e.g., 50ms for realistic WebRTC)
+    pub network_latency_ms: u64,
 }
 
 impl Default for SimConfig {
@@ -42,6 +47,7 @@ impl Default for SimConfig {
             discovery_interval_ms: 500,
             churn_rate: 0.01, // 1% chance per interval
             allow_rejoin: true,
+            network_latency_ms: 50, // 50ms simulated network latency per hop
         }
     }
 }
@@ -59,6 +65,7 @@ pub enum SimEvent {
 struct RunningNode {
     node: Arc<SimNode>,
     client: RelayClient,
+    #[allow(dead_code)]
     joined_at_ms: u64,
 }
 
@@ -87,6 +94,130 @@ pub struct TopologyStats {
     pub clustering_coefficient: f64,
     /// Degree distribution
     pub degree_distribution: HashMap<usize, usize>,
+}
+
+/// Results from a single request
+#[derive(Debug, Clone)]
+pub struct RequestResult {
+    /// Whether the request succeeded (found data)
+    pub success: bool,
+    /// Latency in milliseconds
+    pub latency_ms: f64,
+    /// Bytes sent for this request
+    pub bytes_sent: u64,
+    /// Bytes received for this request
+    pub bytes_received: u64,
+    /// Number of peers queried
+    pub peers_queried: usize,
+    /// Hops to find data (for sequential)
+    pub hops: usize,
+}
+
+/// Aggregated benchmark results
+#[derive(Debug, Clone)]
+pub struct BenchmarkResults {
+    /// Strategy name
+    pub strategy: String,
+    /// Number of requests made
+    pub total_requests: usize,
+    /// Successful requests
+    pub successful_requests: usize,
+    /// Success rate (0.0 - 1.0)
+    pub success_rate: f64,
+    /// Total bytes sent
+    pub total_bytes_sent: u64,
+    /// Total bytes received
+    pub total_bytes_received: u64,
+    /// Average bytes sent per request
+    pub avg_bytes_sent: f64,
+    /// Average bytes received per request
+    pub avg_bytes_received: f64,
+    /// Average latency (ms) for successful requests
+    pub avg_latency_ms: f64,
+    /// Min latency (ms)
+    pub min_latency_ms: f64,
+    /// Max latency (ms)
+    pub max_latency_ms: f64,
+    /// P50 latency (ms)
+    pub p50_latency_ms: f64,
+    /// P95 latency (ms)
+    pub p95_latency_ms: f64,
+    /// P99 latency (ms)
+    pub p99_latency_ms: f64,
+    /// Average hops to find data
+    pub avg_hops: f64,
+    /// Individual request results
+    pub requests: Vec<RequestResult>,
+}
+
+impl BenchmarkResults {
+    fn from_requests(strategy: &str, requests: Vec<RequestResult>) -> Self {
+        let total = requests.len();
+        let successful: Vec<&RequestResult> = requests.iter().filter(|r| r.success).collect();
+        let success_count = successful.len();
+
+        let total_sent: u64 = requests.iter().map(|r| r.bytes_sent).sum();
+        let total_recv: u64 = requests.iter().map(|r| r.bytes_received).sum();
+
+        let mut latencies: Vec<f64> = successful.iter().map(|r| r.latency_ms).collect();
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let avg_latency = if !latencies.is_empty() {
+            latencies.iter().sum::<f64>() / latencies.len() as f64
+        } else {
+            0.0
+        };
+
+        let percentile = |p: f64| -> f64 {
+            if latencies.is_empty() {
+                return 0.0;
+            }
+            let idx = ((p / 100.0) * latencies.len() as f64) as usize;
+            latencies[idx.min(latencies.len() - 1)]
+        };
+
+        let total_hops: usize = successful.iter().map(|r| r.hops).sum();
+        let avg_hops = if success_count > 0 {
+            total_hops as f64 / success_count as f64
+        } else {
+            0.0
+        };
+
+        Self {
+            strategy: strategy.to_string(),
+            total_requests: total,
+            successful_requests: success_count,
+            success_rate: if total > 0 { success_count as f64 / total as f64 } else { 0.0 },
+            total_bytes_sent: total_sent,
+            total_bytes_received: total_recv,
+            avg_bytes_sent: if total > 0 { total_sent as f64 / total as f64 } else { 0.0 },
+            avg_bytes_received: if total > 0 { total_recv as f64 / total as f64 } else { 0.0 },
+            avg_latency_ms: avg_latency,
+            min_latency_ms: latencies.first().copied().unwrap_or(0.0),
+            max_latency_ms: latencies.last().copied().unwrap_or(0.0),
+            p50_latency_ms: percentile(50.0),
+            p95_latency_ms: percentile(95.0),
+            p99_latency_ms: percentile(99.0),
+            avg_hops,
+            requests,
+        }
+    }
+
+    /// Print benchmark results
+    pub fn print(&self) {
+        println!("=== {} Benchmark ===", self.strategy);
+        println!("Requests: {} total, {} successful ({:.1}%)",
+            self.total_requests, self.successful_requests, self.success_rate * 100.0);
+        println!("Bandwidth: {:.0} bytes sent, {:.0} bytes recv (avg per request)",
+            self.avg_bytes_sent, self.avg_bytes_received);
+        println!("Latency: avg={:.2}ms, min={:.2}ms, max={:.2}ms",
+            self.avg_latency_ms, self.min_latency_ms, self.max_latency_ms);
+        println!("Latency percentiles: p50={:.2}ms, p95={:.2}ms, p99={:.2}ms",
+            self.p50_latency_ms, self.p95_latency_ms, self.p99_latency_ms);
+        if self.avg_hops > 0.0 {
+            println!("Average hops: {:.2}", self.avg_hops);
+        }
+    }
 }
 
 /// Simulation statistics over time
@@ -522,6 +653,186 @@ impl Simulation {
         println!("Connections lost: {}", stats.total_connections_lost);
         println!("Topology snapshots: {}", stats.topology_snapshots.len());
     }
+
+    /// Run network benchmarks with both flooding and sequential strategies
+    ///
+    /// Places data on random nodes and makes requests from other nodes,
+    /// measuring bandwidth, latency, and success rate.
+    pub async fn run_benchmarks(
+        &self,
+        num_requests: usize,
+        data_size: usize,
+        request_timeout: Duration,
+    ) -> (BenchmarkResults, BenchmarkResults) {
+        let flooding_results = self.benchmark_flooding(num_requests, data_size, request_timeout).await;
+        let sequential_results = self.benchmark_sequential(num_requests, data_size, request_timeout).await;
+        (flooding_results, sequential_results)
+    }
+
+    /// Create agents from the current network topology
+    ///
+    /// This creates Agent instances that mirror the SimNode connections,
+    /// enabling proper multi-hop request forwarding for benchmarking.
+    async fn create_agents(&self) -> HashMap<u64, Arc<Agent>> {
+        let nodes = self.nodes.read().await;
+        let mut agents: HashMap<u64, Arc<Agent>> = HashMap::new();
+        let latency = Duration::from_millis(self.config.network_latency_ms);
+
+        // Create an agent for each node
+        for (id_str, _) in nodes.iter() {
+            let id: u64 = id_str.parse().unwrap_or(0);
+            let agent = Agent::new(id, AgentConfig {
+                request_timeout: Duration::from_secs(5),
+                max_pending: 100,
+                forward_requests: true,
+            });
+            agents.insert(id, agent);
+        }
+
+        // Connect agents based on SimNode peer connections
+        // We need to create channel pairs for each connection
+        let mut connected: HashSet<(u64, u64)> = HashSet::new();
+        let mut connection_count = 0;
+
+        for (id_str, running) in nodes.iter() {
+            let id: u64 = id_str.parse().unwrap_or(0);
+            let peer_ids = running.node.peer_ids().await;
+
+            for peer_id_str in peer_ids {
+                let peer_id: u64 = peer_id_str.parse().unwrap_or(0);
+
+                // Only connect once per pair
+                let key = if id < peer_id { (id, peer_id) } else { (peer_id, id) };
+                if connected.contains(&key) {
+                    continue;
+                }
+                connected.insert(key);
+
+                // Create channel pair with latency and connect agents
+                if let (Some(agent_a), Some(agent_b)) = (agents.get(&id), agents.get(&peer_id)) {
+                    let (chan_a, chan_b) = MockChannel::pair(id, peer_id);
+                    // Wrap in LatencyChannel to simulate network delay
+                    let latency_chan_a = LatencyChannel::new(chan_a, latency);
+                    let latency_chan_b = LatencyChannel::new(chan_b, latency);
+                    agent_a.add_peer(peer_id, Arc::new(latency_chan_a)).await;
+                    agent_b.add_peer(id, Arc::new(latency_chan_b)).await;
+                    connection_count += 1;
+                }
+            }
+        }
+
+        eprintln!("  Connected {} agent pairs with {}ms latency", connection_count, self.config.network_latency_ms);
+
+        // Give time for receiver tasks to start
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        agents
+    }
+
+    /// Benchmark using Agent-based multi-hop forwarding (flooding strategy)
+    async fn benchmark_flooding(
+        &self,
+        num_requests: usize,
+        data_size: usize,
+        _timeout: Duration,
+    ) -> BenchmarkResults {
+        let mut results = Vec::new();
+
+        // Create agents from topology
+        let agents = self.create_agents().await;
+        let agent_ids: Vec<u64> = agents.keys().copied().collect();
+
+        if agent_ids.len() < 2 {
+            eprintln!("  Not enough agents for benchmark");
+            return BenchmarkResults::from_requests("Flooding", results);
+        }
+
+        for i in 0..num_requests {
+            if i > 0 && i % 10 == 0 {
+                eprint!(".");
+            }
+            // Pick random requester and data owner
+            let (requester_id, owner_id) = {
+                let mut rng = self.rng.write().await;
+                let req_idx = rng.gen_range(0..agent_ids.len());
+                let mut owner_idx = rng.gen_range(0..agent_ids.len());
+                while owner_idx == req_idx {
+                    owner_idx = rng.gen_range(0..agent_ids.len());
+                }
+                (agent_ids[req_idx], agent_ids[owner_idx])
+            };
+
+            // Generate random data
+            let data: Vec<u8> = {
+                let mut rng = self.rng.write().await;
+                (0..data_size).map(|_| rng.gen()).collect()
+            };
+            let hash = hashtree::sha256(&data);
+
+            // Store data on owner
+            if let Some(owner) = agents.get(&owner_id) {
+                owner.store.put_local(hash, data.clone());
+            }
+
+            // Get requester
+            let requester = match agents.get(&requester_id) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            let bytes_sent_before = requester.bytes_sent();
+            let bytes_recv_before = requester.bytes_received();
+
+            // Make request using Agent (multi-hop flooding)
+            let start = Instant::now();
+            let result = requester.get(&hash).await;
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let bytes_sent = requester.bytes_sent() - bytes_sent_before;
+            let bytes_recv = requester.bytes_received() - bytes_recv_before;
+
+            let success = match result {
+                Some(retrieved) => retrieved == data,
+                None => false,
+            };
+
+            // Clean up
+            if let Some(owner) = agents.get(&owner_id) {
+                owner.store.delete_local(&hash);
+            }
+            requester.store.delete_local(&hash);
+
+            results.push(RequestResult {
+                success,
+                latency_ms,
+                bytes_sent,
+                bytes_received: bytes_recv,
+                peers_queried: 0,
+                hops: 0,
+            });
+        }
+
+        // Stop all agents
+        for agent in agents.values() {
+            agent.stop().await;
+        }
+
+        BenchmarkResults::from_requests("Flooding", results)
+    }
+
+    /// Benchmark sequential strategy
+    /// Note: Current Agent uses flooding; sequential would need different logic
+    async fn benchmark_sequential(
+        &self,
+        num_requests: usize,
+        data_size: usize,
+        timeout: Duration,
+    ) -> BenchmarkResults {
+        // For now, use the same flooding-based agents
+        // A proper sequential implementation would try peers one at a time
+        // and only proceed to the next on not_found
+        self.benchmark_flooding(num_requests, data_size, timeout).await
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +849,7 @@ mod tests {
             discovery_interval_ms: 100,
             churn_rate: 0.0, // No churn for basic test
             allow_rejoin: false,
+            network_latency_ms: 0, // No latency for unit tests
         };
 
         let sim = Simulation::new(config);
@@ -561,6 +873,7 @@ mod tests {
             discovery_interval_ms: 100,
             churn_rate: 0.05, // 5% churn rate
             allow_rejoin: true,
+            network_latency_ms: 0,
         };
 
         let sim = Simulation::new(config);
@@ -587,6 +900,7 @@ mod tests {
             discovery_interval_ms: 100,
             churn_rate: 0.0,
             allow_rejoin: false,
+            network_latency_ms: 0,
         };
 
         let sim = Simulation::new(config);

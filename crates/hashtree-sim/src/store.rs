@@ -73,6 +73,11 @@ impl SimStore {
     pub fn clear(&self) {
         self.data.write().unwrap().clear();
     }
+
+    /// Delete data directly (sync version)
+    pub fn delete_local(&self, hash: &Hash) -> bool {
+        self.data.write().unwrap().remove(hash).is_some()
+    }
 }
 
 #[async_trait]

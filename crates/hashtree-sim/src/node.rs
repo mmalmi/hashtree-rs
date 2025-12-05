@@ -4,16 +4,19 @@
 //! 1. Announces presence on relay
 //! 2. Discovers other nodes
 //! 3. Establishes peer connections via signaling
-//! 4. Uses NetworkStore for data fetching
+//! 4. Uses NetworkStore for data fetching with handler loops
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::channel::{MockChannel, PeerChannel};
+use crate::flooding::{FloodingStore, handle_request as flooding_handle_request};
 use crate::relay::{
     Event, Filter, MockRelay, RelayClient, RelayMessage, KIND_ANSWER, KIND_OFFER, KIND_PRESENCE,
 };
+use crate::sequential::{SequentialStore, handle_request as sequential_handle_request};
 use crate::store::SimStore;
 
 /// Signaling content types
@@ -48,6 +51,18 @@ pub struct SimPeer {
     pub remote_id: String,
     pub channel: Arc<dyn PeerChannel>,
     pub connected_at: std::time::Instant,
+    /// Handler task for this peer (processes incoming requests)
+    #[allow(dead_code)]
+    handler: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Routing strategy for network requests
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingStrategy {
+    /// Send to all peers simultaneously
+    Flooding,
+    /// Try peers one at a time
+    Sequential,
 }
 
 /// Pending outbound connection (we sent offer, waiting for answer)
@@ -61,24 +76,47 @@ pub struct SimNode {
     pub id: String,
     /// Local storage
     pub store: Arc<SimStore>,
+    /// Flooding network store (wraps local + peer channels)
+    pub flooding_store: Arc<FloodingStore>,
+    /// Sequential network store (wraps local + peer channels)
+    pub sequential_store: Arc<SequentialStore>,
     /// Connected peers
     peers: RwLock<HashMap<String, SimPeer>>,
     /// Pending outbound connections (we sent offer)
     pending_outbound: RwLock<HashMap<String, PendingConnection>>,
     /// Configuration
     config: NodeConfig,
+    /// Current routing strategy for handlers
+    routing_strategy: RwLock<RoutingStrategy>,
 }
 
 impl SimNode {
     pub fn new(id: impl Into<String>, config: NodeConfig) -> Arc<Self> {
         let id = id.into();
+        let store = Arc::new(SimStore::new(id.parse().unwrap_or(0)));
+        let flooding_store = Arc::new(FloodingStore::new(store.clone(), Duration::from_secs(5)));
+        let sequential_store = Arc::new(SequentialStore::new(store.clone(), Duration::from_secs(1)));
+
         Arc::new(Self {
-            store: Arc::new(SimStore::new(id.parse().unwrap_or(0))),
+            store,
+            flooding_store,
+            sequential_store,
             id,
             peers: RwLock::new(HashMap::new()),
             pending_outbound: RwLock::new(HashMap::new()),
             config,
+            routing_strategy: RwLock::new(RoutingStrategy::Flooding),
         })
+    }
+
+    /// Set the routing strategy for request handlers
+    pub async fn set_routing_strategy(&self, strategy: RoutingStrategy) {
+        *self.routing_strategy.write().await = strategy;
+    }
+
+    /// Get the current routing strategy
+    pub async fn get_routing_strategy(&self) -> RoutingStrategy {
+        *self.routing_strategy.read().await
     }
 
     /// Connect to relay and announce presence
@@ -210,10 +248,14 @@ impl SimNode {
 
         // Get our channel half from the registry
         let their_channel = CHANNEL_REGISTRY.write().await.remove(&channel_id);
-        let channel = match their_channel {
+        let channel: Arc<dyn PeerChannel> = match their_channel {
             Some(c) => c,
             None => return Ok(()), // Channel not found, maybe stale offer
         };
+
+        // Note: We don't add channels to network stores here because the simulation
+        // uses direct store access for benchmarking. In a real implementation,
+        // channels would be added to enable network fetching.
 
         // Store the connection
         {
@@ -224,6 +266,7 @@ impl SimNode {
                     remote_id: from.clone(),
                     channel,
                     connected_at: std::time::Instant::now(),
+                    handler: None,
                 },
             );
         }
@@ -243,7 +286,7 @@ impl SimNode {
     }
 
     /// Handle incoming answer - complete the connection
-    pub async fn handle_answer(&self, event: &Event) {
+    pub async fn handle_answer(self: &Arc<Self>, event: &Event) {
         let from = &event.pubkey;
 
         // Get pending connection
@@ -258,16 +301,64 @@ impl SimNode {
             return;
         }
 
+        let channel: Arc<dyn PeerChannel> = pending.our_channel;
+
+        // Add channel to network stores
+        self.flooding_store.add_peer(channel.clone()).await;
+        self.sequential_store.add_peer(channel.clone()).await;
+
+        // Spawn handler loop for this peer
+        let handler = self.spawn_peer_handler(channel.clone()).await;
+
         // Complete the connection
         let mut peers = self.peers.write().await;
         peers.insert(
             from.clone(),
             SimPeer {
                 remote_id: from.clone(),
-                channel: pending.our_channel,
+                channel,
                 connected_at: std::time::Instant::now(),
+                handler: Some(handler),
             },
         );
+    }
+
+    /// Spawn a handler loop for a peer channel
+    ///
+    /// The handler receives requests and responds based on the current routing strategy.
+    async fn spawn_peer_handler(
+        self: &Arc<Self>,
+        channel: Arc<dyn PeerChannel>,
+    ) -> tokio::task::JoinHandle<()> {
+        let store = self.store.clone();
+        let routing_strategy = self.routing_strategy.read().await.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match channel.recv(Duration::from_secs(60)).await {
+                    Ok(bytes) => {
+                        // Handle request based on routing strategy
+                        let response = match routing_strategy {
+                            RoutingStrategy::Flooding => {
+                                flooding_handle_request(&store, &bytes).await
+                            }
+                            RoutingStrategy::Sequential => {
+                                sequential_handle_request(&store, &bytes).await
+                            }
+                        };
+
+                        if let Some(response) = response {
+                            if channel.send(response).await.is_err() {
+                                break; // Channel closed
+                            }
+                        }
+                    }
+                    Err(crate::channel::ChannelError::Disconnected) => break,
+                    Err(crate::channel::ChannelError::Timeout) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
     }
 
     /// Process relay messages - call this in a loop
@@ -283,7 +374,7 @@ impl SimNode {
                         let _ = self.handle_offer(client, &event).await;
                     }
                     "answers" => {
-                        self.handle_answer(&event).await;
+                        self.clone().handle_answer(&event).await;
                     }
                     "discovery" => {
                         // Found a peer's presence

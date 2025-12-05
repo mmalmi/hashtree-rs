@@ -24,6 +24,7 @@ mod sequential;
 mod relay;
 mod node;
 mod simulation;
+mod agent;
 
 pub use store::{SimStore, NetworkStore};
 pub use peer_agent::{PeerAgent, OurRequest, TheirRequest};
@@ -40,8 +41,9 @@ pub use relay::{
     MockRelay, RelayClient, RelayError, Event, Filter, RelayMessage, ClientMessage,
     KIND_PRESENCE, KIND_OFFER, KIND_ANSWER, KIND_CANDIDATE,
 };
-pub use node::{SimNode, NodeConfig, SimPeer, SignalingContent};
-pub use simulation::{Simulation, SimConfig, SimEvent, SimStats, TopologyStats};
+pub use node::{SimNode, NodeConfig, SimPeer, SignalingContent, RoutingStrategy};
+pub use simulation::{Simulation, SimConfig, SimEvent, SimStats, TopologyStats, BenchmarkResults, RequestResult};
+pub use agent::{Agent, AgentConfig};
 
 /// Node identifier
 pub type NodeId = u64;
