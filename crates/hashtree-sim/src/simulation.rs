@@ -814,7 +814,7 @@ impl Simulation {
 
         // Stop all agents
         for agent in agents.values() {
-            agent.stop().await;
+            agent.stop();
         }
 
         BenchmarkResults::from_requests("Flooding", results)

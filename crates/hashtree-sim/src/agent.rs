@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 
 use crate::channel::{ChannelError, PeerChannel};
 use crate::message::{encode_not_found, encode_request, encode_response, parse, ParsedMessage, RequestId};
@@ -71,8 +71,8 @@ pub struct Agent {
     bytes_sent: AtomicU64,
     /// Bytes received
     bytes_received: AtomicU64,
-    /// Running flag
-    running: RwLock<bool>,
+    /// Shutdown signal sender - broadcast to all receiver tasks
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 /// Incoming message with source peer
@@ -85,6 +85,8 @@ impl Agent {
     /// Create a new agent
     pub fn new(id: u64, config: AgentConfig) -> Arc<Self> {
         let (msg_tx, msg_rx) = mpsc::channel(1000);
+        // Broadcast channel for shutdown - capacity 1 is sufficient
+        let (shutdown_tx, _) = broadcast::channel(1);
 
         let agent = Arc::new(Self {
             id,
@@ -97,13 +99,14 @@ impl Agent {
             config,
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
-            running: RwLock::new(true),
+            shutdown_tx,
         });
 
         // Start message handler
         let agent_clone = agent.clone();
+        let shutdown_rx = agent.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            agent_clone.message_loop(msg_rx).await;
+            agent_clone.message_loop(msg_rx, shutdown_rx).await;
         });
 
         agent
@@ -113,25 +116,30 @@ impl Agent {
     pub async fn add_peer(self: &Arc<Self>, peer_id: u64, channel: Arc<dyn PeerChannel>) {
         self.peers.write().await.insert(peer_id, channel.clone());
 
-        // Spawn receiver for this peer
+        // Spawn receiver for this peer with proper async cancellation
         let agent = self.clone();
         let msg_tx = self.msg_tx.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
-                // Check running flag without holding lock during recv
-                if !*agent.running.read().await {
-                    break;
-                }
-
-                // Use short timeout to allow checking running flag frequently
-                match channel.recv(Duration::from_millis(100)).await {
-                    Ok(data) => {
-                        agent.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
-                        let _ = msg_tx.send(IncomingMessage { from_peer: peer_id, data }).await;
+                // Use select! to wait on either recv or shutdown - truly non-blocking
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = shutdown_rx.recv() => {
+                        break;
                     }
-                    Err(ChannelError::Disconnected) => break,
-                    Err(ChannelError::Timeout) => continue,
-                    Err(_) => break,
+                    // Wait for incoming data (with long timeout since we have select!)
+                    result = channel.recv(Duration::from_secs(60)) => {
+                        match result {
+                            Ok(data) => {
+                                agent.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                let _ = msg_tx.send(IncomingMessage { from_peer: peer_id, data }).await;
+                            }
+                            Err(ChannelError::Disconnected) => break,
+                            Err(ChannelError::Timeout) => continue,
+                            Err(_) => break,
+                        }
+                    }
                 }
             }
         });
@@ -207,20 +215,30 @@ impl Agent {
         }
     }
 
-    /// Main message processing loop
-    async fn message_loop(self: Arc<Self>, mut rx: mpsc::Receiver<IncomingMessage>) {
-        while let Some(msg) = rx.recv().await {
-            if !*self.running.read().await {
-                break;
+    /// Main message processing loop - uses select! for non-blocking shutdown
+    async fn message_loop(self: Arc<Self>, mut rx: mpsc::Receiver<IncomingMessage>, mut shutdown_rx: broadcast::Receiver<()>) {
+        loop {
+            tokio::select! {
+                // Check for shutdown signal
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+                // Wait for incoming messages
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            // Spawn message handling so it doesn't block the loop
+                            // This is critical for multi-hop: B can receive A's request,
+                            // forward to C, and still process C's response
+                            let self_clone = self.clone();
+                            tokio::spawn(async move {
+                                self_clone.handle_message(msg.from_peer, &msg.data).await;
+                            });
+                        }
+                        None => break, // Channel closed
+                    }
+                }
             }
-
-            // Spawn message handling so it doesn't block the loop
-            // This is critical for multi-hop: B can receive A's request,
-            // forward to C, and still process C's response
-            let self_clone = self.clone();
-            tokio::spawn(async move {
-                self_clone.handle_message(msg.from_peer, &msg.data).await;
-            });
         }
     }
 
@@ -319,9 +337,10 @@ impl Agent {
         }
     }
 
-    /// Stop the agent
-    pub async fn stop(&self) {
-        *self.running.write().await = false;
+    /// Stop the agent - broadcasts shutdown signal to all receiver tasks
+    pub fn stop(&self) {
+        // Broadcast shutdown to all receiver tasks - they will wake up immediately
+        let _ = self.shutdown_tx.send(());
     }
 
     /// Get bytes sent
