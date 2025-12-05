@@ -346,6 +346,7 @@ impl Simulation {
         let store_config = FloodingConfig {
             max_peers: self.config.max_peers,
             connect_timeout_ms: 5000,
+            network_latency_ms: self.config.network_latency_ms,
             ..FloodingConfig::default()
         };
 
@@ -676,7 +677,10 @@ impl Simulation {
     ///
     /// Places data on random nodes and makes requests from other nodes,
     /// measuring bandwidth, latency, and success rate.
-    /// Uses the FloodingStore instances which have multi-hop forwarding enabled.
+    ///
+    /// Returns (flooding_results, sequential_results) for comparison:
+    /// - Flooding: Multi-hop forwarding, sends to all peers, first response wins
+    /// - Sequential: Direct neighbors only, one peer at a time until found
     pub async fn run_benchmarks(
         &self,
         num_requests: usize,
@@ -684,8 +688,7 @@ impl Simulation {
         request_timeout: Duration,
     ) -> (BenchmarkResults, BenchmarkResults) {
         let flooding_results = self.benchmark_flooding(num_requests, data_size, request_timeout).await;
-        // Sequential uses the same stores for now (flooding-based)
-        let sequential_results = BenchmarkResults::from_requests("Sequential", flooding_results.requests.clone());
+        let sequential_results = self.benchmark_sequential(num_requests, data_size, request_timeout).await;
         (flooding_results, sequential_results)
     }
 
@@ -800,6 +803,153 @@ impl Simulation {
         }
 
         BenchmarkResults::from_requests("Flooding", results)
+    }
+
+    /// Benchmark using sequential strategy (direct neighbors only)
+    ///
+    /// Queries immediate peers one at a time, checks if they have the data locally.
+    /// No multi-hop forwarding - simulates a simpler protocol with lower bandwidth
+    /// but only works if data owner is a direct neighbor.
+    async fn benchmark_sequential(
+        &self,
+        num_requests: usize,
+        data_size: usize,
+        timeout: Duration,
+    ) -> BenchmarkResults {
+        let mut results = Vec::new();
+
+        let node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+
+        if node_ids.len() < 2 {
+            return BenchmarkResults::from_requests("Sequential", results);
+        }
+
+        let latency_ms = self.config.network_latency_ms;
+
+        for i in 0..num_requests {
+            if i > 0 && i % 10 == 0 {
+                eprint!(".");
+            }
+
+            // Pick random requester and data owner
+            let (requester_id, owner_id) = {
+                let mut rng = self.rng.write().await;
+                let req_idx = rng.gen_range(0..node_ids.len());
+                let mut owner_idx = rng.gen_range(0..node_ids.len());
+                while owner_idx == req_idx {
+                    owner_idx = rng.gen_range(0..node_ids.len());
+                }
+                (node_ids[req_idx].clone(), node_ids[owner_idx].clone())
+            };
+
+            // Generate random data (same as flooding test)
+            let data: Vec<u8> = {
+                let mut rng = self.rng.write().await;
+                (0..data_size).map(|_| rng.gen()).collect()
+            };
+            let hash = hashtree::sha256(&data);
+
+            // Store data locally on owner (raw, no chunking - simulates direct chunk lookup)
+            {
+                let nodes = self.nodes.read().await;
+                if let Some(owner) = nodes.get(&owner_id) {
+                    owner.store.local().put_local(hash, data.clone());
+                }
+            }
+
+            // Sequential: try each direct peer one at a time
+            let start = Instant::now();
+            let mut found_data: Option<Vec<u8>> = None;
+            let mut peers_queried = 0;
+            let mut bytes_sent: u64 = 0;
+            let mut bytes_recv: u64 = 0;
+
+            // Get requester's peers
+            let peer_ids = {
+                let nodes = self.nodes.read().await;
+                match nodes.get(&requester_id) {
+                    Some(n) => n.store.peer_ids().await,
+                    None => continue,
+                }
+            };
+
+            // Try peers sequentially
+            for peer_id in peer_ids {
+                if start.elapsed() > timeout {
+                    break;
+                }
+
+                peers_queried += 1;
+
+                // Simulate request message (41 bytes: 1 type + 4 id + 32 hash + 4 len)
+                let request_size: u64 = 41;
+                bytes_sent += request_size;
+
+                // Simulate network latency for request
+                if latency_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(latency_ms)).await;
+                }
+
+                // Check if this peer has the data (direct lookup)
+                let peer_has_data = {
+                    let nodes = self.nodes.read().await;
+                    let peer_node_id = peer_id.to_string();
+                    match nodes.get(&peer_node_id) {
+                        Some(peer_node) => peer_node.store.local().has_local(&hash),
+                        None => false,
+                    }
+                };
+
+                if peer_has_data {
+                    // Peer has it - simulate response
+                    let response_size = 41 + data_size as u64; // header + data
+                    bytes_recv += response_size;
+
+                    // Simulate network latency for response
+                    if latency_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(latency_ms)).await;
+                    }
+
+                    found_data = Some(data.clone());
+                    break;
+                } else {
+                    // Peer doesn't have it - simulate NOT_FOUND response
+                    let not_found_size: u64 = 37; // 1 type + 4 id + 32 hash
+                    bytes_recv += not_found_size;
+
+                    // Simulate network latency for response
+                    if latency_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(latency_ms)).await;
+                    }
+                }
+            }
+
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let success = match found_data {
+                Some(ref retrieved) => *retrieved == data,
+                None => false,
+            };
+
+            // Clean up
+            {
+                let nodes = self.nodes.read().await;
+                if let Some(owner) = nodes.get(&owner_id) {
+                    owner.store.local().delete_local(&hash);
+                }
+            }
+
+            results.push(RequestResult {
+                success,
+                latency_ms: elapsed_ms,
+                bytes_sent,
+                bytes_received: bytes_recv,
+                peers_queried,
+                hops: if success { peers_queried } else { 0 },
+            });
+        }
+
+        BenchmarkResults::from_requests("Sequential", results)
     }
 }
 

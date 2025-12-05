@@ -30,6 +30,8 @@ pub struct SequentialStore {
     bytes_sent: AtomicU64,
     /// Total bytes received
     bytes_received: AtomicU64,
+    /// Simulated network latency per send (ms)
+    network_latency_ms: u64,
 }
 
 impl SequentialStore {
@@ -41,7 +43,28 @@ impl SequentialStore {
             next_request_id: AtomicU32::new(1),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            network_latency_ms: 0,
         }
+    }
+
+    pub fn with_latency(local: Arc<SimStore>, peer_timeout: Duration, network_latency_ms: u64) -> Self {
+        Self {
+            local,
+            peers: RwLock::new(Vec::new()),
+            peer_timeout,
+            next_request_id: AtomicU32::new(1),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            network_latency_ms,
+        }
+    }
+
+    /// Send data with simulated network latency
+    async fn send_with_latency(&self, peer: &dyn PeerChannel, data: Vec<u8>) -> Result<(), ChannelError> {
+        if self.network_latency_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.network_latency_ms)).await;
+        }
+        peer.send(data).await
     }
 
     /// Add a peer channel
@@ -97,11 +120,11 @@ impl NetworkStore for SequentialStore {
 
         // Try each peer sequentially
         for peer in peers.iter() {
-            // Send request
+            // Send request with latency simulation
             self.bytes_sent
                 .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
 
-            if peer.send(request_bytes.clone()).await.is_err() {
+            if self.send_with_latency(peer.as_ref(), request_bytes.clone()).await.is_err() {
                 continue; // Try next peer
             }
 

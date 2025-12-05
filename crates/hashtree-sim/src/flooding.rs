@@ -60,6 +60,9 @@ pub struct FloodingConfig {
     pub max_peers: usize,
     /// Connection timeout (ms)
     pub connect_timeout_ms: u64,
+    /// Simulated network latency per hop (ms)
+    /// Set to 0 for instant delivery (unit tests), ~50ms for realistic WebRTC
+    pub network_latency_ms: u64,
 }
 
 impl Default for FloodingConfig {
@@ -69,6 +72,7 @@ impl Default for FloodingConfig {
             forward_requests: true,
             max_peers: 5,
             connect_timeout_ms: 5000,
+            network_latency_ms: 0, // Instant for tests, set to ~50 for realistic simulation
         }
     }
 }
@@ -217,6 +221,19 @@ impl FloodingStore {
     pub async fn discover_peers(&self, client: &RelayClient) -> Result<(), crate::relay::RelayError> {
         let filter = Filter::new().kinds(vec![KIND_PRESENCE]);
         client.subscribe("discovery", vec![filter]).await
+    }
+
+    /// Send data to a channel with simulated network latency
+    async fn send_with_latency(
+        &self,
+        channel: &dyn PeerChannel,
+        data: Vec<u8>,
+    ) -> Result<(), crate::channel::ChannelError> {
+        // Simulate network latency (one-way delay)
+        if self.config.network_latency_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.config.network_latency_ms)).await;
+        }
+        channel.send(data).await
     }
 
     /// Send offer to a peer
@@ -430,7 +447,7 @@ impl FloodingStore {
                 continue;
             }
 
-            if channel.send(request_bytes.clone()).await.is_ok() {
+            if self.send_with_latency(channel.as_ref(), request_bytes.clone()).await.is_ok() {
                 self.bytes_sent
                     .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
                 sent_to.push(peer_id);
@@ -519,7 +536,7 @@ impl FloodingStore {
         if let Some(data) = self.local.get_local(&hash) {
             let response = encode_response(id, &hash, &data);
             if let Some(channel) = self.peers.read().await.get(&from_peer) {
-                if channel.send(response.clone()).await.is_ok() {
+                if self.send_with_latency(channel.as_ref(), response.clone()).await.is_ok() {
                     self.bytes_sent
                         .fetch_add(response.len() as u64, Ordering::Relaxed);
                 }
@@ -551,7 +568,7 @@ impl FloodingStore {
                 self.their_requests.write().await.remove(&hash);
                 let response = encode_response(id, &hash, &data);
                 if let Some(channel) = self.peers.read().await.get(&from_peer) {
-                    if channel.send(response.clone()).await.is_ok() {
+                    if self.send_with_latency(channel.as_ref(), response.clone()).await.is_ok() {
                         self.bytes_sent
                             .fetch_add(response.len() as u64, Ordering::Relaxed);
                     }
