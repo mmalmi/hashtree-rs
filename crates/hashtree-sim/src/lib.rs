@@ -2,51 +2,46 @@
 //!
 //! Provides store implementations for testing different routing strategies.
 //!
-//! ## NetworkStore implementations
-//!
-//! - `FloodingStore` - sends to all peers, returns first response (high bandwidth, low latency)
-//! - `SequentialStore` - sends to one peer at a time with not_found (low bandwidth, higher latency)
-//!
 //! ## Architecture
 //!
 //! - `SimStore` - local-only storage (implements hashtree::Store)
-//! - `NetworkStore` trait - extends Store with network fetch capability
+//! - `FloodingStore` - complete P2P node with signaling + multi-hop forwarding (like WebRTCStore)
+//! - `SequentialStore` - sends to one peer at a time with not_found (low bandwidth, higher latency)
+//! - `MockRelay` - Nostr-like relay for signaling
 //! - `PeerChannel` trait - abstraction for peer communication
-//! - `PeerAgent` - per-peer request/response tracking
 
-mod store;
-mod peer_agent;
-mod message;
 mod behavior;
 mod channel;
 mod flooding;
-mod sequential;
+mod message;
+mod peer_agent;
 mod relay;
-mod node;
+mod sequential;
 mod simulation;
-mod agent;
+mod store;
 
-pub use store::{SimStore, NetworkStore};
-pub use peer_agent::{PeerAgent, OurRequest, TheirRequest};
-pub use message::{
-    Hash, RequestId, ParsedMessage, ParseError,
-    encode_request, encode_response, encode_not_found, encode_push, parse,
-    MSG_REQUEST, MSG_RESPONSE, MSG_NOT_FOUND, MSG_PUSH,
-};
 pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};
-pub use channel::{PeerChannel, ChannelError, MockChannel, LatencyChannel};
-pub use flooding::{FloodingStore, handle_request as flooding_handle_request};
-pub use sequential::{SequentialStore, handle_request as sequential_handle_request};
-pub use relay::{
-    MockRelay, RelayClient, RelayError, Event, Filter, RelayMessage, ClientMessage,
-    KIND_PRESENCE, KIND_OFFER, KIND_ANSWER, KIND_CANDIDATE,
+pub use channel::{ChannelError, LatencyChannel, MockChannel, PeerChannel};
+pub use flooding::{
+    handle_request as flooding_handle_request, FloodingConfig, FloodingStore, SignalingContent,
 };
-pub use node::{SimNode, NodeConfig, SimPeer, SignalingContent, RoutingStrategy};
-pub use simulation::{Simulation, SimConfig, SimEvent, SimStats, TopologyStats, BenchmarkResults, RequestResult};
-pub use agent::{Agent, AgentConfig};
+pub use message::{
+    encode_not_found, encode_push, encode_request, encode_response, parse, Hash, ParseError,
+    ParsedMessage, RequestId, MSG_NOT_FOUND, MSG_PUSH, MSG_REQUEST, MSG_RESPONSE,
+};
+pub use peer_agent::{OurRequest, PeerAgent, TheirRequest};
+pub use relay::{
+    ClientMessage, Event, Filter, MockRelay, RelayClient, RelayError, RelayMessage,
+    KIND_ANSWER, KIND_CANDIDATE, KIND_OFFER, KIND_PRESENCE,
+};
+pub use sequential::{handle_request as sequential_handle_request, SequentialStore};
+pub use simulation::{
+    BenchmarkResults, RequestResult, SimConfig, SimEvent, SimStats, Simulation, TopologyStats,
+};
+pub use store::{NetworkStore, SimStore};
 
 /// Node identifier
 pub type NodeId = u64;
 
 // Re-export hashtree types for convenience
-pub use hashtree::{HashTree, HashTreeConfig, MemoryStore, Store, Cid};
+pub use hashtree::{Cid, HashTree, HashTreeConfig, MemoryStore, Store};

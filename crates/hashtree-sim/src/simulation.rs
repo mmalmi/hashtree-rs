@@ -3,6 +3,10 @@
 //! Spawns and removes nodes over time (churn), forms topology through signaling,
 //! and analyzes results. Can run network benchmarks measuring bandwidth, latency,
 //! and success rate.
+//!
+//! Uses HashTree<FloodingStore> - full stack simulation matching production architecture.
+//! - HashTree handles content chunking and merkle tree operations
+//! - FloodingStore handles P2P networking (signaling, peer management, multi-hop routing)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -11,10 +15,10 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use tokio::sync::RwLock;
 
+use crate::flooding::{FloodingConfig, FloodingStore};
 use crate::relay::{MockRelay, RelayClient};
-use crate::node::{NodeConfig, SimNode};
-use crate::agent::{Agent, AgentConfig};
-use crate::channel::{MockChannel, LatencyChannel};
+use crate::store::NetworkStore;
+use hashtree::{HashTree, HashTreeConfig};
 
 /// Simulation configuration
 #[derive(Clone)]
@@ -63,7 +67,11 @@ pub enum SimEvent {
 
 /// A running node in the simulation
 struct RunningNode {
-    node: Arc<SimNode>,
+    /// HashTree for content operations (chunking, merkle trees)
+    tree: HashTree<FloodingStore>,
+    /// The underlying FloodingStore for P2P operations (signaling, peer management)
+    store: Arc<FloodingStore>,
+    /// Relay client for signaling
     client: RelayClient,
     #[allow(dead_code)]
     joined_at_ms: u64,
@@ -335,20 +343,24 @@ impl Simulation {
             current.to_string()
         };
 
-        let node_config = NodeConfig {
+        let store_config = FloodingConfig {
             max_peers: self.config.max_peers,
             connect_timeout_ms: 5000,
+            ..FloodingConfig::default()
         };
 
-        let node = SimNode::new(node_id.clone(), node_config);
-        let mut client = node.connect_to_relay(&self.relay).await;
+        // Create FloodingStore for P2P networking
+        let store = FloodingStore::new(node_id.clone(), store_config);
 
-        // Setup signaling subscriptions
-        let _ = node.setup_signaling(&client).await;
+        // Wrap in HashTree for content operations (chunking, merkle trees)
+        let tree_config = HashTreeConfig::new(store.clone());
+        let tree = HashTree::new(tree_config);
 
-        // Drain initial messages
+        let mut client = store.start(&self.relay).await;
+
+        // Drain initial messages (EOSE, etc)
         while let Some(msg) = client.try_recv() {
-            let _ = node.process_message(&client, msg).await;
+            let _ = store.process_message(&client, msg).await;
         }
 
         // Record event
@@ -364,7 +376,8 @@ impl Simulation {
         self.nodes.write().await.insert(
             node_id,
             RunningNode {
-                node,
+                tree,
+                store,
                 client,
                 joined_at_ms: time_ms,
             },
@@ -405,15 +418,18 @@ impl Simulation {
         let removed = self.nodes.write().await.remove(node_id);
 
         if let Some(running) = removed {
+            // Stop the store
+            running.store.stop();
+
             // Record connections lost
-            let peer_ids = running.node.peer_ids().await;
+            let peer_ids = running.store.peer_ids().await;
             let mut stats = self.stats.write().await;
 
             for peer_id in peer_ids {
                 stats.total_connections_lost += 1;
                 stats.events.push(SimEvent::ConnectionLost {
                     from: node_id.to_string(),
-                    to: peer_id,
+                    to: peer_id.to_string(),
                     time_ms,
                 });
             }
@@ -430,7 +446,7 @@ impl Simulation {
         let mut nodes = self.nodes.write().await;
         for (_, running) in nodes.iter_mut() {
             while let Some(msg) = running.client.try_recv() {
-                running.node.process_message(&running.client, msg).await;
+                running.store.process_message(&running.client, msg).await;
             }
         }
     }
@@ -445,7 +461,7 @@ impl Simulation {
                 None => continue,
             };
 
-            let current_peers = running.node.peer_count().await;
+            let current_peers = running.store.peer_count().await;
             if current_peers >= self.config.max_peers {
                 continue;
             }
@@ -465,13 +481,14 @@ impl Simulation {
                 candidates[rng.gen_range(0..candidates.len())].clone()
             };
 
-            // Check if already connected
-            let existing_peers = running.node.peer_ids().await;
-            if existing_peers.contains(&target) {
+            // Check if already connected (peer_ids returns u64, need to convert)
+            let existing_peers = running.store.peer_ids().await;
+            let target_id: u64 = target.parse().unwrap_or(0);
+            if existing_peers.contains(&target_id) {
                 continue;
             }
 
-            let _ = running.node.send_offer(&running.client, &target).await;
+            let _ = running.store.send_offer(&running.client, &target).await;
 
             // Record potential connection (actual connection confirmed via answer)
             // We'll count connections in topology analysis
@@ -482,11 +499,12 @@ impl Simulation {
     pub async fn analyze_topology(&self) -> TopologyStats {
         let nodes = self.nodes.read().await;
 
-        // Build adjacency map
+        // Build adjacency map (convert u64 peer IDs to strings for topology analysis)
         let mut adjacency: HashMap<String, HashSet<String>> = HashMap::new();
         for (node_id, running) in nodes.iter() {
-            let peers = running.node.peer_ids().await;
-            adjacency.insert(node_id.clone(), peers.into_iter().collect());
+            let peers = running.store.peer_ids().await;
+            let peer_strings: HashSet<String> = peers.into_iter().map(|p| p.to_string()).collect();
+            adjacency.insert(node_id.clone(), peer_strings);
         }
 
         let node_count = adjacency.len();
@@ -654,10 +672,11 @@ impl Simulation {
         println!("Topology snapshots: {}", stats.topology_snapshots.len());
     }
 
-    /// Run network benchmarks with both flooding and sequential strategies
+    /// Run network benchmarks using the live simulation topology
     ///
     /// Places data on random nodes and makes requests from other nodes,
     /// measuring bandwidth, latency, and success rate.
+    /// Uses the FloodingStore instances which have multi-hop forwarding enabled.
     pub async fn run_benchmarks(
         &self,
         num_requests: usize,
@@ -665,71 +684,16 @@ impl Simulation {
         request_timeout: Duration,
     ) -> (BenchmarkResults, BenchmarkResults) {
         let flooding_results = self.benchmark_flooding(num_requests, data_size, request_timeout).await;
-        let sequential_results = self.benchmark_sequential(num_requests, data_size, request_timeout).await;
+        // Sequential uses the same stores for now (flooding-based)
+        let sequential_results = BenchmarkResults::from_requests("Sequential", flooding_results.requests.clone());
         (flooding_results, sequential_results)
     }
 
-    /// Create agents from the current network topology
+    /// Benchmark using HashTree + FloodingStore (full stack)
     ///
-    /// This creates Agent instances that mirror the SimNode connections,
-    /// enabling proper multi-hop request forwarding for benchmarking.
-    async fn create_agents(&self) -> HashMap<u64, Arc<Agent>> {
-        let nodes = self.nodes.read().await;
-        let mut agents: HashMap<u64, Arc<Agent>> = HashMap::new();
-        let latency = Duration::from_millis(self.config.network_latency_ms);
-
-        // Create an agent for each node
-        for (id_str, _) in nodes.iter() {
-            let id: u64 = id_str.parse().unwrap_or(0);
-            let agent = Agent::new(id, AgentConfig {
-                request_timeout: Duration::from_secs(2), // Reasonable timeout for multi-hop requests
-                max_pending: 100,
-                forward_requests: true,
-            });
-            agents.insert(id, agent);
-        }
-
-        // Connect agents based on SimNode peer connections
-        // We need to create channel pairs for each connection
-        let mut connected: HashSet<(u64, u64)> = HashSet::new();
-        let mut connection_count = 0;
-
-        for (id_str, running) in nodes.iter() {
-            let id: u64 = id_str.parse().unwrap_or(0);
-            let peer_ids = running.node.peer_ids().await;
-
-            for peer_id_str in peer_ids {
-                let peer_id: u64 = peer_id_str.parse().unwrap_or(0);
-
-                // Only connect once per pair
-                let key = if id < peer_id { (id, peer_id) } else { (peer_id, id) };
-                if connected.contains(&key) {
-                    continue;
-                }
-                connected.insert(key);
-
-                // Create channel pair with latency and connect agents
-                if let (Some(agent_a), Some(agent_b)) = (agents.get(&id), agents.get(&peer_id)) {
-                    let (chan_a, chan_b) = MockChannel::pair(id, peer_id);
-                    // Wrap in LatencyChannel to simulate network delay
-                    let latency_chan_a = LatencyChannel::new(chan_a, latency);
-                    let latency_chan_b = LatencyChannel::new(chan_b, latency);
-                    agent_a.add_peer(peer_id, Arc::new(latency_chan_a)).await;
-                    agent_b.add_peer(id, Arc::new(latency_chan_b)).await;
-                    connection_count += 1;
-                }
-            }
-        }
-
-        eprintln!("  Connected {} agent pairs with {}ms latency", connection_count, self.config.network_latency_ms);
-
-        // Give time for receiver tasks to start
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        agents
-    }
-
-    /// Benchmark using Agent-based multi-hop forwarding (flooding strategy)
+    /// Uses HashTree for content operations (put_file/read_file with chunking)
+    /// and FloodingStore for P2P networking (multi-hop forwarding).
+    /// This mirrors production architecture: HashTree<WebRTCStore>.
     async fn benchmark_flooding(
         &self,
         num_requests: usize,
@@ -738,12 +702,10 @@ impl Simulation {
     ) -> BenchmarkResults {
         let mut results = Vec::new();
 
-        // Create agents from topology
-        let agents = self.create_agents().await;
-        let agent_ids: Vec<u64> = agents.keys().copied().collect();
+        let node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
 
-        if agent_ids.len() < 2 {
-            eprintln!("  Not enough agents for benchmark");
+        if node_ids.len() < 2 {
+            eprintln!("  Not enough nodes for benchmark");
             return BenchmarkResults::from_requests("Flooding", results);
         }
 
@@ -751,15 +713,16 @@ impl Simulation {
             if i > 0 && i % 10 == 0 {
                 eprint!(".");
             }
+
             // Pick random requester and data owner
             let (requester_id, owner_id) = {
                 let mut rng = self.rng.write().await;
-                let req_idx = rng.gen_range(0..agent_ids.len());
-                let mut owner_idx = rng.gen_range(0..agent_ids.len());
+                let req_idx = rng.gen_range(0..node_ids.len());
+                let mut owner_idx = rng.gen_range(0..node_ids.len());
                 while owner_idx == req_idx {
-                    owner_idx = rng.gen_range(0..agent_ids.len());
+                    owner_idx = rng.gen_range(0..node_ids.len());
                 }
-                (agent_ids[req_idx], agent_ids[owner_idx])
+                (node_ids[req_idx].clone(), node_ids[owner_idx].clone())
             };
 
             // Generate random data
@@ -767,43 +730,64 @@ impl Simulation {
                 let mut rng = self.rng.write().await;
                 (0..data_size).map(|_| rng.gen()).collect()
             };
-            let hash = hashtree::sha256(&data);
 
-            // Store data on owner
-            if let Some(owner) = agents.get(&owner_id) {
-                owner.store.put_local(hash, data.clone());
-            }
-
-            // Get requester
-            let requester = match agents.get(&requester_id) {
-                Some(a) => a,
-                None => continue,
+            // Store data on owner's HashTree (handles chunking for large files)
+            let hash = {
+                let nodes = self.nodes.read().await;
+                let owner = match nodes.get(&owner_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                match owner.tree.put_file(&data).await {
+                    Ok(result) => result.hash,
+                    Err(_) => continue,
+                }
             };
 
-            let bytes_sent_before = requester.bytes_sent();
-            let bytes_recv_before = requester.bytes_received();
+            // Get requester's store for bandwidth tracking
+            let (requester_store, bytes_sent_before, bytes_recv_before) = {
+                let nodes = self.nodes.read().await;
+                let requester = match nodes.get(&requester_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let store = requester.store.clone();
+                (store, requester.store.bytes_sent(), requester.store.bytes_received())
+            };
 
-            // Make request using Agent (multi-hop flooding) with overall timeout
+            // Make request using requester's HashTree (multi-hop forwarding via FloodingStore)
             let start = Instant::now();
-            let result = tokio::time::timeout(timeout, requester.get(&hash)).await;
+            let result = {
+                let nodes = self.nodes.read().await;
+                let requester = match nodes.get(&requester_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                tokio::time::timeout(timeout, requester.tree.read_file(&hash)).await
+            };
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-            // Unwrap timeout result
-            let result = result.ok().flatten();
+            // Unwrap timeout and HashTree result
+            let result = result.ok().and_then(|r| r.ok()).flatten();
 
-            let bytes_sent = requester.bytes_sent() - bytes_sent_before;
-            let bytes_recv = requester.bytes_received() - bytes_recv_before;
+            let bytes_sent = requester_store.bytes_sent() - bytes_sent_before;
+            let bytes_recv = requester_store.bytes_received() - bytes_recv_before;
 
             let success = match result {
-                Some(retrieved) => retrieved == data,
+                Some(ref retrieved) => *retrieved == data,
                 None => false,
             };
 
-            // Clean up
-            if let Some(owner) = agents.get(&owner_id) {
-                owner.store.delete_local(&hash);
+            // Clean up - delete from owner and requester cache
+            {
+                let nodes = self.nodes.read().await;
+                if let Some(owner) = nodes.get(&owner_id) {
+                    owner.store.local().delete_local(&hash);
+                }
+                if let Some(requester) = nodes.get(&requester_id) {
+                    requester.store.local().delete_local(&hash);
+                }
             }
-            requester.store.delete_local(&hash);
 
             results.push(RequestResult {
                 success,
@@ -815,26 +799,7 @@ impl Simulation {
             });
         }
 
-        // Stop all agents
-        for agent in agents.values() {
-            agent.stop();
-        }
-
         BenchmarkResults::from_requests("Flooding", results)
-    }
-
-    /// Benchmark sequential strategy
-    /// Note: Current Agent uses flooding; sequential would need different logic
-    async fn benchmark_sequential(
-        &self,
-        num_requests: usize,
-        data_size: usize,
-        timeout: Duration,
-    ) -> BenchmarkResults {
-        // For now, use the same flooding-based agents
-        // A proper sequential implementation would try peers one at a time
-        // and only proceed to the next on not_found
-        self.benchmark_flooding(num_requests, data_size, timeout).await
     }
 }
 
