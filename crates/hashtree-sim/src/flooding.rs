@@ -53,10 +53,14 @@ struct PendingConnection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingStrategy {
     /// Flood requests to all peers simultaneously, first response wins
-    /// Lower latency, higher bandwidth
+    /// + Multi-hop forwarding: peers forward to their peers
+    /// + Lower latency, higher bandwidth usage
     Flooding,
     /// Try peers one at a time, wait for response before trying next
-    /// Lower bandwidth, higher latency
+    /// + Single-hop only: peers only check local storage (no forwarding)
+    /// + Lower bandwidth, but only reaches direct neighbors
+    /// Note: Multi-hop sequential would require NOT_FOUND responses to avoid
+    /// cascading timeouts at each hop.
     Sequential,
 }
 
@@ -627,7 +631,9 @@ impl FloodingStore {
         }
 
         // Not found locally - try forwarding to other peers
-        if self.config.forward_requests {
+        // Note: Sequential strategy doesn't forward because timeout-based failure
+        // detection causes cascading delays (each hop waits for timeout before trying next)
+        if self.config.forward_requests && self.config.routing_strategy == RoutingStrategy::Flooding {
             // Check if we're already looking for this hash (prevents cycles)
             {
                 let their_requests = self.their_requests.read().await;
