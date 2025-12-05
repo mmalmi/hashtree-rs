@@ -134,17 +134,15 @@ impl<C: PeerChannel> PeerChannel for LatencyChannel<C> {
     }
 
     async fn send(&self, data: Vec<u8>) -> Result<(), ChannelError> {
+        // Simulate network latency on send (one-way delay)
         tokio::time::sleep(self.latency).await;
         self.inner.send(data).await
     }
 
     async fn recv(&self, timeout: Duration) -> Result<Vec<u8>, ChannelError> {
-        // Account for latency in timeout
-        let adjusted = timeout.saturating_sub(self.latency);
-        if adjusted.is_zero() {
-            return Err(ChannelError::Timeout);
-        }
-        self.inner.recv(adjusted).await
+        // No latency adjustment on recv - message has already arrived
+        // Latency is simulated on the send side
+        self.inner.recv(timeout).await
     }
 
     fn is_connected(&self) -> bool {

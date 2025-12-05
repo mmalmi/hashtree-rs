@@ -42,7 +42,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(2), // Short timeout to avoid cascading delays
             max_pending: 100,
             forward_requests: true,
         }
@@ -118,11 +118,13 @@ impl Agent {
         let msg_tx = self.msg_tx.clone();
         tokio::spawn(async move {
             loop {
+                // Check running flag without holding lock during recv
                 if !*agent.running.read().await {
                     break;
                 }
 
-                match channel.recv(Duration::from_secs(60)).await {
+                // Use short timeout to allow checking running flag frequently
+                match channel.recv(Duration::from_millis(100)).await {
                     Ok(data) => {
                         agent.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
                         let _ = msg_tx.send(IncomingMessage { from_peer: peer_id, data }).await;
@@ -260,7 +262,22 @@ impl Agent {
 
         // Not found locally - try forwarding to other peers
         if self.config.forward_requests {
-            // Track the request for later push
+            // Check if we're already looking for this hash (prevents cycles)
+            {
+                let their_requests = self.their_requests.read().await;
+                if their_requests.contains_key(&hash) {
+                    // Already have a pending request for this hash, send not_found to avoid cycle
+                    let response = encode_not_found(id, &hash);
+                    if let Some(channel) = self.peers.read().await.get(&from_peer) {
+                        if channel.send(response.clone()).await.is_ok() {
+                            self.bytes_sent.fetch_add(response.len() as u64, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Track the request for cycle detection and later push
             self.their_requests.write().await.insert(hash, TheirRequest { id, from_peer });
 
             // Forward to other peers (excluding the requester)
@@ -275,6 +292,9 @@ impl Agent {
                 }
                 return;
             }
+
+            // Remove the tracking entry
+            self.their_requests.write().await.remove(&hash);
         }
 
         // Not found anywhere - send not_found
