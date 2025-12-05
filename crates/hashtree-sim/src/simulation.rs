@@ -682,7 +682,7 @@ impl Simulation {
         for (id_str, _) in nodes.iter() {
             let id: u64 = id_str.parse().unwrap_or(0);
             let agent = Agent::new(id, AgentConfig {
-                request_timeout: Duration::from_secs(5),
+                request_timeout: Duration::from_secs(2), // Reasonable timeout for multi-hop requests
                 max_pending: 100,
                 forward_requests: true,
             });
@@ -734,7 +734,7 @@ impl Simulation {
         &self,
         num_requests: usize,
         data_size: usize,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> BenchmarkResults {
         let mut results = Vec::new();
 
@@ -783,10 +783,13 @@ impl Simulation {
             let bytes_sent_before = requester.bytes_sent();
             let bytes_recv_before = requester.bytes_received();
 
-            // Make request using Agent (multi-hop flooding)
+            // Make request using Agent (multi-hop flooding) with overall timeout
             let start = Instant::now();
-            let result = requester.get(&hash).await;
+            let result = tokio::time::timeout(timeout, requester.get(&hash)).await;
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // Unwrap timeout result
+            let result = result.ok().flatten();
 
             let bytes_sent = requester.bytes_sent() - bytes_sent_before;
             let bytes_recv = requester.bytes_received() - bytes_recv_before;
