@@ -15,10 +15,12 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
+use lru::LruCache;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, error, warn};
 
 use crate::storage::HashtreeStore;
@@ -36,12 +38,18 @@ struct Peer {
     tx: mpsc::Sender<Message>,
 }
 
+/// Max number of hashes to track per peer (LRU eviction after this)
+const MAX_REQUESTED_HASHES_PER_PEER: usize = 1000;
+
 /// Registry of all connected peers
 pub struct PeerRegistry {
     peers: RwLock<HashMap<u64, Peer>>,
     next_id: RwLock<u64>,
     /// Pending requests waiting for responses from peers
     pending_requests: RwLock<HashMap<(u64, u32), oneshot::Sender<Option<Vec<u8>>>>>,
+    /// Track hashes we've already requested from each peer (peer_id -> LRU cache of hashes)
+    /// Value is () since we only care about presence
+    requested_from_peer: Mutex<HashMap<u64, LruCache<String, ()>>>,
 }
 
 impl PeerRegistry {
@@ -50,6 +58,7 @@ impl PeerRegistry {
             peers: RwLock::new(HashMap::new()),
             next_id: RwLock::new(1),
             pending_requests: RwLock::new(HashMap::new()),
+            requested_from_peer: Mutex::new(HashMap::new()),
         }
     }
 
@@ -68,6 +77,11 @@ impl PeerRegistry {
         let mut peers = self.peers.write().await;
         peers.remove(&id);
         debug!("Peer {} unregistered, total: {}", id, peers.len());
+        drop(peers);
+
+        // Clean up request tracking for this peer
+        let mut requested = self.requested_from_peer.lock().await;
+        requested.remove(&id);
     }
 
     /// Forward a request to other peers (excluding the requester)
@@ -85,10 +99,38 @@ impl PeerRegistry {
             return None;
         }
 
-        debug!("Forwarding request for {} to {} peers", &hash[..16.min(hash.len())], other_peers.len());
+        // Filter out peers we've already requested this hash from
+        let mut requested = self.requested_from_peer.lock().await;
+        let peers_to_query: Vec<_> = other_peers
+            .into_iter()
+            .filter(|(peer_id, _)| {
+                if let Some(cache) = requested.get(peer_id) {
+                    !cache.contains(hash)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        drop(requested);
+
+        if peers_to_query.is_empty() {
+            debug!("Already requested {} from all peers, skipping", &hash[..16.min(hash.len())]);
+            return None;
+        }
+
+        debug!("Forwarding request for {} to {} peers", &hash[..16.min(hash.len())], peers_to_query.len());
 
         // Query peers sequentially with delay
-        for (peer_id, tx) in other_peers {
+        for (peer_id, tx) in peers_to_query {
+            // Mark this hash as requested from this peer
+            {
+                let mut requested = self.requested_from_peer.lock().await;
+                let cache = requested.entry(peer_id).or_insert_with(|| {
+                    LruCache::new(NonZeroUsize::new(MAX_REQUESTED_HASHES_PER_PEER).unwrap())
+                });
+                cache.put(hash.to_string(), ());
+            }
+
             // Create a unique request ID for this forward
             let forward_id = {
                 let next_id = self.next_id.read().await;
