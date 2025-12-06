@@ -16,6 +16,8 @@ use axum::{
 use hashtree_git::http::{handle_info_refs, handle_receive_pack, handle_upload_pack, Service};
 use hashtree_git::refs::Ref;
 use hashtree_git::GitStorage;
+use nostr::nips::nip19::{FromBech32, ToBech32};
+use nostr::PublicKey;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -36,6 +38,21 @@ pub struct InfoRefsQuery {
 pub struct GitPath {
     pub pubkey: String,
     pub repo: String,
+}
+
+/// Normalize pubkey to hex format (accepts both npub and hex)
+fn normalize_pubkey_to_hex(pubkey: &str) -> Option<String> {
+    // Try parsing as npub first
+    if pubkey.starts_with("npub") {
+        PublicKey::from_bech32(pubkey)
+            .ok()
+            .map(|pk| pk.to_hex())
+    } else {
+        // Assume hex, validate it
+        PublicKey::from_hex(pubkey)
+            .ok()
+            .map(|pk| pk.to_hex())
+    }
 }
 
 /// GET /:pubkey/:repo/info/refs?service=git-upload-pack|git-receive-pack
@@ -86,8 +103,16 @@ pub async fn receive_pack(
     Path(path): Path<GitPath>,
     body: axum::body::Bytes,
 ) -> Response {
+    // Normalize path pubkey to hex for comparison (accepts both npub and hex)
+    let path_pubkey_hex = match normalize_pubkey_to_hex(&path.pubkey) {
+        Some(hex) => hex,
+        None => {
+            return (StatusCode::BAD_REQUEST, "Invalid pubkey format").into_response();
+        }
+    };
+
     // Only allow push to own pubkey
-    if path.pubkey.to_lowercase() != state.local_pubkey.to_lowercase() {
+    if path_pubkey_hex.to_lowercase() != state.local_pubkey.to_lowercase() {
         return (
             StatusCode::FORBIDDEN,
             "Cannot push to another user's repository",
@@ -138,10 +163,16 @@ pub async fn list_repos(State(state): State<GitState>) -> impl IntoResponse {
     // Build repo info - currently single repo model
     let has_refs = !refs.is_empty();
 
+    // Convert hex pubkey to npub for display
+    let npub = PublicKey::from_hex(&state.local_pubkey)
+        .ok()
+        .and_then(|pk| pk.to_bech32().ok())
+        .unwrap_or_else(|| state.local_pubkey.clone());
+
     Json(json!({
-        "pubkey": state.local_pubkey,
+        "pubkey": npub,
         "has_repo": has_refs,
         "branches": branches,
-        "clone_url": format!("/git/{}/repo", state.local_pubkey),
+        "clone_url": format!("/git/{}/repo", npub),
     }))
 }
