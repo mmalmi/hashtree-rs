@@ -346,11 +346,23 @@ impl Simulation {
             current.to_string()
         };
 
+        // Sequential strategy: single-hop only (no forwarding) to avoid cascading timeouts
+        // Flooding strategy: multi-hop forwarding enabled for better coverage
+        let forward_requests = matches!(self.config.routing_strategy, RoutingStrategy::Flooding);
+
         let store_config = FloodingConfig {
             max_peers: self.config.max_peers,
             connect_timeout_ms: 5000,
             network_latency_ms: self.config.network_latency_ms,
             routing_strategy: self.config.routing_strategy,
+            forward_requests,
+            // Sequential: short per-peer timeout (500ms) since no forwarding
+            // Flooding: longer timeout (1s) for multi-hop forwarding
+            request_timeout: if forward_requests {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(500)
+            },
             ..FloodingConfig::default()
         };
 

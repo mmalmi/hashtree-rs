@@ -275,3 +275,27 @@ impl std::fmt::Display for PeerDirection {
         }
     }
 }
+
+/// Hashtree data channel protocol messages
+/// Shared between WebRTC data channels and WebSocket transport
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum DataMessage {
+    #[serde(rename = "req")]
+    Request { id: u32, hash: String },
+
+    #[serde(rename = "res")]
+    Response { id: u32, hash: String, found: bool },
+
+    #[serde(rename = "push")]
+    Push { hash: String },
+
+    #[serde(rename = "have")]
+    Have { hashes: Vec<String> },
+
+    #[serde(rename = "want")]
+    Want { hashes: Vec<String> },
+
+    #[serde(rename = "root")]
+    Root { hash: String },
+}

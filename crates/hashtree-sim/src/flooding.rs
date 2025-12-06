@@ -73,7 +73,7 @@ impl Default for RoutingStrategy {
 /// Configuration for FloodingStore
 #[derive(Clone)]
 pub struct FloodingConfig {
-    /// Request timeout
+    /// Per-peer timeout for sequential strategy (try next peer if no response)
     pub request_timeout: Duration,
     /// Enable multi-hop forwarding
     pub forward_requests: bool,
@@ -91,7 +91,10 @@ pub struct FloodingConfig {
 impl Default for FloodingConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(2),
+            // Per-peer timeout: 1s allows multi-hop forwarding with 50ms latency
+            // Sequential tries each peer for 1s before moving to next
+            // Flooding uses this as overall timeout (parallel requests)
+            request_timeout: Duration::from_secs(1),
             forward_requests: true,
             max_peers: 5,
             connect_timeout_ms: 5000,
@@ -549,9 +552,9 @@ impl FloodingStore {
                 .await
                 .insert(request_id, OurRequest { response_tx: tx });
 
-            // Wait for response with per-peer timeout
-            let per_peer_timeout = self.config.request_timeout / 2; // Shorter timeout per peer
-            match tokio::time::timeout(per_peer_timeout, rx).await {
+            // Wait for response - use full timeout since peer may be forwarding sequentially
+            // Sequential forwarding: peer tries its peers one at a time, responds when found
+            match tokio::time::timeout(self.config.request_timeout, rx).await {
                 Ok(Ok(Some(data))) => {
                     // Found it! Cache locally and return
                     self.local.put_local(*hash, data.clone());
@@ -631,9 +634,10 @@ impl FloodingStore {
         }
 
         // Not found locally - try forwarding to other peers
-        // Note: Sequential strategy doesn't forward because timeout-based failure
-        // detection causes cascading delays (each hop waits for timeout before trying next)
-        if self.config.forward_requests && self.config.routing_strategy == RoutingStrategy::Flooding {
+        // Both flooding and sequential forward, but with different strategies:
+        // - Flooding: send to all peers at once, first response wins
+        // - Sequential: try one peer at a time until found
+        if self.config.forward_requests {
             // Check if we're already looking for this hash (prevents cycles)
             {
                 let their_requests = self.their_requests.read().await;

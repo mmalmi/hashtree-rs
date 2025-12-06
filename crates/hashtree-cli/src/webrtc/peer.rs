@@ -21,23 +21,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use super::types::{PeerDirection, PeerId, SignalingMessage};
-
-/// Hashtree data channel protocol messages
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum DataMessage {
-    #[serde(rename = "req")]
-    Request { id: u32, hash: String },
-    #[serde(rename = "res")]
-    Response { id: u32, hash: String, found: bool },
-    #[serde(rename = "have")]
-    Have { hashes: Vec<String> },
-    #[serde(rename = "want")]
-    Want { hashes: Vec<String> },
-    #[serde(rename = "root")]
-    Root { hash: String },
-}
+use super::types::{DataMessage, PeerDirection, PeerId, SignalingMessage};
 
 /// Trait for content storage that can be used by WebRTC peers
 pub trait ContentStore: Send + Sync + 'static {

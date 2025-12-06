@@ -7,11 +7,11 @@
 
 mod peer;
 mod signaling;
-mod types;
+pub mod types;
 
 #[cfg(test)]
 mod tests;
 
-pub use peer::{ContentStore, DataMessage, Peer};
+pub use peer::{ContentStore, Peer};
 pub use signaling::{ConnectionState, PeerEntry, WebRTCManager, WebRTCState};
-pub use types::{PeerDirection, PeerId, SignalingMessage, WebRTCConfig};
+pub use types::{DataMessage, PeerDirection, PeerId, SignalingMessage, WebRTCConfig};

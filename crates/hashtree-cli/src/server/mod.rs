@@ -1,5 +1,6 @@
 mod auth;
 pub mod blossom;
+pub mod data_ws;
 mod git;
 mod handlers;
 mod mime;
@@ -27,6 +28,7 @@ pub struct HashtreeServer {
     git_storage: Option<Arc<GitStorage>>,
     local_pubkey: Option<String>,
     addr: String,
+    enable_data_ws: bool,
 }
 
 impl HashtreeServer {
@@ -41,7 +43,14 @@ impl HashtreeServer {
             git_storage: None,
             local_pubkey: None,
             addr,
+            enable_data_ws: true, // Enabled by default
         }
+    }
+
+    /// Enable or disable the /ws/data WebSocket endpoint for P2P data exchange
+    pub fn with_data_ws(mut self, enabled: bool) -> Self {
+        self.enable_data_ws = enabled;
+        self
     }
 
     /// Enable git smart HTTP protocol
@@ -127,6 +136,15 @@ impl HashtreeServer {
                 .route("/api/git/repos", get(git::list_repos))
                 .with_state(git_state);
             public_routes = public_routes.merge(git_routes);
+        }
+
+        // Add data WebSocket endpoint for P2P file sharing (same protocol as WebRTC)
+        if self.enable_data_ws {
+            let data_ws_state = data_ws::DataWsState::new(self.state.store.clone());
+            let data_ws_routes = Router::new()
+                .route("/ws/data", get(data_ws::data_ws_handler))
+                .with_state(data_ws_state);
+            public_routes = public_routes.merge(data_ws_routes);
         }
 
         // Protected endpoints (require auth if enabled)
