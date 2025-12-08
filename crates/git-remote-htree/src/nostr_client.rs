@@ -90,7 +90,7 @@ impl NostrClient {
         let paths = [
             home.join(".config/nostr/secret"),
             home.join(".nostr/secret"),
-            home.join(".config/git-remote-nostr/secret"),
+            home.join(".config/git-remote-htree/secret"),
         ];
 
         for path in paths {

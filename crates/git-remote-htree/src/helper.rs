@@ -379,19 +379,276 @@ impl RemoteHelper {
 mod tests {
     use super::*;
 
+    const TEST_PUBKEY: &str = "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0";
+
+    fn create_test_helper() -> Option<RemoteHelper> {
+        RemoteHelper::new(TEST_PUBKEY, "test-repo").ok()
+    }
+
     #[test]
     fn test_capabilities() {
-        // Skip test if we can't create storage (no ~/.hashtree/data)
-        let helper = match RemoteHelper::new(
-            "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0",
-            "test",
-        ) {
-            Ok(h) => h,
-            Err(_) => return, // Skip if storage can't be created
+        let Some(helper) = create_test_helper() else {
+            return; // Skip if storage can't be created
         };
 
         let caps = helper.capabilities();
         assert!(caps.contains(&"fetch".to_string()));
         assert!(caps.contains(&"push".to_string()));
+        assert!(caps.contains(&"option".to_string()));
+        // Should end with empty line
+        assert_eq!(caps.last(), Some(&String::new()));
+    }
+
+    #[test]
+    fn test_handle_capabilities_command() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        let result = helper.handle_command("capabilities").unwrap();
+        assert!(result.is_some());
+        let caps = result.unwrap();
+        assert!(caps.contains(&"fetch".to_string()));
+        assert!(caps.contains(&"push".to_string()));
+    }
+
+    #[test]
+    fn test_handle_list_command() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // list should return refs (empty for new repo)
+        let result = helper.handle_command("list").unwrap();
+        assert!(result.is_some());
+        let lines = result.unwrap();
+        // Should end with empty line
+        assert_eq!(lines.last(), Some(&String::new()));
+    }
+
+    #[test]
+    fn test_handle_list_for_push_command() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        let result = helper.handle_command("list for-push").unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_handle_option_command() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        let result = helper.handle_command("option verbosity 1").unwrap();
+        assert!(result.is_some());
+        let lines = result.unwrap();
+        assert!(lines.contains(&"unsupported".to_string()));
+    }
+
+    #[test]
+    fn test_handle_unknown_command() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        let result = helper.handle_command("unknown-command").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_handle_empty_line_exits() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        assert!(!helper.should_exit());
+        let _ = helper.handle_command("").unwrap();
+        assert!(helper.should_exit());
+    }
+
+    #[test]
+    fn test_queue_fetch() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // Queue a fetch
+        let result = helper.handle_command("fetch abc123def456 refs/heads/main").unwrap();
+        assert!(result.is_none()); // fetch queues, doesn't respond immediately
+
+        assert_eq!(helper.fetch_specs.len(), 1);
+        assert_eq!(helper.fetch_specs[0].sha, "abc123def456");
+        assert_eq!(helper.fetch_specs[0].name, "refs/heads/main");
+    }
+
+    #[test]
+    fn test_queue_multiple_fetches() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        helper.handle_command("fetch abc123 refs/heads/main").unwrap();
+        helper.handle_command("fetch def456 refs/heads/feature").unwrap();
+
+        assert_eq!(helper.fetch_specs.len(), 2);
+    }
+
+    #[test]
+    fn test_queue_fetch_invalid() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // Missing name
+        let result = helper.handle_command("fetch abc123");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_queue_push() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        let result = helper.handle_command("push refs/heads/main:refs/heads/main").unwrap();
+        assert!(result.is_none()); // push queues, doesn't respond immediately
+
+        assert_eq!(helper.push_specs.len(), 1);
+        assert_eq!(helper.push_specs[0].src, "refs/heads/main");
+        assert_eq!(helper.push_specs[0].dst, "refs/heads/main");
+        assert!(!helper.push_specs[0].force);
+    }
+
+    #[test]
+    fn test_queue_force_push() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        helper.handle_command("push +refs/heads/main:refs/heads/main").unwrap();
+
+        assert_eq!(helper.push_specs.len(), 1);
+        assert!(helper.push_specs[0].force);
+    }
+
+    #[test]
+    fn test_queue_delete_push() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // Empty src means delete
+        helper.handle_command("push :refs/heads/old-branch").unwrap();
+
+        assert_eq!(helper.push_specs.len(), 1);
+        assert_eq!(helper.push_specs[0].src, "");
+        assert_eq!(helper.push_specs[0].dst, "refs/heads/old-branch");
+    }
+
+    #[test]
+    fn test_queue_push_invalid() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // Missing colon separator
+        let result = helper.handle_command("push refs/heads/main");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_push_spec_parsing() {
+        // Test internal PushSpec parsing via queue_push
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // Normal push
+        helper.queue_push("src:dst").unwrap();
+        assert_eq!(helper.push_specs[0].src, "src");
+        assert_eq!(helper.push_specs[0].dst, "dst");
+        assert!(!helper.push_specs[0].force);
+
+        helper.push_specs.clear();
+
+        // Force push
+        helper.queue_push("+src:dst").unwrap();
+        assert!(helper.push_specs[0].force);
+        assert_eq!(helper.push_specs[0].src, "src");
+
+        helper.push_specs.clear();
+
+        // Delete (empty src)
+        helper.queue_push(":dst").unwrap();
+        assert_eq!(helper.push_specs[0].src, "");
+        assert_eq!(helper.push_specs[0].dst, "dst");
+    }
+
+    #[test]
+    fn test_fetch_spec_parsing() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        helper.queue_fetch("abc123def456789 refs/heads/main").unwrap();
+
+        assert_eq!(helper.fetch_specs[0].sha, "abc123def456789");
+        assert_eq!(helper.fetch_specs[0].name, "refs/heads/main");
+    }
+
+    #[test]
+    fn test_fetch_spec_with_tag() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        helper.queue_fetch("abc123 refs/tags/v1.0.0").unwrap();
+        assert_eq!(helper.fetch_specs[0].name, "refs/tags/v1.0.0");
+    }
+
+    #[test]
+    fn test_should_exit_initially_false() {
+        let Some(helper) = create_test_helper() else {
+            return;
+        };
+
+        assert!(!helper.should_exit());
+    }
+
+    #[test]
+    fn test_get_hashtree_data_dir() {
+        let dir = get_hashtree_data_dir();
+        assert!(dir.ends_with("data"));
+        assert!(dir.to_string_lossy().contains(".hashtree"));
+    }
+
+    #[test]
+    fn test_command_parsing_with_spaces() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // Commands are split by first space only
+        let result = helper.handle_command("option verbosity 1").unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_list_clears_remote_refs() {
+        let Some(mut helper) = create_test_helper() else {
+            return;
+        };
+
+        // Add some dummy refs
+        helper.remote_refs.insert("refs/heads/old".to_string(), "abc".to_string());
+
+        // list should clear and repopulate
+        helper.handle_command("list").unwrap();
+
+        // For empty repo, refs should be empty
+        assert!(helper.remote_refs.is_empty());
     }
 }

@@ -86,7 +86,7 @@ let resolved = tree.resolve_path(&dir, "a.txt").await?;
 - `hashtree-git` - Git object compatibility layer
 - `hashtree-cli` - Command-line interface
 - `hashtree-relay` - Nostr relay for hashtree events
-- `git-remote-nostr` - Git remote helper for Nostr
+- `git-remote-htree` - Git remote helper (htree:// protocol)
 
 ## Development
 

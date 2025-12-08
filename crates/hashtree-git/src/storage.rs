@@ -1,14 +1,18 @@
 //! Hashtree-backed git object and ref storage using LMDB persistence
 //!
-//! Stores git objects and refs in a hashtree merkle tree:
+//! Stores git objects and refs in a hashtree merkle tree with working tree:
 //!   root/
-//!     refs/
-//!       heads/main -> <commit-sha1>
-//!       tags/v1.0 -> <tag-sha1>
-//!       HEAD -> "ref: refs/heads/main" or <sha1>
-//!     objects/
-//!       <sha1> -> zlib-compressed loose object
+//!     .git/
+//!       HEAD -> "ref: refs/heads/main"
+//!       refs/
+//!         heads/main -> <commit-sha1>
+//!         tags/v1.0 -> <tag-sha1>
+//!       objects/
+//!         <sha1> -> zlib-compressed loose object
+//!     README.md -> actual file content (from HEAD)
+//!     src/main.rs -> actual file content
 //!
+//! The working tree is extracted from HEAD commit for direct browsing.
 //! The root hash (SHA-256) is the content-addressed identifier for the entire repo state.
 //! All hashtree nodes are persisted to LMDB via LmdbBlobStore.
 
@@ -23,9 +27,17 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::runtime::Runtime;
 
-use crate::object::{GitObject, ObjectId, ObjectType};
+use crate::object::{GitObject, ObjectId, ObjectType, parse_tree};
 use crate::refs::{validate_ref_name, NamedRef, Ref};
 use crate::{Error, Result};
+
+/// Represents a file in the working tree
+#[derive(Debug, Clone)]
+pub struct WorkingTreeEntry {
+    pub path: String,
+    pub mode: u32,
+    pub content: Vec<u8>,
+}
 
 /// Interior mutable state for GitStorage
 struct GitStorageState {
@@ -299,6 +311,7 @@ impl GitStorage {
     // === Hashtree operations ===
 
     /// Build the merkle tree and return root hash (SHA-256)
+    /// Includes .git/ directory and working tree from HEAD
     /// Also persists all nodes to LMDB
     pub fn build_tree(&mut self) -> Result<[u8; 32]> {
         {
@@ -307,6 +320,18 @@ impl GitStorage {
                 return Ok(hash);
             }
         }
+
+        // Determine HEAD and extract working tree
+        let default_branch = self.determine_default_branch();
+        let working_tree = if let Some(ref branch) = default_branch {
+            if let Ok(commit_oid) = self.resolve_ref(branch) {
+                self.extract_working_tree(&commit_oid).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let (objects, refs) = {
             let state = self.state.read().map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
@@ -317,13 +342,19 @@ impl GitStorage {
         let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
 
         let root_hash = self.runtime.block_on(async {
-            let objects_hash = build_objects_dir(&tree, &store, &objects).await?;
-            let refs_hash = build_refs_dir(&tree, &store, &refs).await?;
+            // Build .git directory
+            let git_dir_hash = build_git_dir(&tree, &store, &objects, &refs, &default_branch).await?;
 
-            let root_entries = vec![
-                DirEntry::new("objects", objects_hash),
-                DirEntry::new("refs", refs_hash),
+            // Build working tree entries
+            let mut root_entries = vec![
+                DirEntry::new(".git", git_dir_hash),
             ];
+
+            // Add working tree files
+            if let Some(wt) = working_tree {
+                let wt_entries = build_working_tree(&tree, wt).await?;
+                root_entries.extend(wt_entries);
+            }
 
             let root_cid = tree
                 .put_directory(root_entries, None)
@@ -346,6 +377,97 @@ impl GitStorage {
     /// Get the underlying store
     pub fn store(&self) -> &Arc<LmdbBlobStore> {
         &self.store
+    }
+
+    /// Determine the default branch for HEAD
+    /// Priority: master > main > alphabetically first branch
+    pub fn determine_default_branch(&self) -> Option<String> {
+        let state = self.state.read().ok()?;
+
+        let branches: Vec<&String> = state.refs.keys()
+            .filter(|k| k.starts_with("refs/heads/"))
+            .collect();
+
+        if branches.is_empty() {
+            return None;
+        }
+
+        // Check for master first
+        if branches.iter().any(|b| *b == "refs/heads/master") {
+            return Some("refs/heads/master".to_string());
+        }
+
+        // Then main
+        if branches.iter().any(|b| *b == "refs/heads/main") {
+            return Some("refs/heads/main".to_string());
+        }
+
+        // Fall back to alphabetically first
+        let mut sorted: Vec<_> = branches.into_iter().collect();
+        sorted.sort();
+        sorted.first().map(|s| (*s).clone())
+    }
+
+    /// Extract the working tree from a commit
+    /// Returns a list of (path, mode, content) for all files
+    pub fn extract_working_tree(&self, commit_oid: &ObjectId) -> Result<Vec<WorkingTreeEntry>> {
+        let commit_obj = self.read_object(commit_oid)?;
+        if commit_obj.obj_type != ObjectType::Commit {
+            return Err(Error::InvalidObjectFormat("expected commit".into()));
+        }
+
+        // Parse commit to get tree OID
+        let commit_content = String::from_utf8_lossy(&commit_obj.content);
+        let tree_line = commit_content.lines()
+            .find(|l| l.starts_with("tree "))
+            .ok_or_else(|| Error::InvalidObjectFormat("commit missing tree".into()))?;
+
+        let tree_hex = tree_line.strip_prefix("tree ").unwrap().trim();
+        let tree_oid = ObjectId::from_hex(tree_hex)
+            .ok_or_else(|| Error::InvalidObjectFormat("invalid tree oid".into()))?;
+
+        // Recursively extract files from tree
+        let mut entries = Vec::new();
+        self.extract_tree_recursive(&tree_oid, "", &mut entries)?;
+        Ok(entries)
+    }
+
+    /// Recursively extract files from a git tree object
+    fn extract_tree_recursive(
+        &self,
+        tree_oid: &ObjectId,
+        prefix: &str,
+        entries: &mut Vec<WorkingTreeEntry>,
+    ) -> Result<()> {
+        let tree_obj = self.read_object(tree_oid)?;
+        if tree_obj.obj_type != ObjectType::Tree {
+            return Err(Error::InvalidObjectFormat("expected tree".into()));
+        }
+
+        let tree_entries = parse_tree(&tree_obj.content)?;
+
+        for entry in tree_entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", prefix, entry.name)
+            };
+
+            if entry.is_tree() {
+                // Recurse into subdirectory
+                self.extract_tree_recursive(&entry.oid, &path, entries)?;
+            } else {
+                // Read blob content
+                let blob_obj = self.read_object(&entry.oid)?;
+                entries.push(WorkingTreeEntry {
+                    path,
+                    mode: entry.mode,
+                    content: blob_obj.content,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Load from a root hash (fetches tree structure from LMDB store)
@@ -483,7 +605,135 @@ async fn build_refs_dir<S: Store>(
         .map_err(|e| Error::StorageError(format!("put refs dir: {}", e)))
 }
 
+/// Build .git/ directory in hashtree (objects, refs, HEAD)
+async fn build_git_dir<S: Store>(
+    tree: &HashTree<S>,
+    store: &Arc<S>,
+    objects: &HashMap<String, Vec<u8>>,
+    refs: &HashMap<String, String>,
+    default_branch: &Option<String>,
+) -> Result<[u8; 32]> {
+    let objects_hash = build_objects_dir(tree, store, objects).await?;
+    let refs_hash = build_refs_dir(tree, store, refs).await?;
+
+    let mut git_entries = vec![
+        DirEntry::new("objects", objects_hash),
+        DirEntry::new("refs", refs_hash),
+    ];
+
+    // Add HEAD pointing to default branch
+    if let Some(branch) = default_branch {
+        let head_content = format!("ref: {}", branch);
+        let head_hash = tree
+            .put_blob(head_content.as_bytes())
+            .await
+            .map_err(|e| Error::StorageError(format!("put HEAD: {}", e)))?;
+        git_entries.push(DirEntry::new("HEAD", head_hash).with_size(head_content.len() as u64));
+    }
+
+    tree
+        .put_directory(git_entries, None)
+        .await
+        .map(|cid| cid.hash)
+        .map_err(|e| Error::StorageError(format!("put .git dir: {}", e)))
+}
+
+/// Build working tree entries from extracted files
+/// Returns DirEntry items for the root directory
+async fn build_working_tree<S: Store>(
+    tree: &HashTree<S>,
+    entries: Vec<WorkingTreeEntry>,
+) -> Result<Vec<DirEntry>> {
+    // Group entries by top-level directory
+    let mut dirs: HashMap<String, Vec<WorkingTreeEntry>> = HashMap::new();
+    let mut root_files: Vec<WorkingTreeEntry> = Vec::new();
+
+    for entry in entries {
+        if let Some(slash_pos) = entry.path.find('/') {
+            let top_dir = entry.path[..slash_pos].to_string();
+            let rest = entry.path[slash_pos + 1..].to_string();
+            dirs.entry(top_dir).or_default().push(WorkingTreeEntry {
+                path: rest,
+                mode: entry.mode,
+                content: entry.content,
+            });
+        } else {
+            root_files.push(entry);
+        }
+    }
+
+    let mut result = Vec::new();
+
+    // Add root-level files
+    for file in root_files {
+        let hash = tree
+            .put_blob(&file.content)
+            .await
+            .map_err(|e| Error::StorageError(format!("put file {}: {}", file.path, e)))?;
+        result.push(DirEntry::new(file.path, hash).with_size(file.content.len() as u64));
+    }
+
+    // Recursively build subdirectories
+    for (dir_name, sub_entries) in dirs {
+        let sub_dir_entries = build_working_tree_recursive(tree, sub_entries).await?;
+        let dir_cid = tree
+            .put_directory(sub_dir_entries, None)
+            .await
+            .map_err(|e| Error::StorageError(format!("put dir {}: {}", dir_name, e)))?;
+        result.push(DirEntry::new(dir_name, dir_cid.hash));
+    }
+
+    Ok(result)
+}
+
+/// Recursively build a subdirectory's entries
+async fn build_working_tree_recursive<S: Store>(
+    tree: &HashTree<S>,
+    entries: Vec<WorkingTreeEntry>,
+) -> Result<Vec<DirEntry>> {
+    let mut dirs: HashMap<String, Vec<WorkingTreeEntry>> = HashMap::new();
+    let mut files: Vec<WorkingTreeEntry> = Vec::new();
+
+    for entry in entries {
+        if let Some(slash_pos) = entry.path.find('/') {
+            let top_dir = entry.path[..slash_pos].to_string();
+            let rest = entry.path[slash_pos + 1..].to_string();
+            dirs.entry(top_dir).or_default().push(WorkingTreeEntry {
+                path: rest,
+                mode: entry.mode,
+                content: entry.content,
+            });
+        } else {
+            files.push(entry);
+        }
+    }
+
+    let mut result = Vec::new();
+
+    // Add files
+    for file in files {
+        let hash = tree
+            .put_blob(&file.content)
+            .await
+            .map_err(|e| Error::StorageError(format!("put file {}: {}", file.path, e)))?;
+        result.push(DirEntry::new(file.path, hash).with_size(file.content.len() as u64));
+    }
+
+    // Recurse into subdirectories
+    for (dir_name, sub_entries) in dirs {
+        let sub_dir_entries = Box::pin(build_working_tree_recursive(tree, sub_entries)).await?;
+        let dir_cid = tree
+            .put_directory(sub_dir_entries, None)
+            .await
+            .map_err(|e| Error::StorageError(format!("put dir {}: {}", dir_name, e)))?;
+        result.push(DirEntry::new(dir_name, dir_cid.hash));
+    }
+
+    Ok(result)
+}
+
 /// Recursively load tree from hashtree using HashTree walk
+/// Supports both old format (objects/, refs/) and new format (.git/objects/, .git/refs/)
 async fn load_tree_recursive<S: Store>(
     tree: &HashTree<S>,
     root: [u8; 32],
@@ -511,14 +761,26 @@ async fn load_tree_recursive<S: Store>(
             .ok_or_else(|| Error::StorageError("file not found".into()))?;
 
         // Determine if this is an object or ref based on path
-        if entry.path.starts_with("objects/") {
-            let sha1 = entry.path.strip_prefix("objects/").unwrap();
-            objects.insert(sha1.to_string(), data);
-        } else if entry.path.starts_with("refs/") {
-            refs.insert(entry.path.clone(), String::from_utf8_lossy(&data).to_string());
-        } else if entry.path == "HEAD" {
+        // Support both .git/ prefix (new) and no prefix (old format)
+        let path = &entry.path;
+
+        if let Some(rest) = path.strip_prefix(".git/objects/") {
+            objects.insert(rest.to_string(), data);
+        } else if let Some(rest) = path.strip_prefix(".git/refs/") {
+            refs.insert(format!("refs/{}", rest), String::from_utf8_lossy(&data).to_string());
+        } else if path == ".git/HEAD" {
+            refs.insert("HEAD".to_string(), String::from_utf8_lossy(&data).to_string());
+        } else if let Some(rest) = path.strip_prefix("objects/") {
+            // Old format compatibility
+            objects.insert(rest.to_string(), data);
+        } else if let Some(rest) = path.strip_prefix("refs/") {
+            // Old format compatibility
+            refs.insert(format!("refs/{}", rest), String::from_utf8_lossy(&data).to_string());
+        } else if path == "HEAD" {
+            // Old format compatibility
             refs.insert("HEAD".to_string(), String::from_utf8_lossy(&data).to_string());
         }
+        // Skip working tree files (not in .git/)
     }
 
     Ok(())
@@ -638,8 +900,264 @@ mod tests {
         let mut storage2 = GitStorage::open(dir.path().join("git")).unwrap();
         storage2.load_from_root(&root_hex).unwrap();
 
-        // Verify refs loaded
+        // Verify refs loaded (now includes HEAD pointing to default branch)
         let refs = storage2.list_refs().unwrap();
-        assert_eq!(refs.len(), 1);
+        // Should have refs/heads/main and HEAD
+        assert!(refs.iter().any(|r| r.name == "refs/heads/main"));
+    }
+
+    #[test]
+    fn test_determine_default_branch_master_first() {
+        let dir = tempdir().unwrap();
+        let storage = GitStorage::open(dir.path().join("git")).unwrap();
+
+        let oid = ObjectId::from_hex("abc123def456abc123def456abc123def456abc1").unwrap();
+
+        // Add both main and master
+        storage.write_ref("refs/heads/main", &Ref::Direct(oid)).unwrap();
+        storage.write_ref("refs/heads/master", &Ref::Direct(oid)).unwrap();
+        storage.write_ref("refs/heads/develop", &Ref::Direct(oid)).unwrap();
+
+        // master should win
+        assert_eq!(
+            storage.determine_default_branch(),
+            Some("refs/heads/master".to_string())
+        );
+    }
+
+    #[test]
+    fn test_determine_default_branch_main_second() {
+        let dir = tempdir().unwrap();
+        let storage = GitStorage::open(dir.path().join("git")).unwrap();
+
+        let oid = ObjectId::from_hex("abc123def456abc123def456abc123def456abc1").unwrap();
+
+        // Add main and others, but not master
+        storage.write_ref("refs/heads/main", &Ref::Direct(oid)).unwrap();
+        storage.write_ref("refs/heads/develop", &Ref::Direct(oid)).unwrap();
+
+        // main should win
+        assert_eq!(
+            storage.determine_default_branch(),
+            Some("refs/heads/main".to_string())
+        );
+    }
+
+    #[test]
+    fn test_determine_default_branch_alphabetical() {
+        let dir = tempdir().unwrap();
+        let storage = GitStorage::open(dir.path().join("git")).unwrap();
+
+        let oid = ObjectId::from_hex("abc123def456abc123def456abc123def456abc1").unwrap();
+
+        // No main or master
+        storage.write_ref("refs/heads/develop", &Ref::Direct(oid)).unwrap();
+        storage.write_ref("refs/heads/feature", &Ref::Direct(oid)).unwrap();
+
+        // Alphabetically first should win
+        assert_eq!(
+            storage.determine_default_branch(),
+            Some("refs/heads/develop".to_string())
+        );
+    }
+
+    #[test]
+    fn test_determine_default_branch_empty() {
+        let dir = tempdir().unwrap();
+        let storage = GitStorage::open(dir.path().join("git")).unwrap();
+
+        // No branches
+        assert_eq!(storage.determine_default_branch(), None);
+    }
+
+    #[test]
+    fn test_working_tree_extraction() {
+        use crate::object::serialize_tree;
+
+        let dir = tempdir().unwrap();
+        let mut storage = GitStorage::open(dir.path().join("git")).unwrap();
+
+        // Create a simple repo structure:
+        // README.md
+        // src/main.rs
+
+        // 1. Create blobs
+        let readme_content = b"# Test Repo\n\nThis is a test.";
+        let main_rs_content = b"fn main() {\n    println!(\"Hello\");\n}";
+
+        let readme_oid = storage.write_blob(readme_content).unwrap();
+        let main_rs_oid = storage.write_blob(main_rs_content).unwrap();
+
+        // 2. Create src/ tree
+        let src_tree_content = serialize_tree(&[
+            crate::object::TreeEntry::new(0o100644, "main.rs".to_string(), main_rs_oid),
+        ]);
+        let src_tree_oid = storage.write_tree(&src_tree_content).unwrap();
+
+        // 3. Create root tree
+        let root_tree_content = serialize_tree(&[
+            crate::object::TreeEntry::new(0o100644, "README.md".to_string(), readme_oid),
+            crate::object::TreeEntry::new(0o40000, "src".to_string(), src_tree_oid),
+        ]);
+        let root_tree_oid = storage.write_tree(&root_tree_content).unwrap();
+
+        // 4. Create commit
+        let commit_content = format!(
+            "tree {}\nauthor Test <test@test.com> 1234567890 +0000\ncommitter Test <test@test.com> 1234567890 +0000\n\nInitial commit\n",
+            root_tree_oid.to_hex()
+        );
+        let commit_oid = storage.write_commit(commit_content.as_bytes()).unwrap();
+
+        // 5. Create ref
+        storage.write_ref("refs/heads/main", &Ref::Direct(commit_oid)).unwrap();
+
+        // 6. Extract working tree
+        let working_tree = storage.extract_working_tree(&commit_oid).unwrap();
+
+        // Verify we got both files
+        assert_eq!(working_tree.len(), 2);
+
+        let readme = working_tree.iter().find(|e| e.path == "README.md").unwrap();
+        assert_eq!(readme.content, readme_content);
+        assert_eq!(readme.mode, 0o100644);
+
+        let main_rs = working_tree.iter().find(|e| e.path == "src/main.rs").unwrap();
+        assert_eq!(main_rs.content, main_rs_content);
+    }
+
+    #[test]
+    fn test_build_tree_with_working_tree() {
+        use crate::object::serialize_tree;
+
+        let dir = tempdir().unwrap();
+        let mut storage = GitStorage::open(dir.path().join("git")).unwrap();
+
+        // Create a repo with files
+        let readme_content = b"# Hello World";
+        let readme_oid = storage.write_blob(readme_content).unwrap();
+
+        let root_tree_content = serialize_tree(&[
+            crate::object::TreeEntry::new(0o100644, "README.md".to_string(), readme_oid),
+        ]);
+        let root_tree_oid = storage.write_tree(&root_tree_content).unwrap();
+
+        let commit_content = format!(
+            "tree {}\nauthor Test <test@test.com> 1234567890 +0000\ncommitter Test <test@test.com> 1234567890 +0000\n\nTest\n",
+            root_tree_oid.to_hex()
+        );
+        let commit_oid = storage.write_commit(commit_content.as_bytes()).unwrap();
+
+        storage.write_ref("refs/heads/main", &Ref::Direct(commit_oid)).unwrap();
+
+        // Build the tree
+        let root_hash = storage.build_tree().unwrap();
+        assert_eq!(root_hash.len(), 32);
+
+        // Verify we can load it back
+        let root_hex = hex::encode(root_hash);
+
+        // Create new storage and load
+        let mut storage2 = GitStorage::open(dir.path().join("git")).unwrap();
+        storage2.load_from_root(&root_hex).unwrap();
+
+        // Should have the ref
+        let refs = storage2.list_refs().unwrap();
+        assert!(refs.iter().any(|r| r.name == "refs/heads/main"));
+
+        // Should be able to read the blob
+        assert!(storage2.has_object(&readme_oid).unwrap());
+    }
+
+    #[test]
+    fn test_full_push_simulation() {
+        use crate::object::serialize_tree;
+
+        let dir = tempdir().unwrap();
+        let mut storage = GitStorage::open(dir.path().join("git")).unwrap();
+
+        // Simulate what git-remote-htree does on push:
+        // 1. Receive objects from git
+        // 2. Store them
+        // 3. Update refs
+        // 4. Build tree (which now includes working tree)
+
+        // Create files
+        let files = vec![
+            ("README.md", b"# My Project\n".as_slice()),
+            ("Cargo.toml", b"[package]\nname = \"test\"\n".as_slice()),
+            ("src/lib.rs", b"pub fn hello() {}\n".as_slice()),
+            ("src/main.rs", b"fn main() { hello(); }\n".as_slice()),
+        ];
+
+        // Store blobs
+        let mut blob_oids = Vec::new();
+        for (_, content) in &files {
+            blob_oids.push(storage.write_blob(content).unwrap());
+        }
+
+        // Create src/ tree
+        let src_tree = serialize_tree(&[
+            crate::object::TreeEntry::new(0o100644, "lib.rs".to_string(), blob_oids[2]),
+            crate::object::TreeEntry::new(0o100644, "main.rs".to_string(), blob_oids[3]),
+        ]);
+        let src_tree_oid = storage.write_tree(&src_tree).unwrap();
+
+        // Create root tree
+        let root_tree = serialize_tree(&[
+            crate::object::TreeEntry::new(0o100644, "Cargo.toml".to_string(), blob_oids[1]),
+            crate::object::TreeEntry::new(0o100644, "README.md".to_string(), blob_oids[0]),
+            crate::object::TreeEntry::new(0o40000, "src".to_string(), src_tree_oid),
+        ]);
+        let root_tree_oid = storage.write_tree(&root_tree).unwrap();
+
+        // Create commit
+        let commit = format!(
+            "tree {}\nauthor Dev <dev@example.com> 1700000000 +0000\ncommitter Dev <dev@example.com> 1700000000 +0000\n\nAdd project files\n",
+            root_tree_oid.to_hex()
+        );
+        let commit_oid = storage.write_commit(commit.as_bytes()).unwrap();
+
+        // Update ref (this is what push does)
+        storage.write_ref("refs/heads/main", &Ref::Direct(commit_oid)).unwrap();
+
+        // Build the hashtree (this should now include working tree)
+        let root_hash = storage.get_root_hash().unwrap();
+        println!("Root hash: {}", root_hash);
+
+        // Verify: load and check structure
+        let store = storage.store().clone();
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
+
+        let root_bytes: [u8; 32] = hex::decode(&root_hash).unwrap().try_into().unwrap();
+        let root_cid = Cid::public(root_bytes, 0);
+
+        // Walk the tree and collect paths
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let entries = rt.block_on(async {
+            tree.walk(&root_cid, "").await.unwrap()
+        });
+
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        println!("Paths in tree: {:?}", paths);
+
+        // Should have .git directory
+        assert!(paths.iter().any(|p| p.starts_with(".git/")), "Missing .git/ directory");
+
+        // Should have .git/objects
+        assert!(paths.iter().any(|p| p.starts_with(".git/objects/")), "Missing .git/objects/");
+
+        // Should have .git/refs
+        assert!(paths.iter().any(|p| p.starts_with(".git/refs/")), "Missing .git/refs/");
+
+        // Should have .git/HEAD
+        assert!(paths.iter().any(|p| p == ".git/HEAD"), "Missing .git/HEAD");
+
+        // Should have working tree files at root
+        assert!(paths.iter().any(|p| p == "README.md"), "Missing README.md in working tree");
+        assert!(paths.iter().any(|p| p == "Cargo.toml"), "Missing Cargo.toml in working tree");
+        assert!(paths.iter().any(|p| p == "src/lib.rs"), "Missing src/lib.rs in working tree");
+        assert!(paths.iter().any(|p| p == "src/main.rs"), "Missing src/main.rs in working tree");
+
+        println!("All checks passed!");
     }
 }
