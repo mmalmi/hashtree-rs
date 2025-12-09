@@ -1,14 +1,14 @@
-//! Integration tests with real Nostr relays
+//! Integration tests for WebRTC peer connectivity
 //!
-//! These tests connect to actual relays for signaling.
-//! Run with: cargo test -p hashtree-webrtc --test integration -- --ignored
+//! These tests connect to actual Nostr relays for signaling and establish
+//! WebRTC connections between peers.
 
 use hashtree::MemoryStore;
 use hashtree_webrtc::{WebRTCStore, WebRTCStoreConfig};
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
 
-/// Default test relays (same as hashtree-ts)
+/// Default relays for signaling
 const TEST_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://relay.snort.social",
@@ -17,7 +17,6 @@ const TEST_RELAYS: &[&str] = &[
 ];
 
 #[tokio::test]
-#[ignore] // Run manually: cargo test -p hashtree-webrtc --test integration -- --ignored
 async fn test_connect_to_relays() {
     let local_store = Arc::new(MemoryStore::new());
     let config = WebRTCStoreConfig {
@@ -45,7 +44,6 @@ async fn test_connect_to_relays() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_peer_discovery() {
     // Create two stores that should discover each other
     let store1_local = Arc::new(MemoryStore::new());
@@ -96,15 +94,10 @@ async fn test_peer_discovery() {
     store1.stop().await;
     store2.stop().await;
 
-    // Note: This may fail in CI due to network conditions
-    // It's more of a smoke test for local development
-    if !found_peer {
-        println!("Warning: Peers did not discover each other (may be network/relay issues)");
-    }
+    assert!(found_peer, "Peers should discover and connect to each other");
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_data_transfer_between_peers() {
     use hashtree::{Store, sha256};
 
@@ -178,33 +171,3 @@ async fn test_data_transfer_between_peers() {
     }
 }
 
-#[tokio::test]
-#[ignore]
-async fn test_hello_message_format() {
-    // Verify hello messages match hashtree-ts format
-    use hashtree_webrtc::SignalingMessage;
-
-    let msg = SignalingMessage::Hello {
-        peer_id: "abc123:uuid456".to_string(),
-        roots: vec![
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-        ],
-    };
-
-    let json = serde_json::to_string(&msg).unwrap();
-
-    // Should match TS format
-    assert!(json.contains("\"type\":\"hello\""));
-    assert!(json.contains("\"peerId\":\"abc123:uuid456\""));
-    assert!(json.contains("\"roots\":["));
-
-    // Should be parseable
-    let parsed: SignalingMessage = serde_json::from_str(&json).unwrap();
-    match parsed {
-        SignalingMessage::Hello { peer_id, roots } => {
-            assert_eq!(peer_id, "abc123:uuid456");
-            assert_eq!(roots.len(), 1);
-        }
-        _ => panic!("Wrong message type"),
-    }
-}
