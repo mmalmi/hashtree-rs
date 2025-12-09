@@ -16,6 +16,23 @@
 //!     refs/tags/v1.0 -> <sha>
 //!     objects/<sha1> -> data
 //!     objects/<sha2> -> data
+//!
+//! ## Secret file format
+//!
+//! The secrets file (~/.hashtree/keys) supports multiple keys with optional petnames:
+//! ```text
+//! nsec1... default
+//! nsec1... work
+//! nsec1... personal
+//! ```
+//!
+//! Or hex format:
+//! ```text
+//! <64-char-hex> default
+//! <64-char-hex> work
+//! ```
+//!
+//! Then use: `htree://work/myrepo` or `htree://npub1.../myrepo`
 
 use anyhow::{Context, Result};
 use nostr::nips::nip19::FromBech32;
@@ -28,6 +45,159 @@ pub const KIND_APP_DATA: u16 = 30078;
 
 /// Label for hashtree events
 pub const LABEL_HASHTREE: &str = "hashtree";
+
+/// A stored key with optional petname
+#[derive(Debug, Clone)]
+pub struct StoredKey {
+    /// Secret key in hex format
+    pub secret_hex: String,
+    /// Public key in hex format
+    pub pubkey_hex: String,
+    /// Optional petname (e.g., "default", "work")
+    pub petname: Option<String>,
+}
+
+impl StoredKey {
+    /// Create from secret key hex, deriving pubkey
+    pub fn from_secret_hex(secret_hex: &str, petname: Option<String>) -> Result<Self> {
+        use secp256k1::{Secp256k1, SecretKey};
+
+        let sk_bytes = hex::decode(secret_hex)
+            .context("Invalid hex in secret key")?;
+        let sk = SecretKey::from_slice(&sk_bytes)
+            .context("Invalid secret key")?;
+        let secp = Secp256k1::new();
+        let pk = sk.x_only_public_key(&secp).0;
+        let pubkey_hex = hex::encode(pk.serialize());
+
+        Ok(Self {
+            secret_hex: secret_hex.to_string(),
+            pubkey_hex,
+            petname,
+        })
+    }
+
+    /// Create from nsec bech32 format
+    pub fn from_nsec(nsec: &str, petname: Option<String>) -> Result<Self> {
+        let secret_key = nostr::SecretKey::from_bech32(nsec)
+            .context("Invalid nsec format")?;
+        let secret_hex = hex::encode(secret_key.to_secret_bytes());
+        Self::from_secret_hex(&secret_hex, petname)
+    }
+}
+
+/// Load all keys from config files
+pub fn load_keys() -> Vec<StoredKey> {
+    let mut keys = Vec::new();
+
+    let Some(home) = dirs::home_dir() else {
+        return keys;
+    };
+
+    // Primary: ~/.hashtree/keys (multi-key format)
+    let keys_path = home.join(".hashtree/keys");
+    if let Ok(content) = std::fs::read_to_string(&keys_path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            let key_str = parts[0];
+            let petname = parts.get(1).map(|s| s.trim().to_string());
+
+            let key = if key_str.starts_with("nsec1") {
+                StoredKey::from_nsec(key_str, petname)
+            } else if key_str.len() == 64 {
+                StoredKey::from_secret_hex(key_str, petname)
+            } else {
+                continue;
+            };
+
+            if let Ok(k) = key {
+                debug!("Loaded key: pubkey={}, petname={:?}", k.pubkey_hex, k.petname);
+                keys.push(k);
+            }
+        }
+    }
+
+    // Legacy: single-key files
+    if keys.is_empty() {
+        let legacy_paths = [
+            home.join(".hashtree/nsec"),
+            home.join(".config/nostr/secret"),
+            home.join(".nostr/secret"),
+            home.join(".config/git-remote-htree/secret"),
+        ];
+
+        for path in legacy_paths {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let key_str = content.trim();
+                let key = if key_str.starts_with("nsec1") {
+                    StoredKey::from_nsec(key_str, Some("default".to_string()))
+                } else if key_str.len() == 64 {
+                    StoredKey::from_secret_hex(key_str, Some("default".to_string()))
+                } else {
+                    continue;
+                };
+
+                if let Ok(k) = key {
+                    debug!("Loaded legacy key from {:?}: pubkey={}", path, k.pubkey_hex);
+                    keys.push(k);
+                    break;
+                }
+            }
+        }
+    }
+
+    keys
+}
+
+/// Resolve an identifier to (pubkey_hex, secret_hex)
+/// Identifier can be:
+/// - petname (e.g., "work", "default")
+/// - pubkey hex (64 chars)
+/// - npub bech32
+pub fn resolve_identity(identifier: &str) -> Result<(String, Option<String>)> {
+    let keys = load_keys();
+
+    // Check if it's a petname
+    for key in &keys {
+        if key.petname.as_deref() == Some(identifier) {
+            return Ok((key.pubkey_hex.clone(), Some(key.secret_hex.clone())));
+        }
+    }
+
+    // Check if it's an npub
+    if identifier.starts_with("npub1") {
+        let pk = nostr::PublicKey::from_bech32(identifier)
+            .context("Invalid npub format")?;
+        let pubkey_hex = hex::encode(pk.to_bytes());
+
+        // Check if we have the secret for this pubkey
+        let secret = keys.iter()
+            .find(|k| k.pubkey_hex == pubkey_hex)
+            .map(|k| k.secret_hex.clone());
+
+        return Ok((pubkey_hex, secret));
+    }
+
+    // Check if it's a hex pubkey
+    if identifier.len() == 64 && hex::decode(identifier).is_ok() {
+        let secret = keys.iter()
+            .find(|k| k.pubkey_hex == identifier)
+            .map(|k| k.secret_hex.clone());
+
+        return Ok((identifier.to_string(), secret));
+    }
+
+    // Unknown identifier - might be a petname we don't have
+    anyhow::bail!(
+        "Unknown identity '{}'. Add it to ~/.hashtree/keys or use a pubkey/npub.",
+        identifier
+    )
+}
 
 /// Default blossom servers for blob storage
 pub const DEFAULT_BLOSSOM_SERVERS: &[&str] =
@@ -55,10 +225,10 @@ pub struct NostrClient {
 }
 
 impl NostrClient {
-    pub fn new(pubkey: &str) -> Result<Self> {
-        // Try to load secret key from environment or config
-        let secret_key =
-            std::env::var("NOSTR_SECRET_KEY").ok().or_else(|| Self::load_secret_from_config());
+    /// Create a new client with pubkey and optional secret key
+    pub fn new(pubkey: &str, secret_key: Option<String>) -> Result<Self> {
+        // Use provided secret, or try environment variable
+        let secret_key = secret_key.or_else(|| std::env::var("NOSTR_SECRET_KEY").ok());
 
         Ok(Self {
             pubkey: pubkey.to_string(),
@@ -70,40 +240,9 @@ impl NostrClient {
         })
     }
 
-    fn load_secret_from_config() -> Option<String> {
-        let home = dirs::home_dir()?;
-
-        // Check paths in priority order - hashtree's nsec first (bech32), then hex formats
-        let nsec_path = home.join(".hashtree/nsec");
-        if let Ok(content) = std::fs::read_to_string(&nsec_path) {
-            let nsec = content.trim();
-            // Parse bech32 nsec format
-            if nsec.starts_with("nsec1") {
-                if let Ok(secret_key) = nostr::SecretKey::from_bech32(nsec) {
-                    debug!("Loaded secret key from {:?}", nsec_path);
-                    return Some(hex::encode(secret_key.to_secret_bytes()));
-                }
-            }
-        }
-
-        // Fallback to hex format paths
-        let paths = [
-            home.join(".config/nostr/secret"),
-            home.join(".nostr/secret"),
-            home.join(".config/git-remote-htree/secret"),
-        ];
-
-        for path in paths {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let key = content.trim().to_string();
-                if key.len() == 64 && hex::decode(&key).is_ok() {
-                    debug!("Loaded secret key from {:?}", path);
-                    return Some(key);
-                }
-            }
-        }
-
-        None
+    /// Check if we can sign (have secret key for this pubkey)
+    pub fn can_sign(&self) -> bool {
+        self.secret_key.is_some()
     }
 
     /// Fetch refs for a repository from nostr
@@ -311,29 +450,33 @@ mod dirs {
 mod tests {
     use super::*;
 
+    const TEST_PUBKEY: &str = "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0";
+
     #[test]
     fn test_new_client() {
-        let client =
-            NostrClient::new("4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0")
-                .unwrap();
+        let client = NostrClient::new(TEST_PUBKEY, None).unwrap();
         assert_eq!(client.relays.len(), 3);
         assert_eq!(client.blossom_servers.len(), 2);
+        assert!(!client.can_sign());
+    }
+
+    #[test]
+    fn test_new_client_with_secret() {
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let client = NostrClient::new(TEST_PUBKEY, Some(secret.to_string())).unwrap();
+        assert!(client.can_sign());
     }
 
     #[test]
     fn test_fetch_refs_empty() {
-        let mut client =
-            NostrClient::new("4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0")
-                .unwrap();
+        let mut client = NostrClient::new(TEST_PUBKEY, None).unwrap();
         let refs = client.fetch_refs("new-repo").unwrap();
         assert!(refs.is_empty());
     }
 
     #[test]
     fn test_update_ref() {
-        let mut client =
-            NostrClient::new("4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0")
-                .unwrap();
+        let mut client = NostrClient::new(TEST_PUBKEY, None).unwrap();
 
         client
             .update_ref("repo", "refs/heads/main", "abc123")
@@ -345,9 +488,7 @@ mod tests {
 
     #[test]
     fn test_event_format() {
-        let client =
-            NostrClient::new("4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0")
-                .unwrap();
+        let client = NostrClient::new(TEST_PUBKEY, None).unwrap();
 
         let tags = vec![
             vec!["d".to_string(), "myrepo".to_string()],
@@ -362,5 +503,58 @@ mod tests {
         assert_eq!(event.content, "abc123root");
         assert_eq!(event.tags[0], vec!["d", "myrepo"]);
         assert_eq!(event.tags[1], vec!["l", "hashtree"]);
+    }
+
+    #[test]
+    fn test_stored_key_from_hex() {
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let key = StoredKey::from_secret_hex(secret, Some("test".to_string())).unwrap();
+        assert_eq!(key.secret_hex, secret);
+        assert_eq!(key.petname, Some("test".to_string()));
+        assert_eq!(key.pubkey_hex.len(), 64);
+    }
+
+    #[test]
+    fn test_stored_key_from_nsec() {
+        // This is a test nsec (don't use in production!)
+        let nsec = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
+        let key = StoredKey::from_nsec(nsec, None).unwrap();
+        assert_eq!(key.secret_hex.len(), 64);
+        assert_eq!(key.pubkey_hex.len(), 64);
+    }
+
+    #[test]
+    fn test_resolve_identity_hex_pubkey() {
+        // Hex pubkey without matching secret returns (pubkey, None)
+        let result = resolve_identity(TEST_PUBKEY);
+        assert!(result.is_ok());
+        let (pubkey, secret) = result.unwrap();
+        assert_eq!(pubkey, TEST_PUBKEY);
+        // No secret unless we have it in config
+        assert!(secret.is_none());
+    }
+
+    #[test]
+    fn test_resolve_identity_npub() {
+        // Use a valid npub - generate one properly from the nostr crate
+        use nostr::nips::nip19::ToBech32;
+
+        // Create a pubkey from our test hex
+        let pk_bytes = hex::decode(TEST_PUBKEY).unwrap();
+        let pk = nostr::PublicKey::from_slice(&pk_bytes).unwrap();
+        let npub = pk.to_bech32().unwrap();
+
+        let result = resolve_identity(&npub);
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        let (pubkey, _) = result.unwrap();
+        // Should be valid hex pubkey
+        assert_eq!(pubkey.len(), 64);
+        assert_eq!(pubkey, TEST_PUBKEY);
+    }
+
+    #[test]
+    fn test_resolve_identity_unknown_petname() {
+        let result = resolve_identity("nonexistent_petname_xyz");
+        assert!(result.is_err());
     }
 }

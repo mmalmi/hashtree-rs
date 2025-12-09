@@ -1,20 +1,28 @@
 //! Git remote helper for hashtree
 //!
-//! Usage: git remote add origin htree://<pubkey>/<repo-name>
-//!        git push origin main
-//!        git pull origin main
+//! Usage:
+//!   git remote add origin htree://<pubkey>/<repo-name>
+//!   git remote add origin htree://<petname>/<repo-name>
+//!   git push origin main
+//!   git pull origin main
+//!
+//! The identifier can be:
+//! - A 64-character hex pubkey
+//! - An npub bech32 address
+//! - A petname defined in ~/.hashtree/keys
 //!
 //! The helper implements the git remote helper protocol:
 //! https://git-scm.com/docs/gitremote-helpers
 
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, Write};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 mod helper;
 mod nostr_client;
 
 use helper::RemoteHelper;
+use nostr_client::resolve_identity;
 
 fn main() -> Result<()> {
     // Initialize logging
@@ -39,12 +47,22 @@ fn main() -> Result<()> {
 
     info!("Remote: {}, URL: {}", remote_name, url);
 
-    // Parse URL: htree://<pubkey>/<repo-name> or htree:<pubkey>/<repo-name>
-    let (pubkey, repo_name) = parse_htree_url(url)?;
-    debug!("Parsed pubkey: {}, repo: {}", pubkey, repo_name);
+    // Parse URL: htree://<identifier>/<repo-name>
+    let (identifier, repo_name) = parse_htree_url(url)?;
+    debug!("Parsed identifier: {}, repo: {}", identifier, repo_name);
+
+    // Resolve identifier to pubkey (and optionally secret key)
+    let (pubkey, secret_key) = resolve_identity(&identifier)?;
+    debug!("Resolved to pubkey: {}", pubkey);
+
+    if secret_key.is_some() {
+        debug!("Have signing key for this identity");
+    } else {
+        warn!("No signing key for {} - push will fail", identifier);
+    }
 
     // Create helper and run protocol
-    let mut helper = RemoteHelper::new(&pubkey, &repo_name)?;
+    let mut helper = RemoteHelper::new(&pubkey, &repo_name, secret_key)?;
 
     // Read commands from stdin, write responses to stdout
     let stdin = std::io::stdin();
@@ -74,8 +92,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Parse htree URL into (pubkey, repo_name)
-/// Formats: htree://<pubkey>/<repo> or htree:<pubkey>/<repo>
+/// Parse htree URL into (identifier, repo_name)
+/// Formats: htree://<identifier>/<repo> or htree:<identifier>/<repo>
+/// Identifier can be: petname, npub, or hex pubkey
 fn parse_htree_url(url: &str) -> Result<(String, String)> {
     let path = url
         .strip_prefix("htree://")
@@ -84,18 +103,17 @@ fn parse_htree_url(url: &str) -> Result<(String, String)> {
 
     let parts: Vec<&str> = path.splitn(2, '/').collect();
     if parts.len() != 2 {
-        bail!("URL must be htree://<pubkey>/<repo-name>");
+        bail!("URL must be htree://<identifier>/<repo-name>");
     }
 
-    let pubkey = parts[0].to_string();
+    let identifier = parts[0].to_string();
     let repo_name = parts[1].to_string();
 
-    // Validate pubkey is hex
-    if pubkey.len() != 64 || hex::decode(&pubkey).is_err() {
-        bail!("Invalid pubkey: must be 64 hex characters");
+    if identifier.is_empty() {
+        bail!("Identifier cannot be empty");
     }
 
-    Ok((pubkey, repo_name))
+    Ok((identifier, repo_name))
 }
 
 #[cfg(test)]
@@ -103,68 +121,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_htree_url() {
-        let (pk, repo) = parse_htree_url(
+    fn test_parse_htree_url_pubkey() {
+        let (id, repo) = parse_htree_url(
             "htree://4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0/myrepo",
         )
         .unwrap();
         assert_eq!(
-            pk,
+            id,
             "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0"
         );
         assert_eq!(repo, "myrepo");
     }
 
     #[test]
-    fn test_parse_htree_url_colon() {
-        let (pk, repo) = parse_htree_url(
-            "htree:4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0/test-repo",
+    fn test_parse_htree_url_petname() {
+        let (id, repo) = parse_htree_url("htree://work/myproject").unwrap();
+        assert_eq!(id, "work");
+        assert_eq!(repo, "myproject");
+    }
+
+    #[test]
+    fn test_parse_htree_url_npub() {
+        let (id, repo) = parse_htree_url(
+            "htree://npub1g53znsnsmu4x0hfkx9e7cs4xtqxsazkyd5nd94u4qzr0gnfndj4q0gzn94/repo",
         )
         .unwrap();
-        assert_eq!(
-            pk,
-            "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0"
-        );
+        assert!(id.starts_with("npub1"));
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_htree_url_colon() {
+        let (id, repo) = parse_htree_url("htree:default/test-repo").unwrap();
+        assert_eq!(id, "default");
         assert_eq!(repo, "test-repo");
     }
 
     #[test]
-    fn test_parse_htree_url_invalid() {
+    fn test_parse_htree_url_invalid_scheme() {
         assert!(parse_htree_url("https://github.com/foo/bar").is_err());
-        assert!(parse_htree_url("htree://shortkey/repo").is_err());
     }
 
     #[test]
     fn test_parse_htree_url_no_repo() {
-        assert!(parse_htree_url(
-            "htree://4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0"
-        )
-        .is_err());
+        assert!(parse_htree_url("htree://work").is_err());
     }
 
     #[test]
-    fn test_parse_htree_url_empty_repo() {
-        // This should fail - empty repo name after slash
-        let result = parse_htree_url(
-            "htree://4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0/",
-        );
-        // Empty repo name is technically valid by current implementation
-        assert!(result.is_ok());
-        let (_, repo) = result.unwrap();
-        assert_eq!(repo, "");
+    fn test_parse_htree_url_empty_identifier() {
+        assert!(parse_htree_url("htree:///repo").is_err());
     }
 
     #[test]
     fn test_parse_htree_url_with_subpath() {
-        // Repo name can contain slashes
-        let (pk, repo) = parse_htree_url(
-            "htree://4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0/org/repo",
-        )
-        .unwrap();
-        assert_eq!(
-            pk,
-            "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0"
-        );
+        let (id, repo) = parse_htree_url("htree://personal/org/repo").unwrap();
+        assert_eq!(id, "personal");
         assert_eq!(repo, "org/repo");
     }
 }

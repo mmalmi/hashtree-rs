@@ -96,27 +96,40 @@ Git automatically finds remote helpers named `git-remote-<protocol>` in PATH.
 ### Usage
 
 ```bash
-# Add a remote (pubkey is 64 hex chars)
-git remote add origin htree://<pubkey>/<repo-name>
-
-# Push
+# Using a petname (defined in ~/.hashtree/keys)
+git remote add origin htree://work/myproject
 git push origin main
 
-# Clone (once repo exists)
-git clone htree://<pubkey>/<repo-name>
+# Using an npub
+git remote add origin htree://npub1.../repo-name
 
-# Pull
+# Using a hex pubkey
+git remote add origin htree://<64-char-hex>/repo-name
+
+# Clone, pull work the same way
+git clone htree://personal/dotfiles
 git pull origin main
 ```
 
 ### Configuration
 
-The helper looks for your nostr private key in these locations:
-- `~/.config/nostr/secret`
-- `~/.nostr/secret`
-- `~/.config/git-remote-htree/secret`
+Create `~/.hashtree/keys` with your nostr keys and optional petnames:
 
-The key should be a hex-encoded 32-byte secret key (64 characters).
+```
+# Format: <nsec or hex> [petname]
+nsec1abc123... default
+nsec1def456... work
+nsec1ghi789... personal
+```
+
+You can push to any repo whose key you have. The identifier in the URL can be:
+- A **petname** (e.g., `work`) - looks up the key in `~/.hashtree/keys`
+- An **npub** (e.g., `npub1...`) - uses that pubkey, signs if you have the nsec
+- A **hex pubkey** (64 chars) - same as npub
+
+Legacy single-key files are also supported:
+- `~/.hashtree/nsec`
+- `~/.config/nostr/secret`
 
 ## Crates
 

@@ -52,10 +52,10 @@ struct FetchSpec {
 }
 
 impl RemoteHelper {
-    pub fn new(pubkey: &str, repo_name: &str) -> Result<Self> {
+    pub fn new(pubkey: &str, repo_name: &str, secret_key: Option<String>) -> Result<Self> {
         // Use shared hashtree storage at ~/.hashtree/data
         let storage = GitStorage::open(get_hashtree_data_dir())?;
-        let nostr = NostrClient::new(pubkey)?;
+        let nostr = NostrClient::new(pubkey, secret_key)?;
 
         Ok(Self {
             pubkey: pubkey.to_string(),
@@ -382,7 +382,7 @@ mod tests {
     const TEST_PUBKEY: &str = "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0";
 
     fn create_test_helper() -> Option<RemoteHelper> {
-        RemoteHelper::new(TEST_PUBKEY, "test-repo").ok()
+        RemoteHelper::new(TEST_PUBKEY, "test-repo", None).ok()
     }
 
     #[test]
