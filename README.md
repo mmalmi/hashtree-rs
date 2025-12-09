@@ -76,6 +76,48 @@ let entries = tree.list_directory(&dir).await?;
 let resolved = tree.resolve_path(&dir, "a.txt").await?;
 ```
 
+## Git Remote Helper
+
+Push and pull git repos via hashtree using the `htree://` protocol.
+
+### Installation
+
+```bash
+# Build and install to ~/.cargo/bin (must be in PATH)
+cargo install --path crates/git-remote-htree
+
+# Or install system-wide
+cargo build --release -p git-remote-htree
+sudo cp target/release/git-remote-htree /usr/local/bin/
+```
+
+Git automatically finds remote helpers named `git-remote-<protocol>` in PATH.
+
+### Usage
+
+```bash
+# Add a remote (pubkey is 64 hex chars)
+git remote add origin htree://<pubkey>/<repo-name>
+
+# Push
+git push origin main
+
+# Clone (once repo exists)
+git clone htree://<pubkey>/<repo-name>
+
+# Pull
+git pull origin main
+```
+
+### Configuration
+
+The helper looks for your nostr private key in these locations:
+- `~/.config/nostr/secret`
+- `~/.nostr/secret`
+- `~/.config/git-remote-htree/secret`
+
+The key should be a hex-encoded 32-byte secret key (64 characters).
+
 ## Crates
 
 - `hashtree` - Core merkle tree library
