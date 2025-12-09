@@ -59,6 +59,7 @@ impl NdbQuerySender {
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://relay.snort.social",
+    "wss://nos.lol",
     "wss://temp.iris.to",
 ];
 

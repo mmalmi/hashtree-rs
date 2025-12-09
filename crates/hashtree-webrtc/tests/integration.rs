@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 /// Default test relays (same as hashtree-ts)
 const TEST_RELAYS: &[&str] = &[
-    "wss://temp.iris.to",
     "wss://relay.damus.io",
+    "wss://relay.snort.social",
+    "wss://nos.lol",
+    "wss://temp.iris.to",
 ];
 
 #[tokio::test]
