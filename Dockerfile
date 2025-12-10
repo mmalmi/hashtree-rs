@@ -1,0 +1,33 @@
+FROM rustlang/rust:nightly-bookworm AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libclang-dev \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build release binary
+RUN cargo build --release --package hashtree-cli
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/htree /usr/local/bin/htree
+
+WORKDIR /data
+
+EXPOSE 8080
+
+CMD ["htree", "start", "--addr", "0.0.0.0:8080", "--data-dir", "/data"]
