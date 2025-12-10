@@ -40,7 +40,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 
 # Nostr
-nostr = { version = "0.37", features = ["nip04"] }
+nostr = { version = "0.37", features = ["nip44"] }
 nostrdb = { git = "https://github.com/mmalmi/nostrdb-rs" }
 enostr = { git = "https://github.com/mmalmi/notedeck" }
 
@@ -48,7 +48,7 @@ enostr = { git = "https://github.com/mmalmi/notedeck" }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 bytes = "1.0"
 toml = "0.8"
 lru = "0.12"

@@ -62,7 +62,8 @@ impl GitStorage {
         let runtime =
             Runtime::new().map_err(|e| Error::StorageError(format!("tokio runtime: {}", e)))?;
 
-        let store_path = path.as_ref().join("hashtree");
+        // Use "blobs" subdirectory to match hashtree-cli's HashtreeStore
+        let store_path = path.as_ref().join("blobs");
         let store = Arc::new(
             LmdbBlobStore::new(&store_path)
                 .map_err(|e| Error::StorageError(format!("lmdb: {}", e)))?,

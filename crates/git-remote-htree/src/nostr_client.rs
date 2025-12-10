@@ -307,13 +307,18 @@ impl NostrClient {
         );
 
         // Build event tags
+        // The hash is in both content (legacy) and 'hash' tag (expected by browser NostrRefResolver)
         let tags = vec![
             vec!["d".to_string(), repo_name.to_string()],
             vec!["l".to_string(), LABEL_HASHTREE.to_string()],
+            vec!["hash".to_string(), root_hash.to_string()],
         ];
+
+        eprintln!("[git-remote-htree] Publishing event with tags: {:?}", tags);
 
         // Create and sign event
         let event = self.create_event(KIND_APP_DATA, &tags, root_hash)?;
+        eprintln!("[git-remote-htree] Created event id: {}", event.id);
 
         // Publish to relays
         self.publish_event(&event)?;
@@ -494,6 +499,7 @@ mod tests {
         let tags = vec![
             vec!["d".to_string(), "myrepo".to_string()],
             vec!["l".to_string(), "hashtree".to_string()],
+            vec!["hash".to_string(), "abc123root".to_string()],
         ];
 
         let event = client
@@ -504,6 +510,7 @@ mod tests {
         assert_eq!(event.content, "abc123root");
         assert_eq!(event.tags[0], vec!["d", "myrepo"]);
         assert_eq!(event.tags[1], vec!["l", "hashtree"]);
+        assert_eq!(event.tags[2], vec!["hash", "abc123root"]);
     }
 
     #[test]

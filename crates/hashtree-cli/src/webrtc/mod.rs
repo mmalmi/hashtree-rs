@@ -13,5 +13,5 @@ pub mod types;
 mod tests;
 
 pub use peer::{ContentStore, Peer};
-pub use signaling::{ConnectionState, PeerEntry, WebRTCManager, WebRTCState};
-pub use types::{DataMessage, PeerDirection, PeerId, SignalingMessage, WebRTCConfig};
+pub use signaling::{ConnectionState, PeerClassifier, PeerEntry, WebRTCManager, WebRTCState};
+pub use types::{DataMessage, PeerDirection, PeerId, PeerPool, PoolConfig, PoolSettings, SignalingMessage, WebRTCConfig};

@@ -13,4 +13,4 @@ pub use hashtree_resolver::nostr::{NostrRootResolver, NostrResolverConfig};
 pub use hashtree_resolver::{Keys as NostrKeys, ResolverEntry, ResolverError, RootResolver, ToBech32 as NostrToBech32};
 pub use server::HashtreeServer;
 pub use storage::HashtreeStore;
-pub use webrtc::{ContentStore, DataMessage, WebRTCConfig, WebRTCManager, PeerId};
+pub use webrtc::{ContentStore, DataMessage, PeerClassifier, PeerId, PeerPool, PoolConfig, PoolSettings, WebRTCConfig, WebRTCManager};

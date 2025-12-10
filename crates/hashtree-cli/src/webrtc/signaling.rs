@@ -5,12 +5,12 @@
 //! - Tag: ["l", "webrtc"]
 //!
 //! Security: Directed signaling messages (offer, answer, candidate, candidates)
-//! are encrypted with NIP-04 for privacy. Hello messages remain unencrypted
+//! are encrypted with NIP-44 for privacy. Hello messages remain unencrypted
 //! for peer discovery.
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use nostr::{nips::nip04, ClientMessage, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, RelayMessage, Tag};
+use nostr::{nips::nip44, ClientMessage, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, RelayMessage, Tag};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,8 +20,11 @@ use tracing::{debug, error, info, warn};
 
 use super::peer::{ContentStore, Peer};
 use super::types::{
-    generate_uuid, PeerDirection, PeerId, PeerStatus, SignalingMessage, WebRTCConfig, WEBRTC_TAG,
+    generate_uuid, PeerDirection, PeerId, PeerPool, PeerStatus, PoolConfig, SignalingMessage, WebRTCConfig, WEBRTC_TAG,
 };
+
+/// Callback type for classifying peers into pools
+pub type PeerClassifier = Arc<dyn Fn(&str) -> PeerPool + Send + Sync>;
 
 /// Connection state for a peer
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +53,7 @@ pub struct PeerEntry {
     pub state: ConnectionState,
     pub last_seen: Instant,
     pub peer: Option<Peer>,
+    pub pool: PeerPool,
 }
 
 /// Shared state for WebRTC manager
@@ -80,6 +84,8 @@ pub struct WebRTCManager {
     signaling_rx: Option<mpsc::Receiver<SignalingMessage>>,
     /// Optional content store for serving hash requests
     store: Option<Arc<dyn ContentStore>>,
+    /// Peer classifier for pool assignment
+    peer_classifier: PeerClassifier,
 }
 
 impl WebRTCManager {
@@ -89,6 +95,9 @@ impl WebRTCManager {
         let my_peer_id = PeerId::new(pubkey, None);
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let (signaling_tx, signaling_rx) = mpsc::channel(100);
+
+        // Default classifier: all peers go to 'other' pool
+        let peer_classifier: PeerClassifier = Arc::new(|_| PeerPool::Other);
 
         Self {
             config,
@@ -100,7 +109,15 @@ impl WebRTCManager {
             signaling_tx,
             signaling_rx: Some(signaling_rx),
             store: None,
+            peer_classifier,
         }
+    }
+
+    /// Create a new WebRTC manager with a peer classifier
+    pub fn new_with_classifier(keys: Keys, config: WebRTCConfig, classifier: PeerClassifier) -> Self {
+        let mut manager = Self::new(keys, config);
+        manager.peer_classifier = classifier;
+        manager
     }
 
     /// Create a new WebRTC manager with a content store for serving hash requests
@@ -110,9 +127,27 @@ impl WebRTCManager {
         manager
     }
 
+    /// Create a new WebRTC manager with store and classifier
+    pub fn new_with_store_and_classifier(
+        keys: Keys,
+        config: WebRTCConfig,
+        store: Arc<dyn ContentStore>,
+        classifier: PeerClassifier,
+    ) -> Self {
+        let mut manager = Self::new(keys, config);
+        manager.store = Some(store);
+        manager.peer_classifier = classifier;
+        manager
+    }
+
     /// Set the content store for serving hash requests
     pub fn set_store(&mut self, store: Arc<dyn ContentStore>) {
         self.store = Some(store);
+    }
+
+    /// Set the peer classifier
+    pub fn set_peer_classifier(&mut self, classifier: PeerClassifier) {
+        self.peer_classifier = classifier;
     }
 
     /// Get my peer ID
@@ -150,8 +185,61 @@ impl WebRTCManager {
                 state: p.state.to_string(),
                 direction: p.direction,
                 connected_at: Some(p.last_seen),
+                pool: p.pool,
             })
             .collect()
+    }
+
+    /// Get pool counts
+    pub async fn get_pool_counts(&self) -> (usize, usize, usize, usize) {
+        let peers = self.state.peers.read().await;
+        let mut follows_connected = 0;
+        let mut follows_total = 0;
+        let mut other_connected = 0;
+        let mut other_total = 0;
+
+        for entry in peers.values() {
+            match entry.pool {
+                PeerPool::Follows => {
+                    follows_total += 1;
+                    if entry.state == ConnectionState::Connected {
+                        follows_connected += 1;
+                    }
+                }
+                PeerPool::Other => {
+                    other_total += 1;
+                    if entry.state == ConnectionState::Connected {
+                        other_connected += 1;
+                    }
+                }
+            }
+        }
+
+        (follows_connected, follows_total, other_connected, other_total)
+    }
+
+    /// Check if we can accept a peer in a given pool
+    fn can_accept_peer(&self, pool: PeerPool, pool_counts: &(usize, usize, usize, usize)) -> bool {
+        let (_, follows_total, _, other_total) = *pool_counts;
+        match pool {
+            PeerPool::Follows => follows_total < self.config.pools.follows.max_connections,
+            PeerPool::Other => other_total < self.config.pools.other.max_connections,
+        }
+    }
+
+    /// Check if a pool is satisfied
+    fn is_pool_satisfied(&self, pool: PeerPool, pool_counts: &(usize, usize, usize, usize)) -> bool {
+        let (follows_connected, _, other_connected, _) = *pool_counts;
+        match pool {
+            PeerPool::Follows => follows_connected >= self.config.pools.follows.satisfied_connections,
+            PeerPool::Other => other_connected >= self.config.pools.other.satisfied_connections,
+        }
+    }
+
+    /// Check if both pools are satisfied
+    fn is_satisfied(&self, pool_counts: &(usize, usize, usize, usize)) -> bool {
+        self.is_pool_satisfied(PeerPool::Follows, pool_counts)
+            && self.is_pool_satisfied(PeerPool::Other, pool_counts)
     }
 
     /// Check if we should initiate connection (tie-breaking)
@@ -332,11 +420,12 @@ impl WebRTCManager {
         let (content, tags) = if let Some(recipient_str) = msg.recipient() {
             // Parse recipient to get their pubkey
             let content = if let Some(peer_id) = PeerId::from_string(recipient_str) {
-                // Encrypt the message content with NIP-04
+                // Encrypt the message content with NIP-44
                 let plaintext = serde_json::to_string(msg)?;
                 let recipient_pubkey = PublicKey::from_hex(&peer_id.pubkey)?;
 
-                nip04::encrypt(keys.secret_key(), &recipient_pubkey, &plaintext)?
+                let encrypted = nip44::encrypt(keys.secret_key(), &recipient_pubkey, &plaintext, nip44::Version::V2)?;
+                encrypted
             } else {
                 // Fallback to unencrypted if can't parse recipient
                 serde_json::to_string(msg)?
@@ -406,8 +495,11 @@ impl WebRTCManager {
         };
 
         // Check if this is a hello message (d-tag = "hello")
-        if get_tag("d").as_deref() == Some("hello") {
-            if let Some(their_uuid) = get_tag("peerId") {
+        let d_tag = get_tag("d");
+        let peer_id_tag = get_tag("peerId");
+        debug!("[WebRTC] Event d-tag: {:?}, peerId: {:?}", d_tag, peer_id_tag.as_ref().map(|s| &s[..8.min(s.len())]));
+        if d_tag.as_deref() == Some("hello") {
+            if let Some(their_uuid) = peer_id_tag {
                 debug!("Received hello from {} via {}", &sender_pubkey[..8], relay);
                 self.handle_hello(&sender_pubkey, &their_uuid, relay_write_tx)
                     .await?;
@@ -420,8 +512,8 @@ impl WebRTCManager {
             return Ok(());
         }
 
-        // Try NIP-04 decryption (silently ignore messages not meant for us)
-        let msg: SignalingMessage = match nip04::decrypt(self.keys.secret_key(), &event.pubkey, &event.content) {
+        // Try NIP-44 decryption (silently ignore messages not meant for us)
+        let msg: SignalingMessage = match nip44::decrypt(self.keys.secret_key(), &event.pubkey, &event.content) {
             Ok(plaintext) => {
                 debug!("Decrypted message from {}: {}", &sender_pubkey[..8], &plaintext[..50.min(plaintext.len())]);
                 serde_json::from_str(&plaintext)?
@@ -504,13 +596,6 @@ impl WebRTCManager {
         let full_peer_id = PeerId::new(sender_pubkey.to_string(), Some(their_uuid.to_string()));
         let peer_key = full_peer_id.to_string();
 
-        // Check connection limits
-        let connected = self
-            .state
-            .connected_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let max_connections = self.config.max_outbound + self.config.max_inbound;
-
         // Check if we already have this peer
         {
             let peers = self.state.peers.read().await;
@@ -524,16 +609,27 @@ impl WebRTCManager {
             }
         }
 
+        // Classify the peer into a pool
+        let pool = (self.peer_classifier)(sender_pubkey);
+
+        // Check pool limits
+        let pool_counts = self.get_pool_counts().await;
+        if !self.can_accept_peer(pool, &pool_counts) {
+            debug!("Ignoring hello from {} - pool {:?} is full", full_peer_id.short(), pool);
+            return Ok(());
+        }
+
         // Decide if we should initiate based on tie-breaking
         let should_initiate = self.should_initiate(their_uuid);
 
         info!(
-            "Discovered peer: {} (initiate: {})",
+            "Discovered peer: {} (pool: {:?}, initiate: {})",
             full_peer_id.short(),
+            pool,
             should_initiate
         );
 
-        // Create peer entry
+        // Create peer entry with pool assignment
         {
             let mut peers = self.state.peers.write().await;
             peers.insert(
@@ -548,13 +644,14 @@ impl WebRTCManager {
                     state: ConnectionState::Discovered,
                     last_seen: Instant::now(),
                     peer: None,
+                    pool,
                 },
             );
         }
 
-        // If we should initiate and haven't reached limits, create offer
-        if should_initiate && connected < max_connections {
-            self.initiate_connection(&full_peer_id, relay_write_tx)
+        // If we should initiate, create offer
+        if should_initiate {
+            self.initiate_connection(&full_peer_id, pool, relay_write_tx)
                 .await?;
         }
 
@@ -565,11 +662,12 @@ impl WebRTCManager {
     async fn initiate_connection(
         &self,
         peer_id: &PeerId,
+        pool: PeerPool,
         relay_write_tx: &tokio::sync::broadcast::Sender<SignalingMessage>,
     ) -> Result<()> {
         let peer_key = peer_id.to_string();
 
-        info!("Initiating connection to {}", peer_id.short());
+        info!("Initiating connection to {} (pool: {:?})", peer_id.short(), pool);
 
         // Create peer connection with content store if available
         let mut peer = Peer::new_with_store(
@@ -593,6 +691,7 @@ impl WebRTCManager {
             if let Some(entry) = peers.get_mut(&peer_key) {
                 entry.state = ConnectionState::Connecting;
                 entry.peer = Some(peer);
+                entry.pool = pool;
             }
         }
 
@@ -602,7 +701,9 @@ impl WebRTCManager {
             recipient: peer_id.to_string(),
             peer_id: self.my_peer_id.uuid.clone(),
         };
-        let _ = relay_write_tx.send(offer_msg);
+        if relay_write_tx.send(offer_msg).is_err() {
+            warn!("Failed to broadcast offer to {}", peer_id.short());
+        }
 
         info!("Sent offer to {}", peer_id.short());
 
@@ -620,18 +721,29 @@ impl WebRTCManager {
         let full_peer_id = PeerId::new(sender_pubkey.to_string(), Some(their_uuid.to_string()));
         let peer_key = full_peer_id.to_string();
 
-        info!("Received offer from {}", full_peer_id.short());
+        // Classify the peer into a pool
+        let pool = (self.peer_classifier)(sender_pubkey);
 
-        // Check limits
-        let connected = self
-            .state
-            .connected_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if connected >= self.config.max_inbound + self.config.max_outbound {
-            warn!("Connection limit reached, ignoring offer");
-            return Ok(());
+        info!("Received offer from {} (pool: {:?})", full_peer_id.short(), pool);
+
+        // Check if we already have this peer with an actual connection
+        {
+            let peers = self.state.peers.read().await;
+            if let Some(entry) = peers.get(&peer_key) {
+                // Only skip if we have an actual peer connection (not just discovered)
+                if entry.peer.is_some() {
+                    debug!("Already have peer {} with connection, skipping offer", full_peer_id.short());
+                    return Ok(());
+                }
+            }
         }
 
+        // Check pool limits
+        let pool_counts = self.get_pool_counts().await;
+        if !self.can_accept_peer(pool, &pool_counts) {
+            warn!("Rejecting offer from {} - pool {:?} is full", full_peer_id.short(), pool);
+            return Ok(());
+        }
         // Create peer connection with content store if available
         let mut peer = Peer::new_with_store(
             full_peer_id.clone(),
@@ -659,6 +771,7 @@ impl WebRTCManager {
                     state: ConnectionState::Connecting,
                     last_seen: Instant::now(),
                     peer: Some(peer),
+                    pool,
                 },
             );
         }
@@ -669,8 +782,9 @@ impl WebRTCManager {
             recipient: full_peer_id.to_string(),
             peer_id: self.my_peer_id.uuid.clone(),
         };
-        let _ = relay_write_tx.send(answer_msg);
-
+        if relay_write_tx.send(answer_msg).is_err() {
+            warn!("Failed to send answer to {}", full_peer_id.short());
+        }
         info!("Sent answer to {}", full_peer_id.short());
 
         Ok(())

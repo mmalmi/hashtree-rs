@@ -11,6 +11,7 @@
 //!   htree info <cid>
 //!   htree stats
 //!   htree gc
+//!   htree user [<nsec>]
 //!   htree publish <ref_name> <hash> [--key <key>]
 
 use anyhow::{Context, Result};
@@ -18,7 +19,8 @@ use clap::{Parser, Subcommand};
 use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
 use hashtree_cli::{
     init_nostrdb_at, spawn_relay_thread, Config, GitStorage, HashtreeServer, HashtreeStore,
-    NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RelayConfig, RootResolver,
+    NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RelayConfig, RootResolver,
+    WebRTCConfig, WebRTCManager,
 };
 use nostr::nips::nip19::ToBech32;
 use std::path::PathBuf;
@@ -29,7 +31,7 @@ use std::time::Duration;
 #[command(name = "htree")]
 #[command(about = "Content-addressed storage with Scionic Merkle Trees", long_about = None)]
 struct Cli {
-    #[arg(long, default_value = "./hashtree-data", global = true)]
+    #[arg(long, default_value = "./hashtree-data", global = true, env = "HTREE_DATA_DIR")]
     data_dir: PathBuf,
 
     #[command(subcommand)]
@@ -94,6 +96,11 @@ enum Commands {
     Stats,
     /// Run garbage collection
     Gc,
+    /// Show or set your nostr identity
+    User {
+        /// npub or nsec to set as active identity (omit to show current)
+        identity: Option<String>,
+    },
     /// Publish a hash to Nostr under a ref name
     Publish {
         /// The ref name to publish under (e.g., "mydata" -> npub.../mydata)
@@ -104,10 +111,25 @@ enum Commands {
         #[arg(long)]
         key: Option<String>,
     },
+    /// Follow a user (adds to your contact list)
+    Follow {
+        /// npub of user to follow
+        npub: String,
+    },
+    /// Unfollow a user (removes from your contact list)
+    Unfollow {
+        /// npub of user to unfollow
+        npub: String,
+    },
+    /// List users you follow
+    Following,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing (respects RUST_LOG env var)
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -174,8 +196,63 @@ async fn main() -> Result<()> {
                 None
             };
 
-            // WebRTC is not yet fully supported in the daemon (enostr RelayPool is not Send)
-            // WebRTC config is in config.server.enable_webrtc
+            // Start WebRTC signaling manager if enabled
+            let webrtc_handle = if config.server.enable_webrtc {
+                let webrtc_config = WebRTCConfig {
+                    relays: config.nostr.relays.clone(),
+                    ..Default::default()
+                };
+
+                // Create peer classifier based on social graph
+                // Distance 0 = self, 1 = direct follow/follower -> Follows pool
+                // Distance > 1 or unknown -> Other pool
+                let ndb_for_classifier = ndb.clone();
+                let contacts_file = data_dir.join("contacts.json");
+                let peer_classifier: hashtree_cli::PeerClassifier = Arc::new(move |pubkey_hex: &str| {
+                    // First check local contacts.json file (updated by htree follow command)
+                    if contacts_file.exists() {
+                        if let Ok(data) = std::fs::read_to_string(&contacts_file) {
+                            if let Ok(contacts) = serde_json::from_str::<Vec<String>>(&data) {
+                                if contacts.contains(&pubkey_hex.to_string()) {
+                                    return PeerPool::Follows;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fall back to nostrdb social graph
+                    if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
+                        if pubkey_bytes.len() == 32 {
+                            let pk: [u8; 32] = pubkey_bytes.try_into().unwrap();
+                            if let Ok(txn) = nostrdb::Transaction::new(&ndb_for_classifier) {
+                                let distance = nostrdb::socialgraph::get_follow_distance(&txn, &ndb_for_classifier, &pk);
+                                // Distance 0 = self (skip), 1 = direct follow/follower
+                                if distance == 1 {
+                                    return PeerPool::Follows;
+                                }
+                            }
+                        }
+                    }
+                    PeerPool::Other
+                });
+
+                let mut manager = WebRTCManager::new_with_store_and_classifier(
+                    keys.clone(),
+                    webrtc_config,
+                    Arc::clone(&store) as Arc<dyn hashtree_cli::ContentStore>,
+                    peer_classifier,
+                );
+
+                // Spawn the manager in a background task
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = manager.run().await {
+                        tracing::error!("WebRTC manager error: {}", e);
+                    }
+                });
+                Some(handle)
+            } else {
+                None
+            };
 
             // Set up server with nostr relay (inbound) and query sender
             let mut server = HashtreeServer::new(store, addr.clone())
@@ -223,6 +300,11 @@ async fn main() -> Result<()> {
             }
 
             server.run().await?;
+
+            // Shutdown WebRTC manager
+            if let Some(handle) = webrtc_handle {
+                handle.abort();
+            }
 
             // Shutdown STUN server
             if let Some(handle) = stun_handle {
@@ -508,6 +590,54 @@ async fn main() -> Result<()> {
                 gc_stats.freed_bytes,
                 gc_stats.freed_bytes as f64 / 1024.0);
         }
+        Commands::User { identity } => {
+            use hashtree_cli::config::get_nsec_path;
+            use nostr::nips::nip19::FromBech32;
+            use std::fs;
+
+            match identity {
+                None => {
+                    // Show current identity
+                    let (keys, was_generated) = ensure_nsec()?;
+                    let npub = keys.public_key().to_bech32()?;
+                    if was_generated {
+                        eprintln!("Generated new identity");
+                    }
+                    println!("{}", npub);
+                }
+                Some(id) => {
+                    // Set identity - accept nsec or derive from input
+                    let nsec = if id.starts_with("nsec1") {
+                        // Validate it's a valid nsec
+                        nostr::SecretKey::from_bech32(&id)
+                            .context("Invalid nsec")?;
+                        id
+                    } else {
+                        anyhow::bail!("Identity must be an nsec (secret key). Use 'htree user' to see your current npub.");
+                    };
+
+                    // Save to nsec file
+                    let nsec_path = get_nsec_path();
+                    if let Some(parent) = nsec_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&nsec_path, &nsec)?;
+
+                    // Set permissions to 0600
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&nsec_path, fs::Permissions::from_mode(0o600))?;
+                    }
+
+                    // Show the new npub
+                    let secret_key = nostr::SecretKey::from_bech32(&nsec)?;
+                    let keys = nostr::Keys::new(secret_key);
+                    let npub = keys.public_key().to_bech32()?;
+                    println!("{}", npub);
+                }
+            }
+        }
         Commands::Publish { ref_name, hash, key } => {
             use hashtree::{from_hex, key_from_hex, Cid};
 
@@ -572,6 +702,131 @@ async fn main() -> Result<()> {
 
             // Clean up
             let _ = resolver.stop().await;
+        }
+        Commands::Follow { npub } => {
+            follow_user(&cli.data_dir, &npub, true).await?;
+        }
+        Commands::Unfollow { npub } => {
+            follow_user(&cli.data_dir, &npub, false).await?;
+        }
+        Commands::Following => {
+            list_following(&cli.data_dir).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Follow or unfollow a user by publishing an updated kind 3 contact list
+async fn follow_user(data_dir: &PathBuf, npub_str: &str, follow: bool) -> Result<()> {
+    use nostr::{EventBuilder, Kind, Tag, PublicKey, Keys, JsonUtil, ClientMessage};
+    use tokio_tungstenite::connect_async;
+    use futures::sink::SinkExt;
+
+    // Load config for relay list
+    let config = Config::load()?;
+
+    // Ensure nsec exists
+    let (nsec_str, _) = ensure_nsec_string()?;
+    let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
+
+    // Parse target npub
+    let target_pubkey = parse_npub(npub_str).context("Invalid npub")?;
+    let target_pubkey_hex = hex::encode(target_pubkey);
+
+    // Load existing contact list from local storage
+    let contacts_file = data_dir.join("contacts.json");
+    let mut contacts: Vec<String> = if contacts_file.exists() {
+        let data = std::fs::read_to_string(&contacts_file)?;
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Update contacts
+    if follow {
+        if !contacts.contains(&target_pubkey_hex) {
+            contacts.push(target_pubkey_hex.clone());
+            println!("Following: {}", npub_str);
+        } else {
+            println!("Already following: {}", npub_str);
+            return Ok(());
+        }
+    } else {
+        if let Some(pos) = contacts.iter().position(|x| x == &target_pubkey_hex) {
+            contacts.remove(pos);
+            println!("Unfollowed: {}", npub_str);
+        } else {
+            println!("Not following: {}", npub_str);
+            return Ok(());
+        }
+    }
+
+    // Save updated contacts locally
+    std::fs::write(&contacts_file, serde_json::to_string_pretty(&contacts)?)?;
+
+    // Build kind 3 contact list event
+    let tags: Vec<Tag> = contacts.iter()
+        .filter_map(|pk_hex| {
+            PublicKey::from_hex(pk_hex).ok().map(|pk| Tag::public_key(pk))
+        })
+        .collect();
+
+    let event = EventBuilder::new(Kind::ContactList, "")
+        .tags(tags)
+        .sign(&keys)
+        .await
+        .context("Failed to sign contact list event")?;
+
+    let event_json = ClientMessage::event(event).as_json();
+
+    // Publish to relays
+    let mut success_count = 0;
+    for relay in &config.nostr.relays {
+        match connect_async(relay).await {
+            Ok((mut ws, _)) => {
+                if ws.send(tokio_tungstenite::tungstenite::Message::Text(event_json.clone().into())).await.is_ok() {
+                    success_count += 1;
+                }
+                let _ = ws.close(None).await;
+            }
+            Err(_) => {}
+        }
+    }
+
+    println!("Published contact list to {} relays", success_count);
+    Ok(())
+}
+
+/// List users we follow
+async fn list_following(data_dir: &PathBuf) -> Result<()> {
+    use nostr::PublicKey;
+    use nostr::nips::nip19::ToBech32;
+
+    // Load contacts from local storage
+    let contacts_file = data_dir.join("contacts.json");
+    let contacts: Vec<String> = if contacts_file.exists() {
+        let data = std::fs::read_to_string(&contacts_file)?;
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if contacts.is_empty() {
+        println!("Not following anyone");
+        return Ok(());
+    }
+
+    println!("Following {} users:", contacts.len());
+    for pk_hex in &contacts {
+        if let Ok(pk) = PublicKey::from_hex(pk_hex) {
+            if let Ok(npub) = pk.to_bech32() {
+                println!("  {}", npub);
+            } else {
+                println!("  {}", pk_hex);
+            }
+        } else {
+            println!("  {} (invalid)", pk_hex);
         }
     }
 

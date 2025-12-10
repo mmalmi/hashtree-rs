@@ -213,9 +213,9 @@ impl SignalingMessage {
 pub struct WebRTCConfig {
     /// Nostr relays for signaling
     pub relays: Vec<String>,
-    /// Maximum outbound connections
+    /// Maximum outbound connections (legacy, use pools instead)
     pub max_outbound: usize,
-    /// Maximum inbound connections
+    /// Maximum inbound connections (legacy, use pools instead)
     pub max_inbound: usize,
     /// Hello message interval in milliseconds
     pub hello_interval_ms: u64,
@@ -225,6 +225,8 @@ pub struct WebRTCConfig {
     pub stun_servers: Vec<String>,
     /// Enable debug logging
     pub debug: bool,
+    /// Pool settings for follows and other peers
+    pub pools: PoolSettings,
 }
 
 impl Default for WebRTCConfig {
@@ -246,6 +248,7 @@ impl Default for WebRTCConfig {
                 "stun:stun.cloudflare.com:3478".to_string(),
             ],
             debug: false,
+            pools: PoolSettings::default(),
         }
     }
 }
@@ -258,6 +261,7 @@ pub struct PeerStatus {
     pub state: String,
     pub direction: PeerDirection,
     pub connected_at: Option<std::time::Instant>,
+    pub pool: PeerPool,
 }
 
 /// Direction of peer connection
@@ -265,6 +269,55 @@ pub struct PeerStatus {
 pub enum PeerDirection {
     Inbound,
     Outbound,
+}
+
+/// Pool type for peer classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerPool {
+    /// Users in social graph (followed or followers)
+    Follows,
+    /// Everyone else
+    Other,
+}
+
+/// Configuration for a peer pool
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    /// Maximum connections in this pool
+    pub max_connections: usize,
+    /// Number of connections to consider "satisfied" (stop sending hellos)
+    pub satisfied_connections: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            satisfied_connections: 5,
+        }
+    }
+}
+
+/// Pool settings for both pools
+#[derive(Debug, Clone)]
+pub struct PoolSettings {
+    pub follows: PoolConfig,
+    pub other: PoolConfig,
+}
+
+impl Default for PoolSettings {
+    fn default() -> Self {
+        Self {
+            follows: PoolConfig {
+                max_connections: 20,
+                satisfied_connections: 10,
+            },
+            other: PoolConfig {
+                max_connections: 10,
+                satisfied_connections: 5,
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for PeerDirection {

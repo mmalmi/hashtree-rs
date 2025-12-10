@@ -15,7 +15,11 @@ use tracing::{debug, info, warn};
 use crate::nostr_client::NostrClient;
 
 /// Get the shared hashtree data directory
+/// Can be overridden with HTREE_DATA_DIR environment variable
 fn get_hashtree_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("HTREE_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".hashtree")
