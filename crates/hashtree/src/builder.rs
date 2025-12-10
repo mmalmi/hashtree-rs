@@ -3,7 +3,6 @@
 //! - Large files are split into chunks
 //! - Large directories are split into sub-trees
 //! - Supports streaming appends
-//! - Supports MessagePack or binary (BEP52-style) merkle algorithms
 //! - Encryption enabled by default (CHK - Content Hash Key)
 
 use std::collections::HashMap;
@@ -26,23 +25,12 @@ pub const BEP52_CHUNK_SIZE: usize = 16 * 1024;
 /// Default max links per tree node (fanout)
 pub const DEFAULT_MAX_LINKS: usize = 174;
 
-/// Merkle tree algorithm for file chunking
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum MerkleAlgorithm {
-    /// Variable fanout tree nodes (default)
-    #[default]
-    Default,
-    /// Binary merkle tree with hash pairs, power-of-2 padding (BEP52-style)
-    Binary,
-}
-
 /// Builder configuration
 #[derive(Clone)]
 pub struct BuilderConfig<S: Store> {
     pub store: Arc<S>,
     pub chunk_size: usize,
     pub max_links: usize,
-    pub merkle_algorithm: MerkleAlgorithm,
     /// Whether to encrypt content (default: true when encryption feature enabled)
     pub encrypted: bool,
 }
@@ -53,7 +41,6 @@ impl<S: Store> BuilderConfig<S> {
             store,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_links: DEFAULT_MAX_LINKS,
-            merkle_algorithm: MerkleAlgorithm::default(),
             #[cfg(feature = "encryption")]
             encrypted: true,
             #[cfg(not(feature = "encryption"))]
@@ -71,11 +58,6 @@ impl<S: Store> BuilderConfig<S> {
         self
     }
 
-    pub fn with_merkle_algorithm(mut self, algorithm: MerkleAlgorithm) -> Self {
-        self.merkle_algorithm = algorithm;
-        self
-    }
-
     /// Disable encryption (store content publicly)
     pub fn public(mut self) -> Self {
         self.encrypted = false;
@@ -90,23 +72,11 @@ impl<S: Store> BuilderConfig<S> {
     }
 }
 
-/// Result of put_file operation
-#[derive(Debug, Clone)]
-pub struct PutFileResult {
-    /// Root hash of the file tree
-    pub hash: Hash,
-    /// Total size in bytes
-    pub size: u64,
-    /// Leaf hashes (chunk hashes) - useful for binary mode verification
-    pub leaf_hashes: Vec<Hash>,
-}
-
 /// TreeBuilder - builds content-addressed merkle trees
 pub struct TreeBuilder<S: Store> {
     store: Arc<S>,
     chunk_size: usize,
     max_links: usize,
-    merkle_algorithm: MerkleAlgorithm,
     encrypted: bool,
 }
 
@@ -116,7 +86,6 @@ impl<S: Store> TreeBuilder<S> {
             store: config.store,
             chunk_size: config.chunk_size,
             max_links: config.max_links,
-            merkle_algorithm: config.merkle_algorithm,
             encrypted: config.encrypted,
         }
     }
@@ -259,43 +228,6 @@ impl<S: Store> TreeBuilder<S> {
         }
 
         Box::pin(self.build_tree_internal(sub_links, total_size)).await
-    }
-
-    /// Build a binary merkle tree (BEP52 style)
-    /// Uses hash pairs with zero-padding to power of 2
-    /// Does not store intermediate nodes - only computes root
-    fn build_binary_tree(&self, leaf_hashes: &[Hash]) -> Hash {
-        if leaf_hashes.is_empty() {
-            return [0u8; 32];
-        }
-        if leaf_hashes.len() == 1 {
-            return leaf_hashes[0];
-        }
-
-        // Pad to power of 2
-        let num_leaves = next_power_of_2(leaf_hashes.len());
-        let zero = [0u8; 32];
-
-        let mut current: Vec<Hash> = leaf_hashes.to_vec();
-        let mut pad_hash = zero;
-        let mut level_size = num_leaves;
-
-        while level_size > 1 {
-            let mut next_level: Vec<Hash> = Vec::with_capacity(level_size / 2);
-
-            for i in (0..level_size).step_by(2) {
-                let left = if i < current.len() { current[i] } else { pad_hash };
-                let right = if i + 1 < current.len() { current[i + 1] } else { pad_hash };
-                next_level.push(hash_pair(&left, &right));
-            }
-
-            // Update pad hash for next level
-            pad_hash = hash_pair(&pad_hash, &pad_hash);
-            current = next_level;
-            level_size /= 2;
-        }
-
-        current[0]
     }
 
     /// Build a balanced tree from links
@@ -723,22 +655,6 @@ pub enum BuilderError {
     Codec(#[from] crate::codec::CodecError),
     #[error("Encryption error: {0}")]
     Encryption(String),
-}
-
-/// Hash two 32-byte values together
-fn hash_pair(left: &Hash, right: &Hash) -> Hash {
-    let mut combined = [0u8; 64];
-    combined[..32].copy_from_slice(left);
-    combined[32..].copy_from_slice(right);
-    sha256(&combined)
-}
-
-/// Next power of 2 >= n
-fn next_power_of_2(n: usize) -> usize {
-    if n <= 1 {
-        return 1;
-    }
-    n.next_power_of_two()
 }
 
 #[cfg(test)]
