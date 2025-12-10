@@ -1,7 +1,7 @@
 //! Interoperability tests with TypeScript implementation
 //!
 //! These tests verify that the Rust implementation produces identical
-//! hashes and CBOR encodings as the TypeScript implementation.
+//! hashes and MessagePack encodings as the TypeScript implementation.
 
 use hashtree::{
     sha256, encode_tree_node, to_hex, from_hex, Link, TreeNode,
@@ -54,7 +54,8 @@ struct EntryInput {
 #[derive(Debug, Deserialize)]
 struct TestExpected {
     hash: String,
-    cbor: Option<String>,
+    msgpack: Option<String>,
+    ciphertext: Option<String>,
     size: Option<u64>,
 }
 
@@ -111,16 +112,16 @@ fn test_tree_node_encoding_vectors() {
         let encoded = encode_tree_node(&node).unwrap();
         let hash = sha256(&encoded);
 
-        // Verify CBOR matches (only for non-metadata cases, as HashMap order is not deterministic)
-        if let Some(ref expected_cbor) = vector.expected.cbor {
+        // Verify MessagePack matches (only for non-metadata cases, as HashMap order is not deterministic)
+        if let Some(ref expected_msgpack) = vector.expected.msgpack {
             if node_input.metadata.is_none() {
                 assert_eq!(
                     hex::encode(&encoded),
-                    *expected_cbor,
-                    "CBOR mismatch for {}",
+                    *expected_msgpack,
+                    "MessagePack mismatch for {}",
                     vector.name
                 );
-                println!("✓ {}: CBOR matches", vector.name);
+                println!("✓ {}: MessagePack matches", vector.name);
             } else {
                 // For metadata cases, just verify it roundtrips correctly
                 let decoded = hashtree::decode_tree_node(&encoded).unwrap();
@@ -225,8 +226,7 @@ fn test_chk_encryption_vectors() {
             vector.name
         );
 
-        if let Some(ref expected_ciphertext) = expected.cbor {
-            // We store ciphertext in cbor field for CHK vectors
+        if let Some(ref expected_ciphertext) = expected.ciphertext {
             assert_eq!(
                 hex::encode(&ciphertext),
                 *expected_ciphertext,
@@ -241,6 +241,83 @@ fn test_chk_encryption_vectors() {
 
         println!("✓ {}: key, ciphertext, and decrypt match", vector.name);
     }
+}
+
+/// Generate MessagePack test vectors - run with: cargo test generate_msgpack_vectors -- --nocapture --ignored
+#[test]
+#[ignore]
+fn generate_msgpack_vectors() {
+    use std::collections::HashMap;
+
+    println!("\n=== MessagePack Test Vectors ===\n");
+
+    // Empty tree node
+    let node = TreeNode::new(vec![]);
+    let encoded = encode_tree_node(&node).unwrap();
+    let hash = sha256(&encoded);
+    println!("tree_node_empty:");
+    println!("  msgpack: {}", hex::encode(&encoded));
+    println!("  hash: {}", to_hex(&hash));
+    println!();
+
+    // Single link
+    let hash1: [u8; 32] = from_hex("abababababababababababababababababababababababababababababababab").unwrap();
+    let node = TreeNode::new(vec![Link {
+        hash: hash1,
+        name: Some("test.txt".to_string()),
+        size: Some(100),
+        key: None,
+    }]);
+    let encoded = encode_tree_node(&node).unwrap();
+    let hash = sha256(&encoded);
+    println!("tree_node_single_link:");
+    println!("  msgpack: {}", hex::encode(&encoded));
+    println!("  hash: {}", to_hex(&hash));
+    println!();
+
+    // Multiple links
+    let h1 = from_hex("0101010101010101010101010101010101010101010101010101010101010101").unwrap();
+    let h2 = from_hex("0202020202020202020202020202020202020202020202020202020202020202").unwrap();
+    let h3 = from_hex("0303030303030303030303030303030303030303030303030303030303030303").unwrap();
+    let node = TreeNode::new(vec![
+        Link { hash: h1, name: Some("a.txt".to_string()), size: Some(10), key: None },
+        Link { hash: h2, name: Some("b.txt".to_string()), size: Some(20), key: None },
+        Link { hash: h3, name: Some("c.txt".to_string()), size: Some(30), key: None },
+    ]).with_total_size(60);
+    let encoded = encode_tree_node(&node).unwrap();
+    let hash = sha256(&encoded);
+    println!("tree_node_multiple_links:");
+    println!("  msgpack: {}", hex::encode(&encoded));
+    println!("  hash: {}", to_hex(&hash));
+    println!();
+
+    // Unnamed links
+    let ha = from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let hb = from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    let node = TreeNode::new(vec![
+        Link { hash: ha, name: None, size: Some(100), key: None },
+        Link { hash: hb, name: None, size: Some(50), key: None },
+    ]).with_total_size(150);
+    let encoded = encode_tree_node(&node).unwrap();
+    let hash = sha256(&encoded);
+    println!("tree_node_unnamed_links:");
+    println!("  msgpack: {}", hex::encode(&encoded));
+    println!("  hash: {}", to_hex(&hash));
+    println!();
+
+    // With metadata (sorted keys for determinism)
+    let hc = from_hex("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap();
+    let mut metadata = HashMap::new();
+    metadata.insert("author".to_string(), serde_json::json!("test"));
+    metadata.insert("version".to_string(), serde_json::json!(1));
+    let node = TreeNode::new(vec![
+        Link { hash: hc, name: None, size: None, key: None },
+    ]).with_metadata(metadata);
+    let encoded = encode_tree_node(&node).unwrap();
+    let hash = sha256(&encoded);
+    println!("tree_node_with_metadata:");
+    println!("  msgpack: {}", hex::encode(&encoded));
+    println!("  hash: {}", to_hex(&hash));
 }
 
 /// Generate CHK test vectors - run with: cargo test generate_chk_vectors -- --nocapture --ignored
@@ -270,7 +347,7 @@ fn generate_chk_vectors() {
     }},
     "expected": {{
       "hash": "{}",
-      "cbor": "{}"
+      "ciphertext": "{}"
     }}
   }},"#, name, hex::encode(data), hex::encode(&key), hex::encode(&ciphertext));
     }

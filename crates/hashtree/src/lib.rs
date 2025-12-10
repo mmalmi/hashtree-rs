@@ -6,7 +6,7 @@
 //! # Overview
 //!
 //! HashTree provides a simple, efficient way to build and traverse content-addressed
-//! merkle trees. It uses SHA256 for hashing and CBOR for tree node encoding.
+//! merkle trees. It uses SHA256 for hashing and MessagePack for tree node encoding.
 //!
 //! Content is CHK (Content Hash Key) encrypted by default, enabling deduplication
 //! even for encrypted content. Use `.public()` config to disable encryption.
@@ -14,7 +14,7 @@
 //! # Core Concepts
 //!
 //! - **Blobs**: Raw data stored directly by their hash (SHA256(data) -> data)
-//! - **Tree Nodes**: CBOR-encoded nodes with links to children (SHA256(CBOR(node)) -> CBOR(node))
+//! - **Tree Nodes**: MessagePack-encoded nodes with links to children (SHA256(msgpack(node)) -> msgpack(node))
 //! - **Links**: References to child nodes with optional name and size metadata
 //! - **Cid**: Content identifier with hash + optional encryption key
 //!

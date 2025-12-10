@@ -38,8 +38,8 @@
       }
     },
     "expected": {
-      "hash": "681740d8022b01965e315e72774a98c864af0884abeeea48583fc9d7f7710fe1",
-      "cbor": "a2617401616c80"
+      "hash": "a253324cb19b96c76328e4105c3d85ffb253a2db1ddad3d01e50c4090354ea78",
+      "msgpack": "82a17401a16c90"
     }
   },
   {
@@ -57,8 +57,8 @@
       }
     },
     "expected": {
-      "hash": "36f24d65075bd3304813640959513bf65674ef8b77366ef689feda33c079f35e",
-      "cbor": "a2617401616c81a361685820abababababababababababababababababababababababababababababababab616e68746573742e74787461731864"
+      "hash": "154973d74633ccb5827f6ae7eca76e091d9bd3b463b37971dbea58182f98e0ac",
+      "msgpack": "82a17401a16c9183a168c420ababababababababababababababababababababababababababababababababa16ea8746573742e747874a17364"
     }
   },
   {
@@ -87,8 +87,8 @@
       }
     },
     "expected": {
-      "hash": "2dd6dfdc2a3f0f8ab7ff0a62b9394b1f279b836219f88decc7bab640721733c4",
-      "cbor": "a3617401616c83a3616858200101010101010101010101010101010101010101010101010101010101010101616e65612e74787461730aa3616858200202020202020202020202020202020202020202020202020202020202020202616e65622e747874617314a3616858200303030303030303030303030303030303030303030303030303030303030303616e65632e7478746173181e6173183c"
+      "hash": "986fb602496093f9f57926a0c1bf69349ed5cef4d5eea333d3b5248f43975ee5",
+      "msgpack": "83a17401a16c9383a168c4200101010101010101010101010101010101010101010101010101010101010101a16ea5612e747874a1730a83a168c4200202020202020202020202020202020202020202020202020202020202020202a16ea5622e747874a1731483a168c4200303030303030303030303030303030303030303030303030303030303030303a16ea5632e747874a1731ea1733c"
     }
   },
   {
@@ -108,8 +108,8 @@
       }
     },
     "expected": {
-      "hash": "6d30d66fb4e181159e8f7d171b7bdbb412f3ffa57041f0d8c689d0b51cde1ac0",
-      "cbor": "a3617401616c81a161685820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd616da26776657273696f6e0166617574686f726474657374"
+      "hash": "a5d9e85597a0f78bc166b16bcbbc15d16c359fdc814daca25a6aa32cb67fb01e",
+      "msgpack": "83a17401a16c9181a168c420cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcda16d82a6617574686f72a474657374a776657273696f6e01"
     }
   },
   {
@@ -131,8 +131,8 @@
       }
     },
     "expected": {
-      "hash": "cbaeb4da4eee40c914df743fbe2a43b1d660b4cd80f2c21e302aa49139abc50c",
-      "cbor": "a3617401616c82a261685820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa61731864a261685820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb6173183261731896"
+      "hash": "0538eca336934ba21a4dc29812cdf4615ba5481cc80d7288c414bb32a304ce60",
+      "msgpack": "83a17401a16c9282a168c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1736482a168c420bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba17332a173cc96"
     }
   },
   {
@@ -153,7 +153,7 @@
       "data": "546869732069732061206c6f6e676572206d65737361676520746861742077696c6c206265206368756e6b65642e"
     },
     "expected": {
-      "hash": "b8fea8d19986e6f5c9540991a7f13f3a6b75c7ce96f579cd53c86dc57097288a",
+      "hash": "f819aa4aa9aea9fbf30225c344d2720f1670680728751af82f51a8d72f2b457e",
       "size": 46
     }
   },
@@ -165,7 +165,7 @@
     },
     "expected": {
       "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "cbor": "7cd161ae8406d82cdf553c1100d012db"
+      "ciphertext": "7cd161ae8406d82cdf553c1100d012db"
     }
   },
   {
@@ -176,7 +176,7 @@
     },
     "expected": {
       "hash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
-      "cbor": "c65308d9c8649ff1c59820d0b3a030db34ad00f92d"
+      "ciphertext": "c65308d9c8649ff1c59820d0b3a030db34ad00f92d"
     }
   },
   {
@@ -187,7 +187,7 @@
     },
     "expected": {
       "hash": "74f81fe167d99b4cb41d6d0ccda82278caee9f3e2f25d5e5a3936ff3dcec60d0",
-      "cbor": "ccda50aa92b688834e3bbefe531dc17574deb4c8a8"
+      "ciphertext": "ccda50aa92b688834e3bbefe531dc17574deb4c8a8"
     }
   },
   {
@@ -198,7 +198,7 @@
     },
     "expected": {
       "hash": "c6c3cdfd45f3161235b73e23090f2621c9af64514cd6aab0f77af347e8c161e3",
-      "cbor": "80550b15be16a63e9ed12b09b00004a4e42b33331cf15d87a6b05637cfa7b04da1906c90ec12a526c626f75105c60769cbcf9ee669c059ce710b3f80f143ca2368b91f821874edb19da6f77f98b3ca46d0edf7d1e0"
+      "ciphertext": "80550b15be16a63e9ed12b09b00004a4e42b33331cf15d87a6b05637cfa7b04da1906c90ec12a526c626f75105c60769cbcf9ee669c059ce710b3f80f143ca2368b91f821874edb19da6f77f98b3ca46d0edf7d1e0"
     }
   }
 ]

@@ -1,9 +1,14 @@
-//! CBOR encoding/decoding for tree nodes
+//! MessagePack encoding/decoding for tree nodes
 //!
-//! Blobs are stored raw (not CBOR-wrapped) for efficiency.
-//! Tree nodes are CBOR-encoded.
+//! Blobs are stored raw (not wrapped) for efficiency.
+//! Tree nodes are MessagePack-encoded.
 //!
-//! CBOR format uses short keys for compact encoding:
+//! **Determinism:** Unlike CBOR, MessagePack doesn't have a built-in canonical encoding.
+//! We ensure deterministic output by:
+//! 1. Using fixed struct field order (Rust declaration order via serde)
+//! 2. Converting HashMap metadata to BTreeMap before encoding (sorted keys)
+//!
+//! Format uses short keys for compact encoding:
 //! - t: type (1 = tree)
 //! - l: links array
 //! - h: hash (in link)
@@ -11,9 +16,8 @@
 //! - s: size (in link or total_size, optional)
 //! - m: metadata (optional)
 
-use ciborium::value::Value;
-use std::collections::HashMap;
-use std::io::Cursor;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::hash::sha256;
 use crate::types::{Hash, Link, TreeNode};
@@ -22,294 +26,142 @@ use crate::types::{Hash, Link, TreeNode};
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("Invalid node type: {0}")]
-    InvalidNodeType(i128),
+    InvalidNodeType(u8),
     #[error("Missing required field: {0}")]
     MissingField(&'static str),
     #[error("Invalid field type for {0}")]
     InvalidFieldType(&'static str),
-    #[error("CBOR encoding error: {0}")]
-    CborEncode(String),
-    #[error("CBOR decoding error: {0}")]
-    CborDecode(String),
+    #[error("MessagePack encoding error: {0}")]
+    MsgpackEncode(String),
+    #[error("MessagePack decoding error: {0}")]
+    MsgpackDecode(String),
     #[error("Invalid hash length: expected 32, got {0}")]
     InvalidHashLength(usize),
 }
 
-/// Encode a tree node to CBOR
+/// Wire format for a link (compact keys)
+#[derive(Serialize, Deserialize)]
+struct WireLink {
+    /// Hash (required) - use serde_bytes for proper MessagePack binary encoding
+    #[serde(with = "serde_bytes")]
+    h: Vec<u8>,
+    /// Name (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n: Option<String>,
+    /// Size (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s: Option<u64>,
+    /// Encryption key (optional) - use serde_bytes for proper MessagePack binary encoding
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_bytes"
+    )]
+    k: Option<Vec<u8>>,
+}
+
+/// Helper module for optional bytes serialization
+mod option_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(data: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match data {
+            Some(bytes) => serde_bytes::serialize(bytes, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<serde_bytes::ByteBuf>::deserialize(deserializer)
+            .map(|opt| opt.map(|bb| bb.into_vec()))
+    }
+}
+
+/// Wire format for a tree node (compact keys)
+#[derive(Serialize, Deserialize)]
+struct WireTreeNode {
+    /// Type (1 = tree)
+    t: u8,
+    /// Links
+    l: Vec<WireLink>,
+    /// Total size (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s: Option<u64>,
+    /// Metadata (optional) - uses BTreeMap for deterministic key ordering
+    #[serde(skip_serializing_if = "Option::is_none")]
+    m: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+/// Encode a tree node to MessagePack
 pub fn encode_tree_node(node: &TreeNode) -> Result<Vec<u8>, CodecError> {
-    let mut map: Vec<(Value, Value)> = Vec::new();
+    // Convert HashMap to BTreeMap for deterministic key ordering
+    let sorted_metadata = node.metadata.as_ref().map(|m| m.iter().collect::<BTreeMap<_, _>>());
 
-    // t = 1 for tree
-    map.push((Value::Text("t".to_string()), Value::Integer(1.into())));
-
-    // l = links array
-    let links: Vec<Value> = node
-        .links
-        .iter()
-        .map(|link| {
-            let mut link_map: Vec<(Value, Value)> = Vec::new();
-
-            // h = hash
-            link_map.push((
-                Value::Text("h".to_string()),
-                Value::Bytes(link.hash.to_vec()),
-            ));
-
-            // n = name (optional)
-            if let Some(ref name) = link.name {
-                link_map.push((Value::Text("n".to_string()), Value::Text(name.clone())));
-            }
-
-            // s = size (optional)
-            if let Some(size) = link.size {
-                link_map.push((Value::Text("s".to_string()), Value::Integer(size.into())));
-            }
-
-            // k = key (optional, for encrypted links)
-            if let Some(ref key) = link.key {
-                link_map.push((
-                    Value::Text("k".to_string()),
-                    Value::Bytes(key.to_vec()),
-                ));
-            }
-
-            Value::Map(link_map)
-        })
-        .collect();
-
-    map.push((Value::Text("l".to_string()), Value::Array(links)));
-
-    // s = totalSize (optional)
-    if let Some(total_size) = node.total_size {
-        map.push((
-            Value::Text("s".to_string()),
-            Value::Integer(total_size.into()),
-        ));
-    }
-
-    // m = metadata (optional)
-    if let Some(ref metadata) = node.metadata {
-        let meta_map: Vec<(Value, Value)> = metadata
+    let wire = WireTreeNode {
+        t: 1,
+        l: node
+            .links
             .iter()
-            .map(|(k, v)| (Value::Text(k.clone()), json_to_cbor(v)))
-            .collect();
-        map.push((Value::Text("m".to_string()), Value::Map(meta_map)));
-    }
+            .map(|link| WireLink {
+                h: link.hash.to_vec(),
+                n: link.name.clone(),
+                s: link.size,
+                k: link.key.map(|k| k.to_vec()),
+            })
+            .collect(),
+        s: node.total_size,
+        m: sorted_metadata.map(|m| m.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+    };
 
-    let value = Value::Map(map);
-    let mut buffer = Vec::new();
-    ciborium::into_writer(&value, &mut buffer)
-        .map_err(|e| CodecError::CborEncode(e.to_string()))?;
-
-    Ok(buffer)
+    rmp_serde::to_vec_named(&wire).map_err(|e| CodecError::MsgpackEncode(e.to_string()))
 }
 
-/// Convert JSON value to CBOR value
-fn json_to_cbor(json: &serde_json::Value) -> Value {
-    match json {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Integer(i.into())
-            } else if let Some(u) = n.as_u64() {
-                Value::Integer(u.into())
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
-            } else {
-                Value::Null
-            }
-        }
-        serde_json::Value::String(s) => Value::Text(s.clone()),
-        serde_json::Value::Array(arr) => {
-            Value::Array(arr.iter().map(json_to_cbor).collect())
-        }
-        serde_json::Value::Object(obj) => {
-            let map: Vec<(Value, Value)> = obj
-                .iter()
-                .map(|(k, v)| (Value::Text(k.clone()), json_to_cbor(v)))
-                .collect();
-            Value::Map(map)
-        }
-    }
-}
-
-/// Convert CBOR value to JSON value
-fn cbor_to_json(cbor: &Value) -> serde_json::Value {
-    match cbor {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Integer(i) => {
-            let n = i128::try_from(*i).unwrap_or(0);
-            if n >= 0 {
-                serde_json::json!(n as u64)
-            } else {
-                serde_json::json!(n as i64)
-            }
-        }
-        Value::Float(f) => serde_json::json!(*f),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
-        Value::Bytes(b) => serde_json::Value::String(hex::encode(b)),
-        Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(cbor_to_json).collect())
-        }
-        Value::Map(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .filter_map(|(k, v)| {
-                    if let Value::Text(key) = k {
-                        Some((key.clone(), cbor_to_json(v)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            serde_json::Value::Object(obj)
-        }
-        Value::Tag(_, inner) => cbor_to_json(inner),
-        _ => serde_json::Value::Null,
-    }
-}
-
-/// Decode CBOR to a tree node
+/// Decode MessagePack to a tree node
 pub fn decode_tree_node(data: &[u8]) -> Result<TreeNode, CodecError> {
-    let value: Value = ciborium::from_reader(Cursor::new(data))
-        .map_err(|e| CodecError::CborDecode(e.to_string()))?;
+    let wire: WireTreeNode =
+        rmp_serde::from_slice(data).map_err(|e| CodecError::MsgpackDecode(e.to_string()))?;
 
-    let map = match value {
-        Value::Map(m) => m,
-        _ => return Err(CodecError::InvalidFieldType("root")),
-    };
-
-    // Helper to find value by key
-    let find_value = |key: &str| -> Option<&Value> {
-        map.iter()
-            .find(|(k, _)| matches!(k, Value::Text(s) if s == key))
-            .map(|(_, v)| v)
-    };
-
-    // Check type = 1
-    let node_type = find_value("t")
-        .ok_or(CodecError::MissingField("t"))?;
-    let type_val = match node_type {
-        Value::Integer(i) => i128::try_from(*i).unwrap_or(0),
-        _ => return Err(CodecError::InvalidFieldType("t")),
-    };
-    if type_val != 1 {
-        return Err(CodecError::InvalidNodeType(type_val));
+    if wire.t != 1 {
+        return Err(CodecError::InvalidNodeType(wire.t));
     }
 
-    // Parse links
-    let links_val = find_value("l")
-        .ok_or(CodecError::MissingField("l"))?;
-    let links_arr = match links_val {
-        Value::Array(arr) => arr,
-        _ => return Err(CodecError::InvalidFieldType("l")),
-    };
-
-    let mut links = Vec::new();
-    for link_val in links_arr {
-        let link_map = match link_val {
-            Value::Map(m) => m,
-            _ => return Err(CodecError::InvalidFieldType("link")),
-        };
-
-        let find_link_value = |key: &str| -> Option<&Value> {
-            link_map
-                .iter()
-                .find(|(k, _)| matches!(k, Value::Text(s) if s == key))
-                .map(|(_, v)| v)
-        };
-
-        // Parse hash
-        let hash_val = find_link_value("h")
-            .ok_or(CodecError::MissingField("h"))?;
-        let hash_bytes = match hash_val {
-            Value::Bytes(b) => b,
-            _ => return Err(CodecError::InvalidFieldType("h")),
-        };
-        if hash_bytes.len() != 32 {
-            return Err(CodecError::InvalidHashLength(hash_bytes.len()));
+    let mut links = Vec::with_capacity(wire.l.len());
+    for wl in wire.l {
+        if wl.h.len() != 32 {
+            return Err(CodecError::InvalidHashLength(wl.h.len()));
         }
         let mut hash = [0u8; 32];
-        hash.copy_from_slice(hash_bytes);
+        hash.copy_from_slice(&wl.h);
 
-        // Parse optional name
-        let name = find_link_value("n").and_then(|v| {
-            if let Value::Text(s) = v {
-                Some(s.clone())
-            } else {
-                None
+        let key = match wl.k {
+            Some(k) if k.len() == 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&k);
+                Some(key)
             }
-        });
-
-        // Parse optional size
-        let size = find_link_value("s").and_then(|v| {
-            if let Value::Integer(i) = v {
-                u64::try_from(i128::try_from(*i).unwrap_or(0)).ok()
-            } else {
-                None
-            }
-        });
-
-        // Parse optional key (for encrypted links)
-        let key = find_link_value("k").and_then(|v| {
-            if let Value::Bytes(b) = v {
-                if b.len() == 32 {
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(b);
-                    Some(key)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        });
+            _ => None,
+        };
 
         links.push(Link {
             hash,
-            name,
-            size,
+            name: wl.n,
+            size: wl.s,
             key,
         });
     }
 
-    // Parse optional totalSize
-    let total_size = find_value("s").and_then(|v| {
-        if let Value::Integer(i) = v {
-            u64::try_from(i128::try_from(*i).unwrap_or(0)).ok()
-        } else {
-            None
-        }
-    });
-
-    // Parse optional metadata
-    let metadata = find_value("m").and_then(|v| {
-        if let Value::Map(m) = v {
-            let map: HashMap<String, serde_json::Value> = m
-                .iter()
-                .filter_map(|(k, val)| {
-                    if let Value::Text(key) = k {
-                        Some((key.clone(), cbor_to_json(val)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if map.is_empty() {
-                None
-            } else {
-                Some(map)
-            }
-        } else {
-            None
-        }
-    });
+    // Convert BTreeMap back to HashMap for the public API
+    let metadata = wire.m.map(|m| m.into_iter().collect::<HashMap<_, _>>());
 
     Ok(TreeNode {
         links,
-        total_size,
+        total_size: wire.s,
         metadata,
     })
 }
@@ -321,13 +173,10 @@ pub fn encode_and_hash(node: &TreeNode) -> Result<(Vec<u8>, Hash), CodecError> {
     Ok((data, hash))
 }
 
-/// Check if data is a CBOR-encoded tree node (vs raw blob)
-/// Tree nodes start with CBOR map with t=1
+/// Check if data is a MessagePack-encoded tree node (vs raw blob)
+/// Tree nodes decode successfully with t=1
 pub fn is_tree_node(data: &[u8]) -> bool {
-    match decode_tree_node(data) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    decode_tree_node(data).is_ok()
 }
 
 /// Check if data is a directory tree node (has named links)
@@ -472,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_tree_node_invalid_cbor() {
+    fn test_is_tree_node_invalid_msgpack() {
         let invalid = vec![255u8, 255, 255];
         assert!(!is_tree_node(&invalid));
     }
@@ -504,5 +353,82 @@ mod tests {
         let encoded = encode_tree_node(&node).unwrap();
 
         assert!(!is_directory_node(&encoded));
+    }
+
+    #[test]
+    fn test_encrypted_link_roundtrip() {
+        let hash = [1u8; 32];
+        let key = [2u8; 32];
+
+        let node = TreeNode::new(vec![Link {
+            hash,
+            name: Some("encrypted.dat".to_string()),
+            size: Some(1024),
+            key: Some(key),
+        }]);
+
+        let encoded = encode_tree_node(&node).unwrap();
+        let decoded = decode_tree_node(&encoded).unwrap();
+
+        assert_eq!(decoded.links[0].key, Some(key));
+    }
+
+    #[test]
+    fn test_encoding_determinism() {
+        // Test that encoding is deterministic across multiple calls
+        // This is critical for content-addressed storage where hash must be stable
+        let hash = [42u8; 32];
+
+        let node = TreeNode::new(vec![
+            Link {
+                hash,
+                name: Some("file.txt".to_string()),
+                size: Some(100),
+                key: None,
+            },
+        ]);
+
+        // Encode multiple times and verify identical output
+        let encoded1 = encode_tree_node(&node).unwrap();
+        let encoded2 = encode_tree_node(&node).unwrap();
+        let encoded3 = encode_tree_node(&node).unwrap();
+
+        assert_eq!(encoded1, encoded2, "Encoding should be deterministic");
+        assert_eq!(encoded2, encoded3, "Encoding should be deterministic");
+    }
+
+    #[test]
+    fn test_metadata_determinism() {
+        // Test that metadata encoding is deterministic regardless of HashMap insertion order
+        // We use BTreeMap internally to ensure sorted keys
+        let hash = [1u8; 32];
+
+        // Create metadata with keys in different orders
+        let mut metadata1 = HashMap::new();
+        metadata1.insert("zebra".to_string(), serde_json::json!("last"));
+        metadata1.insert("alpha".to_string(), serde_json::json!("first"));
+        metadata1.insert("middle".to_string(), serde_json::json!("mid"));
+
+        let mut metadata2 = HashMap::new();
+        metadata2.insert("alpha".to_string(), serde_json::json!("first"));
+        metadata2.insert("middle".to_string(), serde_json::json!("mid"));
+        metadata2.insert("zebra".to_string(), serde_json::json!("last"));
+
+        let node1 = TreeNode::new(vec![Link::new(hash)]).with_metadata(metadata1);
+        let node2 = TreeNode::new(vec![Link::new(hash)]).with_metadata(metadata2);
+
+        let encoded1 = encode_tree_node(&node1).unwrap();
+        let encoded2 = encode_tree_node(&node2).unwrap();
+
+        // Both should produce identical bytes (keys sorted alphabetically)
+        assert_eq!(
+            encoded1, encoded2,
+            "Metadata encoding should be deterministic regardless of insertion order"
+        );
+
+        // Verify the hash is also identical
+        let hash1 = crate::hash::sha256(&encoded1);
+        let hash2 = crate::hash::sha256(&encoded2);
+        assert_eq!(hash1, hash2, "Hashes should match for identical content");
     }
 }

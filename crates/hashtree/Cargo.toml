@@ -8,8 +8,9 @@ keywords = ["merkle", "content-addressed", "hash", "tree", "storage"]
 
 [dependencies]
 sha2.workspace = true
-ciborium.workspace = true
+rmp-serde.workspace = true
 serde.workspace = true
+serde_bytes = "0.11"
 serde_json.workspace = true
 hex.workspace = true
 async-trait.workspace = true

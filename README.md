@@ -4,7 +4,7 @@ Content-addressed merkle tree storage library for Rust.
 
 ## Design Philosophy
 
-**Simple over clever.** SHA256 for hashing, CBOR for encoding. No multicodec, multibase, or CID versioning. One way to do things.
+**Simple over clever.** SHA256 for hashing, MessagePack for encoding. No multicodec, multibase, or CID versioning. One way to do things.
 
 **Core does one thing.** Merkle trees over any key-value store. That's it. The library doesn't know about networks, peers, or protocols.
 
@@ -13,7 +13,7 @@ Content-addressed merkle tree storage library for Rust.
 ## Features
 
 - SHA256 hashing
-- CBOR encoding for tree nodes
+- MessagePack encoding for tree nodes (deterministic, 8x faster decode than CBOR)
 - File chunking with configurable size
 - Directory support with nested trees
 - Streaming append for large files

@@ -1,6 +1,6 @@
 //! HashTree - Simple content-addressed merkle tree
 //!
-//! Core principle: Every node is stored by SHA256(CBOR(node)) -> CBOR(node)
+//! Core principle: Every node is stored by SHA256(msgpack(node)) -> msgpack(node)
 //! This enables pure KV content-addressed storage.
 
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ pub fn hash_equals(a: &Hash, b: &Hash) -> bool {
 /// A link to a child node with optional metadata
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
-    /// SHA256 hash of the child node's CBOR encoding
+    /// SHA256 hash of the child node's MessagePack encoding
     pub hash: Hash,
     /// Optional name (for directory entries)
     pub name: Option<String>,
@@ -69,7 +69,7 @@ impl Link {
 }
 
 /// Tree node - contains links to children
-/// Stored as: SHA256(CBOR(TreeNode)) -> CBOR(TreeNode)
+/// Stored as: SHA256(msgpack(TreeNode)) -> msgpack(TreeNode)
 ///
 /// For directories: links have names
 /// For chunked files: links are ordered chunks

@@ -1,4 +1,4 @@
-//! TreeBuilder benchmark comparing CBOR vs Binary merkle algorithms
+//! TreeBuilder benchmark comparing MessagePack vs Binary merkle algorithms
 //! and encrypted vs non-encrypted performance.
 //!
 //! Run with: cargo bench -p hashtree --features encryption
@@ -32,9 +32,9 @@ fn bench_tree_builder(c: &mut Criterion) {
     ];
 
     let configs: Vec<(&str, usize, MerkleAlgorithm)> = vec![
-        ("256KB_cbor", DEFAULT_CHUNK_SIZE, MerkleAlgorithm::Cbor),
+        ("256KB_default", DEFAULT_CHUNK_SIZE, MerkleAlgorithm::Default),
         ("256KB_binary", DEFAULT_CHUNK_SIZE, MerkleAlgorithm::Binary),
-        ("16KB_cbor", BEP52_CHUNK_SIZE, MerkleAlgorithm::Cbor),
+        ("16KB_default", BEP52_CHUNK_SIZE, MerkleAlgorithm::Default),
         ("16KB_binary", BEP52_CHUNK_SIZE, MerkleAlgorithm::Binary),
     ];
 
@@ -66,7 +66,7 @@ fn bench_tree_builder(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark TreeReader for CBOR trees
+/// Benchmark TreeReader for MessagePack trees
 fn bench_tree_reader(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("tree_reader");
@@ -92,7 +92,7 @@ fn bench_tree_reader(c: &mut Criterion) {
                 let store = Arc::new(MemoryStore::new());
                 let config = BuilderConfig::new(store.clone())
                     .with_chunk_size(*chunk_size)
-                    .with_merkle_algorithm(MerkleAlgorithm::Cbor);
+                    .with_merkle_algorithm(MerkleAlgorithm::Default);
                 let builder = TreeBuilder::new(config);
                 let result = builder.put_file(&data).await.unwrap();
                 (store, result.hash)
@@ -125,10 +125,10 @@ fn bench_roundtrip(c: &mut Criterion) {
     let data = random_data(size);
     group.throughput(Throughput::Bytes(size as u64));
 
-    // CBOR algorithm (supports read)
+    // Default algorithm (supports read)
     for (name, chunk_size) in [("256KB", DEFAULT_CHUNK_SIZE), ("16KB", BEP52_CHUNK_SIZE)] {
         group.bench_with_input(
-            BenchmarkId::new(format!("{}_cbor", name), "10MB"),
+            BenchmarkId::new(format!("{}_default", name), "10MB"),
             &data,
             |b, data| {
                 b.iter(|| {
@@ -136,7 +136,7 @@ fn bench_roundtrip(c: &mut Criterion) {
                         let store = Arc::new(MemoryStore::new());
                         let config = BuilderConfig::new(store.clone())
                             .with_chunk_size(chunk_size)
-                            .with_merkle_algorithm(MerkleAlgorithm::Cbor);
+                            .with_merkle_algorithm(MerkleAlgorithm::Default);
                         let builder = TreeBuilder::new(config);
                         let result = builder.put_file(black_box(data)).await.unwrap();
 

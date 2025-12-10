@@ -629,7 +629,7 @@ impl<S: Store> HashTree<S> {
             };
             let (data, _plain_hash) = encode_and_hash(&node)?;
 
-            // Encrypt directory CBOR if encryption is enabled
+            // Encrypt directory data if encryption is enabled
             let (hash, key) = self.put_chunk_internal(&data).await?;
 
             return Ok(Cid { hash, key, size: total_size });

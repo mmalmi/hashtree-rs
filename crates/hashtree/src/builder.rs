@@ -3,7 +3,7 @@
 //! - Large files are split into chunks
 //! - Large directories are split into sub-trees
 //! - Supports streaming appends
-//! - Supports CBOR or binary (BEP52-style) merkle algorithms
+//! - Supports MessagePack or binary (BEP52-style) merkle algorithms
 //! - Encryption enabled by default (CHK - Content Hash Key)
 
 use std::collections::HashMap;
@@ -29,9 +29,9 @@ pub const DEFAULT_MAX_LINKS: usize = 174;
 /// Merkle tree algorithm for file chunking
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MerkleAlgorithm {
-    /// CBOR-encoded tree nodes with variable fanout (default)
+    /// Variable fanout tree nodes (default)
     #[default]
-    Cbor,
+    Default,
     /// Binary merkle tree with hash pairs, power-of-2 padding (BEP52-style)
     Binary,
 }
