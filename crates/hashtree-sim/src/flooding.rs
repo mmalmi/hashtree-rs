@@ -4,20 +4,23 @@
 //! 1. Connects to relay and announces presence
 //! 2. Discovers peers and establishes connections via signaling
 //! 3. Floods requests to all peers, returns first response
-//! 4. Forwards requests it can't fulfill (multi-hop)
+//! 4. Forwards requests using HTL (Hops-To-Live) like Freenet
 //!
 //! This is the simulation equivalent of WebRTCStore.
 
 use async_trait::async_trait;
 use hashtree::{Hash, Store, StoreError};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 
 use crate::channel::{ChannelError, MockChannel, PeerChannel};
-use crate::message::{encode_request, encode_response, parse, ParsedMessage, RequestId};
+use crate::message::{
+    decrement_htl, encode_request, encode_response, parse, should_forward,
+    ParsedMessage, PeerHTLConfig, MAX_HTL,
+};
 use crate::relay::{
     Event, Filter, MockRelay, RelayClient, RelayMessage, KIND_ANSWER, KIND_OFFER, KIND_PRESENCE,
 };
@@ -32,16 +35,17 @@ pub enum SignalingContent {
     Answer { sdp: String },
 }
 
-/// Pending request we sent to peers
+/// Pending request we originated (waiting for response)
 struct OurRequest {
     response_tx: oneshot::Sender<Option<Vec<u8>>>,
 }
 
-/// Request a peer sent to us that we're forwarding
-#[derive(Clone)]
-struct TheirRequest {
-    _id: RequestId,
-    _from_peer: u64,
+/// Track forwarded requests to route responses back
+/// Key: hash, Value: (from_peer_id, htl_when_received)
+struct ForwardedRequest {
+    from_peer: u64,
+    #[allow(dead_code)]
+    received_htl: u8,
 }
 
 /// Pending outbound connection (we sent offer, waiting for answer)
@@ -49,18 +53,22 @@ struct PendingConnection {
     our_channel: Arc<MockChannel>,
 }
 
+/// Connected peer with its HTL config
+struct ConnectedPeer {
+    channel: Arc<dyn PeerChannel>,
+    htl_config: PeerHTLConfig,
+}
+
 /// Routing strategy for data requests
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingStrategy {
     /// Flood requests to all peers simultaneously, first response wins
-    /// + Multi-hop forwarding: peers forward to their peers
+    /// + Multi-hop forwarding using HTL
     /// + Lower latency, higher bandwidth usage
     Flooding,
     /// Try peers one at a time, wait for response before trying next
     /// + Single-hop only: peers only check local storage (no forwarding)
     /// + Lower bandwidth, but only reaches direct neighbors
-    /// Note: Multi-hop sequential would require NOT_FOUND responses to avoid
-    /// cascading timeouts at each hop.
     Sequential,
 }
 
@@ -75,7 +83,7 @@ impl Default for RoutingStrategy {
 pub struct FloodingConfig {
     /// Per-peer timeout for sequential strategy (try next peer if no response)
     pub request_timeout: Duration,
-    /// Enable multi-hop forwarding
+    /// Enable multi-hop forwarding (using HTL)
     pub forward_requests: bool,
     /// Max peers to connect to
     pub max_peers: usize,
@@ -115,7 +123,7 @@ struct IncomingMessage {
 /// Like WebRTCStore, this is a complete P2P node that handles:
 /// - Signaling (relay connection, presence, offers/answers)
 /// - Peer management (connection establishment, channel handling)
-/// - Data transfer (flooding requests, multi-hop forwarding)
+/// - Data transfer (flooding requests, HTL-based forwarding)
 pub struct FloodingStore {
     /// Node ID (string for signaling)
     id: String,
@@ -123,16 +131,14 @@ pub struct FloodingStore {
     node_id: u64,
     /// Local storage
     local: Arc<SimStore>,
-    /// Connected peer channels (peer_id -> channel)
-    peers: RwLock<HashMap<u64, Arc<dyn PeerChannel>>>,
-    /// Pending requests we sent (request_id -> response channel)
-    our_requests: RwLock<HashMap<RequestId, OurRequest>>,
-    /// Requests peers sent us that we're forwarding (hash -> their_request)
-    their_requests: RwLock<HashMap<[u8; 32], TheirRequest>>,
+    /// Connected peers with their HTL configs
+    peers: RwLock<HashMap<u64, ConnectedPeer>>,
+    /// Pending requests we originated (hash -> response channel)
+    our_requests: RwLock<HashMap<[u8; 32], OurRequest>>,
+    /// Forwarded requests (hash -> who to send response back to)
+    forwarded_requests: RwLock<HashMap<[u8; 32], ForwardedRequest>>,
     /// Pending outbound connections (we sent offer)
     pending_outbound: RwLock<HashMap<String, PendingConnection>>,
-    /// Next request ID
-    next_request_id: AtomicU32,
     /// Message sender for unified handler
     msg_tx: mpsc::Sender<IncomingMessage>,
     /// Configuration
@@ -166,9 +172,8 @@ impl FloodingStore {
             local,
             peers: RwLock::new(HashMap::new()),
             our_requests: RwLock::new(HashMap::new()),
-            their_requests: RwLock::new(HashMap::new()),
+            forwarded_requests: RwLock::new(HashMap::new()),
             pending_outbound: RwLock::new(HashMap::new()),
-            next_request_id: AtomicU32::new(1),
             msg_tx,
             config,
             bytes_sent: AtomicU64::new(0),
@@ -412,7 +417,13 @@ impl FloodingStore {
 
     /// Add a peer channel and start receiving from it
     pub async fn add_peer(self: &Arc<Self>, peer_id: u64, channel: Arc<dyn PeerChannel>) {
-        self.peers.write().await.insert(peer_id, channel.clone());
+        // Generate random HTL config for this peer (Freenet-style)
+        let htl_config = PeerHTLConfig::random();
+
+        self.peers.write().await.insert(peer_id, ConnectedPeer {
+            channel: channel.clone(),
+            htl_config,
+        });
 
         // Spawn receiver for this peer
         let store = self.clone();
@@ -472,17 +483,18 @@ impl FloodingStore {
             return None;
         }
 
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let request_bytes = encode_request(request_id, hash);
-
-        // Send to all peers (flooding)
+        // Send to all peers (flooding) with MAX_HTL (we're originating this request)
         let mut sent_to = Vec::new();
-        for (&peer_id, channel) in peers.iter() {
+        for (&peer_id, peer) in peers.iter() {
             if Some(peer_id) == exclude {
                 continue;
             }
 
-            if self.send_with_latency(channel.as_ref(), request_bytes.clone()).await.is_ok() {
+            // Decrement HTL when sending (Freenet-style)
+            let outgoing_htl = decrement_htl(MAX_HTL, &peer.htl_config);
+            let request_bytes = encode_request(hash, outgoing_htl);
+
+            if self.send_with_latency(peer.channel.as_ref(), request_bytes.clone()).await.is_ok() {
                 self.bytes_sent
                     .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
                 sent_to.push(peer_id);
@@ -499,7 +511,7 @@ impl FloodingStore {
         self.our_requests
             .write()
             .await
-            .insert(request_id, OurRequest { response_tx: tx });
+            .insert(*hash, OurRequest { response_tx: tx });
 
         // Wait for response with timeout
         match tokio::time::timeout(self.config.request_timeout, rx).await {
@@ -512,7 +524,7 @@ impl FloodingStore {
             }
             _ => {
                 // Timeout or error - cleanup
-                self.our_requests.write().await.remove(&request_id);
+                self.our_requests.write().await.remove(hash);
                 None
             }
         }
@@ -520,12 +532,15 @@ impl FloodingStore {
 
     /// Sequential strategy: try one peer at a time, wait for response before trying next
     async fn fetch_from_peers_sequential(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
-        let peer_list: Vec<(u64, Arc<dyn PeerChannel>)> = {
+        let peer_list: Vec<(u64, ConnectedPeer)> = {
             let peers = self.peers.read().await;
             peers
                 .iter()
                 .filter(|(&id, _)| Some(id) != exclude)
-                .map(|(&id, ch)| (id, ch.clone()))
+                .map(|(&id, p)| (id, ConnectedPeer {
+                    channel: p.channel.clone(),
+                    htl_config: p.htl_config.clone(),
+                }))
                 .collect()
         };
 
@@ -534,12 +549,13 @@ impl FloodingStore {
         }
 
         // Try each peer sequentially
-        for (_peer_id, channel) in peer_list {
-            let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            let request_bytes = encode_request(request_id, hash);
+        for (_peer_id, peer) in peer_list {
+            // Decrement HTL when sending
+            let outgoing_htl = decrement_htl(MAX_HTL, &peer.htl_config);
+            let request_bytes = encode_request(hash, outgoing_htl);
 
             // Send request
-            if self.send_with_latency(channel.as_ref(), request_bytes.clone()).await.is_err() {
+            if self.send_with_latency(peer.channel.as_ref(), request_bytes.clone()).await.is_err() {
                 continue; // Try next peer
             }
             self.bytes_sent
@@ -550,10 +566,9 @@ impl FloodingStore {
             self.our_requests
                 .write()
                 .await
-                .insert(request_id, OurRequest { response_tx: tx });
+                .insert(*hash, OurRequest { response_tx: tx });
 
-            // Wait for response - use full timeout since peer may be forwarding sequentially
-            // Sequential forwarding: peer tries its peers one at a time, responds when found
+            // Wait for response
             match tokio::time::timeout(self.config.request_timeout, rx).await {
                 Ok(Ok(Some(data))) => {
                     // Found it! Cache locally and return
@@ -566,7 +581,7 @@ impl FloodingStore {
                 }
                 _ => {
                     // Timeout or error - cleanup and try next peer
-                    self.our_requests.write().await.remove(&request_id);
+                    self.our_requests.write().await.remove(hash);
                     continue;
                 }
             }
@@ -605,27 +620,27 @@ impl FloodingStore {
     /// Handle an incoming data message
     async fn handle_data_message(&self, from_peer: u64, data: &[u8]) {
         match parse(data) {
-            Ok(ParsedMessage::Request { id, hash }) => {
-                self.handle_request(from_peer, id, hash).await;
+            Ok(ParsedMessage::Request(req)) => {
+                if let Some(hash) = req.hash() {
+                    self.handle_request(from_peer, hash, req.htl_value()).await;
+                }
             }
-            Ok(ParsedMessage::Response { id, hash, data }) => {
-                self.handle_response(id, hash, data).await;
-            }
-            Ok(ParsedMessage::Push { hash, data }) => {
-                // Peer is pushing data
-                self.local.put_local(hash, data);
+            Ok(ParsedMessage::Response(res)) => {
+                if let Some(hash) = res.hash() {
+                    self.handle_response(from_peer, hash, res.d).await;
+                }
             }
             Err(_) => {}
         }
     }
 
     /// Handle incoming request from a peer
-    async fn handle_request(&self, from_peer: u64, id: RequestId, hash: [u8; 32]) {
+    async fn handle_request(&self, from_peer: u64, hash: [u8; 32], htl: u8) {
         // Check local store first
         if let Some(data) = self.local.get_local(&hash) {
-            let response = encode_response(id, &hash, &data);
-            if let Some(channel) = self.peers.read().await.get(&from_peer) {
-                if self.send_with_latency(channel.as_ref(), response.clone()).await.is_ok() {
+            let response = encode_response(&hash, &data);
+            if let Some(peer) = self.peers.read().await.get(&from_peer) {
+                if self.send_with_latency(peer.channel.as_ref(), response.clone()).await.is_ok() {
                     self.bytes_sent
                         .fetch_add(response.len() as u64, Ordering::Relaxed);
                 }
@@ -633,55 +648,79 @@ impl FloodingStore {
             return;
         }
 
-        // Not found locally - try forwarding to other peers
-        // Both flooding and sequential forward, but with different strategies:
-        // - Flooding: send to all peers at once, first response wins
-        // - Sequential: try one peer at a time until found
-        if self.config.forward_requests {
-            // Check if we're already looking for this hash (prevents cycles)
+        // Not found locally - try forwarding to other peers if HTL allows
+        if self.config.forward_requests && should_forward(htl) {
+            // Check if we're already forwarding this request (prevents loops)
             {
-                let their_requests = self.their_requests.read().await;
-                if their_requests.contains_key(&hash) {
-                    return;
+                let forwarded = self.forwarded_requests.read().await;
+                if forwarded.contains_key(&hash) {
+                    return; // Already forwarding this hash
                 }
             }
 
-            // Track the request for cycle detection
-            self.their_requests.write().await.insert(
+            // Track the request so we can route response back
+            self.forwarded_requests.write().await.insert(
                 hash,
-                TheirRequest {
-                    _id: id,
-                    _from_peer: from_peer,
+                ForwardedRequest {
+                    from_peer,
+                    received_htl: htl,
                 },
             );
 
             // Forward to other peers (excluding the requester)
-            if let Some(data) = self.fetch_from_peers(&hash, Some(from_peer)).await {
-                self.their_requests.write().await.remove(&hash);
-                let response = encode_response(id, &hash, &data);
-                if let Some(channel) = self.peers.read().await.get(&from_peer) {
-                    if self.send_with_latency(channel.as_ref(), response.clone()).await.is_ok() {
-                        self.bytes_sent
-                            .fetch_add(response.len() as u64, Ordering::Relaxed);
-                    }
+            let peers = self.peers.read().await;
+            for (&peer_id, peer) in peers.iter() {
+                if peer_id == from_peer {
+                    continue;
                 }
-                return;
-            }
 
-            self.their_requests.write().await.remove(&hash);
+                // Decrement HTL when forwarding
+                let outgoing_htl = decrement_htl(htl, &peer.htl_config);
+                if !should_forward(outgoing_htl) {
+                    continue; // HTL exhausted for this peer
+                }
+
+                let request_bytes = encode_request(&hash, outgoing_htl);
+                if self.send_with_latency(peer.channel.as_ref(), request_bytes.clone()).await.is_ok() {
+                    self.bytes_sent
+                        .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
+                }
+            }
+            drop(peers);
+
+            // Note: We don't wait for response here - response will come asynchronously
+            // and be routed back via handle_response
         }
     }
 
     /// Handle incoming response
-    async fn handle_response(&self, id: RequestId, hash: [u8; 32], data: Vec<u8>) {
+    async fn handle_response(&self, _from_peer: u64, hash: [u8; 32], data: Vec<u8>) {
         // Verify hash
         if hashtree::sha256(&data) != hash {
             return;
         }
 
-        // Route to pending request
-        if let Some(req) = self.our_requests.write().await.remove(&id) {
-            let _ = req.response_tx.send(Some(data));
+        // Check if this is a response to our own request
+        if let Some(req) = self.our_requests.write().await.remove(&hash) {
+            let _ = req.response_tx.send(Some(data.clone()));
+            // Cache locally
+            self.local.put_local(hash, data);
+            return;
+        }
+
+        // Check if we need to forward response back to original requester
+        if let Some(forwarded) = self.forwarded_requests.write().await.remove(&hash) {
+            // Cache locally before forwarding
+            self.local.put_local(hash, data.clone());
+
+            // Send response back to original requester
+            if let Some(peer) = self.peers.read().await.get(&forwarded.from_peer) {
+                let response = encode_response(&hash, &data);
+                if self.send_with_latency(peer.channel.as_ref(), response.clone()).await.is_ok() {
+                    self.bytes_sent
+                        .fetch_add(response.len() as u64, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -735,9 +774,13 @@ impl NetworkStore for FloodingStore {
 /// Deprecated: Use FloodingStore directly which handles requests internally
 pub async fn handle_request(local: &SimStore, request_bytes: &[u8]) -> Option<Vec<u8>> {
     match parse(request_bytes) {
-        Ok(ParsedMessage::Request { id, hash }) => {
-            if let Some(data) = local.get_local(&hash) {
-                Some(encode_response(id, &hash, &data))
+        Ok(ParsedMessage::Request(req)) => {
+            if let Some(hash) = req.hash() {
+                if let Some(data) = local.get_local(&hash) {
+                    Some(encode_response(&hash, &data))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -808,7 +851,7 @@ mod tests {
         // Give time for receivers to start
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // A fetches - should go A -> B -> C -> B -> A
+        // A fetches - should go A -> B -> C -> B -> A (using HTL)
         let result = store_a.get(&hash).await.unwrap();
         assert_eq!(result, Some(data.to_vec()));
 

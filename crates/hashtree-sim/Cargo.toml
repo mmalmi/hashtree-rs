@@ -18,6 +18,8 @@ serde_json.workspace = true
 rand = "0.8"
 lru = "0.12"
 lazy_static = "1.4"
+rmp-serde = "1"
+serde_bytes = "0.11"
 
 # Async runtime
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

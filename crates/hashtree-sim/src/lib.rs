@@ -27,8 +27,9 @@ pub use flooding::{
     SignalingContent,
 };
 pub use message::{
-    encode_push, encode_request, encode_response, parse, Hash, ParseError,
-    ParsedMessage, RequestId, MSG_PUSH, MSG_REQUEST, MSG_RESPONSE,
+    decrement_htl, encode_request, encode_response, parse, should_forward,
+    DataRequest, DataResponse, Hash, ParseError, ParsedMessage, PeerHTLConfig,
+    DECREMENT_AT_MAX_PROB, DECREMENT_AT_MIN_PROB, MAX_HTL, MSG_TYPE_REQUEST, MSG_TYPE_RESPONSE,
 };
 pub use peer_agent::{OurRequest, PeerAgent, TheirRequest};
 pub use relay::{

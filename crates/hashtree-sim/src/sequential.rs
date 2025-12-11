@@ -5,13 +5,13 @@
 
 use async_trait::async_trait;
 use hashtree::{Hash, Store, StoreError};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::channel::{ChannelError, PeerChannel};
-use crate::message::{encode_request, encode_response, parse, ParsedMessage, RequestId};
+use crate::message::{encode_request, encode_response, parse, ParsedMessage, MAX_HTL};
 use crate::store::{NetworkStore, SimStore};
 
 /// Sequential store - tries one peer at a time, waits for response or timeout
@@ -22,8 +22,6 @@ pub struct SequentialStore {
     peers: RwLock<Vec<Arc<dyn PeerChannel>>>,
     /// Per-peer timeout
     peer_timeout: Duration,
-    /// Next request ID
-    next_request_id: AtomicU32,
     /// Total bytes sent
     bytes_sent: AtomicU64,
     /// Total bytes received
@@ -38,7 +36,6 @@ impl SequentialStore {
             local,
             peers: RwLock::new(Vec::new()),
             peer_timeout,
-            next_request_id: AtomicU32::new(1),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             network_latency_ms: 0,
@@ -50,7 +47,6 @@ impl SequentialStore {
             local,
             peers: RwLock::new(Vec::new()),
             peer_timeout,
-            next_request_id: AtomicU32::new(1),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             network_latency_ms,
@@ -73,10 +69,6 @@ impl SequentialStore {
     /// Remove disconnected peers
     pub async fn cleanup_peers(&self) {
         self.peers.write().await.retain(|p| p.is_connected());
-    }
-
-    fn next_request_id(&self) -> RequestId {
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -113,8 +105,8 @@ impl NetworkStore for SequentialStore {
             return Ok(None);
         }
 
-        let request_id = self.next_request_id();
-        let request_bytes = encode_request(request_id, hash);
+        // Use MAX_HTL for sequential requests (single-hop, no forwarding)
+        let request_bytes = encode_request(hash, MAX_HTL);
 
         // Try each peer sequentially
         for peer in peers.iter() {
@@ -133,16 +125,20 @@ impl NetworkStore for SequentialStore {
                         .fetch_add(response_bytes.len() as u64, Ordering::Relaxed);
 
                     match parse(&response_bytes) {
-                        Ok(ParsedMessage::Response { id, hash: h, data })
-                            if id == request_id && h == *hash =>
-                        {
-                            // Verify data matches hash
-                            if hashtree::sha256(&data) == *hash {
-                                // Cache locally and return
-                                let _ = self.local.put(*hash, data.clone()).await;
-                                return Ok(Some(data));
+                        Ok(ParsedMessage::Response(res)) => {
+                            if let Some(h) = res.hash() {
+                                if h == *hash {
+                                    // Verify data matches hash
+                                    if hashtree::sha256(&res.d) == *hash {
+                                        // Cache locally and return
+                                        let _ = self.local.put(*hash, res.d.clone()).await;
+                                        return Ok(Some(res.d));
+                                    }
+                                    // Malicious: wrong data, try next peer
+                                }
                             }
-                            // Malicious: wrong data, try next peer
+                            // Wrong hash, try next peer
+                            continue;
                         }
                         _ => {
                             // Garbage or wrong message, try next peer
@@ -181,17 +177,19 @@ impl NetworkStore for SequentialStore {
 /// Only responds when data is found - no response means "keep waiting" or timeout.
 pub async fn handle_request(store: &SequentialStore, request_bytes: &[u8]) -> Option<Vec<u8>> {
     match parse(request_bytes) {
-        Ok(ParsedMessage::Request { id, hash }) => {
+        Ok(ParsedMessage::Request(req)) => {
+            let hash = req.hash()?;
+
             // First check local storage
             if let Some(data) = store.local.get_local(&hash) {
-                return Some(encode_response(id, &hash, &data));
+                return Some(encode_response(&hash, &data));
             }
 
             // Not found locally - forward to our peers (sequential forwarding)
             // This creates multi-hop routing: each node tries its peers one at a time
             // Only respond if we find the data
             match store.fetch_from_network(&hash).await {
-                Ok(Some(data)) => Some(encode_response(id, &hash, &data)),
+                Ok(Some(data)) => Some(encode_response(&hash, &data)),
                 _ => None, // Don't respond if not found - let timeout handle it
             }
         }
