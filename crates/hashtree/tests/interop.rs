@@ -44,6 +44,7 @@ struct LinkInput {
     size: Option<u64>,
     #[serde(default)]
     is_tree_node: bool,
+    meta: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[allow(dead_code)]
@@ -102,14 +103,14 @@ fn test_tree_node_encoding_vectors() {
                 key: None,
                 // is_tree_node: true means it's a Dir, false means Blob (for interop with old format)
                 link_type: if l.is_tree_node { LinkType::Dir } else { LinkType::Blob },
-                meta: None,
+                meta: l.meta.clone(),
             }
         }).collect();
 
-        // Determine node type: File only if ALL links are unnamed (chunks), Dir otherwise
-        // An empty node is considered Dir (empty directory)
-        let all_links_unnamed = !node_input.links.is_empty() && node_input.links.iter().all(|l| l.name.is_none());
-        let node_type = if all_links_unnamed { LinkType::File } else { LinkType::Dir };
+        // Determine node type based on test name:
+        // - "unnamed_links" tests are File type (chunked file nodes)
+        // - All others are Dir type
+        let node_type = if vector.name.contains("unnamed_links") { LinkType::File } else { LinkType::Dir };
         let mut node = TreeNode::new(node_type, links);
         if let Some(total_size) = node_input.total_size {
             node = node.with_total_size(total_size);

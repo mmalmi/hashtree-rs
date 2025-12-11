@@ -41,19 +41,20 @@ pub enum CodecError {
 }
 
 /// Wire format for a link (compact keys)
+/// Field order must match TypeScript: h, s, t, n?, k?, m?
 #[derive(Serialize, Deserialize)]
 struct WireLink {
     /// Hash (required) - use serde_bytes for proper MessagePack binary encoding
     #[serde(with = "serde_bytes")]
     h: Vec<u8>,
+    /// Size (required)
+    s: u64,
     /// Link type (0 = Blob, 1 = File, 2 = Dir)
     #[serde(default)]
     t: u8,
     /// Name (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     n: Option<String>,
-    /// Size (required)
-    s: u64,
     /// Encryption key (optional) - use serde_bytes for proper MessagePack binary encoding
     #[serde(
         default,
