@@ -128,8 +128,6 @@ pub struct TreeNode {
     pub node_type: LinkType,
     /// Links to child nodes
     pub links: Vec<Link>,
-    /// Total size of all data in this subtree
-    pub total_size: Option<u64>,
 }
 
 impl TreeNode {
@@ -138,7 +136,6 @@ impl TreeNode {
         Self {
             node_type,
             links,
-            total_size: None,
         }
     }
 
@@ -150,11 +147,6 @@ impl TreeNode {
     /// Create a Dir node (directory)
     pub fn dir(links: Vec<Link>) -> Self {
         Self::new(LinkType::Dir, links)
-    }
-
-    pub fn with_total_size(mut self, size: u64) -> Self {
-        self.total_size = Some(size);
-        self
     }
 
     /// Check if this is a directory node

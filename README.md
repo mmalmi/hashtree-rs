@@ -45,7 +45,7 @@ Every stored item is either raw bytes or a tree node. Tree nodes are MessagePack
 - `File` (1) - Chunked file: links are unnamed, ordered by byte offset
 - `Dir` (2) - Directory: links have names, may point to files or subdirs
 
-Wire format: `{t: LinkType, l: [{h: hash, s: size, n?: name, t: linkType, ...}], s?: totalSize}`
+Wire format: `{t: LinkType, l: [{h: hash, s: size, n?: name, t: linkType, ...}]}`
 
 ## Crates
 

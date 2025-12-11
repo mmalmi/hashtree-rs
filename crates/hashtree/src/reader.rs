@@ -378,10 +378,6 @@ impl<S: Store> TreeReader<S> {
         }
 
         let node = decode_tree_node(&data).map_err(ReaderError::Codec)?;
-        if let Some(total_size) = node.total_size {
-            return Ok(total_size);
-        }
-
         // Calculate from children
         let mut total = 0u64;
         for link in &node.links {
@@ -422,11 +418,12 @@ impl<S: Store> TreeReader<S> {
             }
         };
 
+        let node_size: u64 = node.links.iter().map(|l| l.size).sum();
         entries.push(WalkEntry {
             path: path.to_string(),
             hash: *hash,
             link_type: node.node_type,
-            size: node.total_size.unwrap_or(0),
+            size: node_size,
             key: None, // directories are not encrypted
         });
 

@@ -111,10 +111,10 @@ fn test_tree_node_encoding_vectors() {
         // - "unnamed_links" tests are File type (chunked file nodes)
         // - All others are Dir type
         let node_type = if vector.name.contains("unnamed_links") { LinkType::File } else { LinkType::Dir };
-        let mut node = TreeNode::new(node_type, links);
-        if let Some(total_size) = node_input.total_size {
-            node = node.with_total_size(total_size);
-        }
+        let node = TreeNode::new(node_type, links);
+        // Note: TreeNode no longer has totalSize - sizes are on links
+        // The interop vectors with total_size are for the old format
+
         // Note: TreeNode no longer has metadata - metadata now lives on individual links
         // The interop vectors with metadata are for the old format, so we skip those checks
 
@@ -289,7 +289,7 @@ fn generate_msgpack_vectors() {
         Link { hash: h1, name: Some("a.txt".to_string()), size: 10, key: None, link_type: LinkType::Blob, meta: None },
         Link { hash: h2, name: Some("b.txt".to_string()), size: 20, key: None, link_type: LinkType::Blob, meta: None },
         Link { hash: h3, name: Some("c.txt".to_string()), size: 30, key: None, link_type: LinkType::Blob, meta: None },
-    ]).with_total_size(60);
+    ]);
     let encoded = encode_tree_node(&node).unwrap();
     let hash = sha256(&encoded);
     println!("tree_node_multiple_links:");
@@ -303,7 +303,7 @@ fn generate_msgpack_vectors() {
     let node = TreeNode::new(LinkType::File, vec![
         Link { hash: ha, name: None, size: 100, key: None, link_type: LinkType::Blob, meta: None },
         Link { hash: hb, name: None, size: 50, key: None, link_type: LinkType::Blob, meta: None },
-    ]).with_total_size(150);
+    ]);
     let encoded = encode_tree_node(&node).unwrap();
     let hash = sha256(&encoded);
     println!("tree_node_unnamed_links:");

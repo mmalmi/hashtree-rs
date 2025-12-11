@@ -14,7 +14,7 @@
 //! - h: hash (in link)
 //! - t: type (in link, 0 = Blob, 1 = File, 2 = Dir)
 //! - n: name (in link, optional)
-//! - s: size (in link or total_size, optional)
+//! - s: size (in link)
 //! - m: metadata (optional)
 
 use serde::{Deserialize, Serialize};
@@ -91,14 +91,11 @@ mod option_bytes {
 }
 
 /// Wire format for a tree node (compact keys)
-/// Fields are ordered alphabetically for canonical encoding: l, s?, t
+/// Fields are ordered alphabetically for canonical encoding: l, t
 #[derive(Serialize, Deserialize)]
 struct WireTreeNode {
     /// Links
     l: Vec<WireLink>,
-    /// Total size (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    s: Option<u64>,
     /// Type (1 = File, 2 = Dir)
     t: u8,
 }
@@ -123,7 +120,6 @@ pub fn encode_tree_node(node: &TreeNode) -> Result<Vec<u8>, CodecError> {
                 }
             })
             .collect(),
-        s: node.total_size,
     };
 
     rmp_serde::to_vec_named(&wire).map_err(|e| CodecError::MsgpackEncode(e.to_string()))
@@ -175,7 +171,6 @@ pub fn decode_tree_node(data: &[u8]) -> Result<TreeNode, CodecError> {
     Ok(TreeNode {
         node_type,
         links,
-        total_size: wire.s,
     })
 }
 
@@ -266,16 +261,6 @@ mod tests {
         assert_eq!(to_hex(&decoded.links[0].hash), to_hex(&hash1));
         assert_eq!(decoded.links[1].name, Some("dir".to_string()));
         assert_eq!(decoded.links[1].link_type, LinkType::Dir);
-    }
-
-    #[test]
-    fn test_preserve_total_size() {
-        let node = TreeNode::file(vec![]).with_total_size(12345);
-
-        let encoded = encode_tree_node(&node).unwrap();
-        let decoded = decode_tree_node(&encoded).unwrap();
-
-        assert_eq!(decoded.total_size, Some(12345));
     }
 
     #[test]

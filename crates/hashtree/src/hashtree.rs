@@ -426,7 +426,6 @@ impl<S: Store> HashTree<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links,
-                total_size,
             };
             let (data, _) = encode_and_hash(&node)?;
 
@@ -633,7 +632,6 @@ impl<S: Store> HashTree<S> {
             let node = TreeNode {
                 node_type: LinkType::Dir,
                 links,
-                total_size: Some(total_size),
             };
             let (data, _plain_hash) = encode_and_hash(&node)?;
 
@@ -663,7 +661,6 @@ impl<S: Store> HashTree<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links,
-                total_size,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -682,7 +679,6 @@ impl<S: Store> HashTree<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links: batch.to_vec(),
-                total_size: Some(batch_size),
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -719,7 +715,6 @@ impl<S: Store> HashTree<S> {
             let node = TreeNode {
                 node_type: LinkType::Dir,
                 links: batch.to_vec(),
-                total_size: Some(batch_size),
             };
             let (data, _plain_hash) = encode_and_hash(&node)?;
 
@@ -740,7 +735,6 @@ impl<S: Store> HashTree<S> {
             let node = TreeNode {
                 node_type: LinkType::Dir,
                 links: sub_trees,
-                total_size: Some(total_size),
             };
             let (data, _plain_hash) = encode_and_hash(&node)?;
 
@@ -758,12 +752,9 @@ impl<S: Store> HashTree<S> {
         &self,
         links: Vec<Link>,
     ) -> Result<Hash, HashTreeError> {
-        let total_size: u64 = links.iter().map(|l| l.size).sum();
-
         let node = TreeNode {
             node_type: LinkType::Dir,
             links,
-            total_size: Some(total_size),
         };
 
         let (data, hash) = encode_and_hash(&node)?;
@@ -1182,10 +1173,6 @@ impl<S: Store> HashTree<S> {
         }
 
         let node = decode_tree_node(&data)?;
-        if let Some(total_size) = node.total_size {
-            return Ok(total_size);
-        }
-
         // Calculate from children
         let mut total = 0u64;
         for link in &node.links {
@@ -1234,11 +1221,12 @@ impl<S: Store> HashTree<S> {
             }
         };
 
+        let node_size: u64 = node.links.iter().map(|l| l.size).sum();
         entries.push(WalkEntry {
             path: path.to_string(),
             hash: cid.hash,
             link_type: node.node_type,
-            size: node.total_size.unwrap_or(0),
+            size: node_size,
             key: cid.key,
         });
 
@@ -1316,11 +1304,12 @@ impl<S: Store> HashTree<S> {
                             }
                         };
 
+                        let node_size: u64 = node.links.iter().map(|l| l.size).sum();
                         let entry = WalkEntry {
                             path: path.clone(),
                             hash: cid.hash,
                             link_type: node.node_type,
-                            size: node.total_size.unwrap_or(0),
+                            size: node_size,
                             key: cid.key,
                         };
 
@@ -1383,11 +1372,12 @@ impl<S: Store> HashTree<S> {
                 }
             };
 
+            let node_size: u64 = node.links.iter().map(|l| l.size).sum();
             let entry = WalkEntry {
                 path: item.path.clone(),
                 hash: item.hash,
                 link_type: node.node_type,
-                size: node.total_size.unwrap_or(0),
+                size: node_size,
                 key: None, // directories are not encrypted
             };
 

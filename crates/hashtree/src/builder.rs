@@ -191,7 +191,6 @@ impl<S: Store> TreeBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links,
-                total_size,
             };
             let (data, _) = encode_and_hash(&node)?;
 
@@ -251,7 +250,6 @@ impl<S: Store> TreeBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links,
-                total_size,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -270,7 +268,6 @@ impl<S: Store> TreeBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links: batch.to_vec(),
-                total_size: Some(batch_size),
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -321,7 +318,6 @@ impl<S: Store> TreeBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::Dir,
                 links,
-                total_size: Some(total_size),
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -365,7 +361,6 @@ impl<S: Store> TreeBuilder<S> {
                 let node = TreeNode {
                     node_type: LinkType::Dir,
                     links: group_links,
-                    total_size: Some(group_size),
                 };
                 let (data, hash) = encode_and_hash(&node)?;
                 self.store
@@ -413,7 +408,6 @@ impl<S: Store> TreeBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::Dir,
                 links: batch.to_vec(),
-                total_size: Some(batch_size),
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -435,7 +429,6 @@ impl<S: Store> TreeBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::Dir,
                 links: sub_trees,
-                total_size: Some(total_size),
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -454,12 +447,9 @@ impl<S: Store> TreeBuilder<S> {
         &self,
         links: Vec<Link>,
     ) -> Result<Hash, BuilderError> {
-        let total_size: u64 = links.iter().map(|l| l.size).sum();
-
         let node = TreeNode {
             node_type: LinkType::Dir,
             links,
-            total_size: Some(total_size),
         };
 
         let (data, hash) = encode_and_hash(&node)?;
@@ -607,7 +597,6 @@ impl<S: Store> StreamBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links: chunks.to_vec(),
-                total_size: Some(total_size),
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -625,7 +614,6 @@ impl<S: Store> StreamBuilder<S> {
             let node = TreeNode {
                 node_type: LinkType::File,
                 links: batch.to_vec(),
-                total_size: Some(batch_size),
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
