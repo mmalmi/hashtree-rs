@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::codec::encode_and_hash;
 use crate::hash::sha256;
 use crate::store::Store;
-use crate::types::{Cid, DirEntry, Hash, Link, TreeNode};
+use crate::types::{Cid, DirEntry, Hash, Link, LinkType, TreeNode};
 
 #[cfg(feature = "encryption")]
 use crate::crypto::{encrypt_chk, EncryptionKey};
@@ -157,8 +157,10 @@ impl<S: Store> TreeBuilder<S> {
             links.push(Link {
                 hash,
                 name: None,
-                size: Some(chunk_size),
+                size: chunk_size,
                 key,
+                link_type: LinkType::Blob, // leaf chunk
+                meta: None,
             });
             offset = end;
         }
@@ -179,7 +181,7 @@ impl<S: Store> TreeBuilder<S> {
         // Single link with matching size - return directly
         if links.len() == 1 {
             if let Some(ts) = total_size {
-                if links[0].size == Some(ts) {
+                if links[0].size == ts {
                     return Ok((links[0].hash, links[0].key));
                 }
             }
@@ -187,9 +189,9 @@ impl<S: Store> TreeBuilder<S> {
 
         if links.len() <= self.max_links {
             let node = TreeNode {
+                node_type: LinkType::File,
                 links,
                 total_size,
-                metadata: None,
             };
             let (data, _) = encode_and_hash(&node)?;
 
@@ -217,13 +219,15 @@ impl<S: Store> TreeBuilder<S> {
         // Too many links - create subtrees
         let mut sub_links = Vec::new();
         for batch in links.chunks(self.max_links) {
-            let batch_size: u64 = batch.iter().filter_map(|l| l.size).sum();
+            let batch_size: u64 = batch.iter().map(|l| l.size).sum();
             let (hash, key) = Box::pin(self.build_tree_internal(batch.to_vec(), Some(batch_size))).await?;
             sub_links.push(Link {
                 hash,
                 name: None,
-                size: Some(batch_size),
+                size: batch_size,
                 key,
+                link_type: LinkType::File, // subtree
+                meta: None,
             });
         }
 
@@ -236,7 +240,7 @@ impl<S: Store> TreeBuilder<S> {
         // Single link with matching size - return it directly
         if links.len() == 1 {
             if let Some(ts) = total_size {
-                if links[0].size == Some(ts) {
+                if links[0].size == ts {
                     return Ok(links[0].hash);
                 }
             }
@@ -245,9 +249,9 @@ impl<S: Store> TreeBuilder<S> {
         // Fits in one node
         if links.len() <= self.max_links {
             let node = TreeNode {
+                node_type: LinkType::File,
                 links,
                 total_size,
-                metadata: None,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -261,12 +265,12 @@ impl<S: Store> TreeBuilder<S> {
         let mut sub_trees: Vec<Link> = Vec::new();
 
         for batch in links.chunks(self.max_links) {
-            let batch_size: u64 = batch.iter().filter_map(|l| l.size).sum();
+            let batch_size: u64 = batch.iter().map(|l| l.size).sum();
 
             let node = TreeNode {
+                node_type: LinkType::File,
                 links: batch.to_vec(),
                 total_size: Some(batch_size),
-                metadata: None,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -277,8 +281,10 @@ impl<S: Store> TreeBuilder<S> {
             sub_trees.push(Link {
                 hash,
                 name: None,
-                size: Some(batch_size),
+                size: batch_size,
                 key: None,
+                link_type: LinkType::File, // subtree
+                meta: None,
             });
         }
 
@@ -291,7 +297,6 @@ impl<S: Store> TreeBuilder<S> {
     pub async fn put_directory(
         &self,
         entries: Vec<DirEntry>,
-        metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<Hash, BuilderError> {
         // Sort entries by name for deterministic hashing
         let mut sorted = entries;
@@ -303,18 +308,20 @@ impl<S: Store> TreeBuilder<S> {
                 hash: e.hash,
                 name: Some(e.name),
                 size: e.size,
-                key: None,
+                key: e.key,
+                link_type: e.link_type,
+                meta: e.meta,
             })
             .collect();
 
-        let total_size: u64 = links.iter().filter_map(|l| l.size).sum();
+        let total_size: u64 = links.iter().map(|l| l.size).sum();
 
         // Fits in one node
         if links.len() <= self.max_links {
             let node = TreeNode {
+                node_type: LinkType::Dir,
                 links,
                 total_size: Some(total_size),
-                metadata,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -342,7 +349,7 @@ impl<S: Store> TreeBuilder<S> {
         let max_group_size = groups.values().map(|g| g.len()).max().unwrap_or(0);
         if groups.len() == 1 || max_group_size > self.max_links {
             return self
-                .build_directory_by_chunks(links, total_size, metadata)
+                .build_directory_by_chunks(links, total_size)
                 .await;
         }
 
@@ -352,13 +359,13 @@ impl<S: Store> TreeBuilder<S> {
         sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (key, group_links) in sorted_groups {
-            let group_size: u64 = group_links.iter().filter_map(|l| l.size).sum();
+            let group_size: u64 = group_links.iter().map(|l| l.size).sum();
 
             if group_links.len() <= self.max_links {
                 let node = TreeNode {
+                    node_type: LinkType::Dir,
                     links: group_links,
                     total_size: Some(group_size),
-                    metadata: None,
                 };
                 let (data, hash) = encode_and_hash(&node)?;
                 self.store
@@ -368,24 +375,28 @@ impl<S: Store> TreeBuilder<S> {
                 sub_dirs.push(DirEntry {
                     name: format!("_{}", key),
                     hash,
-                    size: Some(group_size),
+                    size: group_size,
                     key: None,
+                    link_type: LinkType::Dir, // Internal chunk node
+                    meta: None,
                 });
             } else {
                 // Recursively split this group
                 let hash = self
-                    .build_directory_by_chunks(group_links, group_size, None)
+                    .build_directory_by_chunks(group_links, group_size)
                     .await?;
                 sub_dirs.push(DirEntry {
                     name: format!("_{}", key),
                     hash,
-                    size: Some(group_size),
+                    size: group_size,
                     key: None,
+                    link_type: LinkType::Dir, // Internal chunk node
+                    meta: None,
                 });
             }
         }
 
-        Box::pin(self.put_directory(sub_dirs, metadata)).await
+        Box::pin(self.put_directory(sub_dirs)).await
     }
 
     /// Split directory into numeric chunks when grouping doesn't help
@@ -393,17 +404,16 @@ impl<S: Store> TreeBuilder<S> {
         &self,
         links: Vec<Link>,
         total_size: u64,
-        metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<Hash, BuilderError> {
         let mut sub_trees: Vec<Link> = Vec::new();
 
         for (i, batch) in links.chunks(self.max_links).enumerate() {
-            let batch_size: u64 = batch.iter().filter_map(|l| l.size).sum();
+            let batch_size: u64 = batch.iter().map(|l| l.size).sum();
 
             let node = TreeNode {
+                node_type: LinkType::Dir,
                 links: batch.to_vec(),
                 total_size: Some(batch_size),
-                metadata: None,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -414,16 +424,18 @@ impl<S: Store> TreeBuilder<S> {
             sub_trees.push(Link {
                 hash,
                 name: Some(format!("_chunk_{}", i * self.max_links)),
-                size: Some(batch_size),
+                size: batch_size,
                 key: None,
+                link_type: LinkType::Dir, // Internal chunk node
+                meta: None,
             });
         }
 
         if sub_trees.len() <= self.max_links {
             let node = TreeNode {
+                node_type: LinkType::Dir,
                 links: sub_trees,
                 total_size: Some(total_size),
-                metadata,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -434,21 +446,20 @@ impl<S: Store> TreeBuilder<S> {
         }
 
         // Recursively build more levels
-        Box::pin(self.build_directory_by_chunks(sub_trees, total_size, metadata)).await
+        Box::pin(self.build_directory_by_chunks(sub_trees, total_size)).await
     }
 
-    /// Create a tree node with custom metadata
+    /// Create a tree node
     pub async fn put_tree_node(
         &self,
         links: Vec<Link>,
-        metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<Hash, BuilderError> {
-        let total_size: u64 = links.iter().filter_map(|l| l.size).sum();
+        let total_size: u64 = links.iter().map(|l| l.size).sum();
 
         let node = TreeNode {
+            node_type: LinkType::Dir,
             links,
             total_size: Some(total_size),
-            metadata,
         };
 
         let (data, hash) = encode_and_hash(&node)?;
@@ -523,8 +534,10 @@ impl<S: Store> StreamBuilder<S> {
         self.chunks.push(Link {
             hash,
             name: None,
-            size: Some(chunk.len() as u64),
+            size: chunk.len() as u64,
             key: None,
+            link_type: LinkType::Blob, // Leaf chunk (raw blob)
+            meta: None,
         });
 
         self.buffer = Vec::with_capacity(self.chunk_size);
@@ -550,8 +563,10 @@ impl<S: Store> StreamBuilder<S> {
             temp_chunks.push(Link {
                 hash,
                 name: None,
-                size: Some(chunk.len() as u64),
+                size: chunk.len() as u64,
                 key: None,
+                link_type: LinkType::Blob, // Leaf chunk (raw blob)
+                meta: None,
             });
         }
 
@@ -590,9 +605,9 @@ impl<S: Store> StreamBuilder<S> {
 
         if chunks.len() <= self.max_links {
             let node = TreeNode {
+                node_type: LinkType::File,
                 links: chunks.to_vec(),
                 total_size: Some(total_size),
-                metadata: None,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -605,12 +620,12 @@ impl<S: Store> StreamBuilder<S> {
         // Build intermediate level
         let mut sub_trees: Vec<Link> = Vec::new();
         for batch in chunks.chunks(self.max_links) {
-            let batch_size: u64 = batch.iter().filter_map(|l| l.size).sum();
+            let batch_size: u64 = batch.iter().map(|l| l.size).sum();
 
             let node = TreeNode {
+                node_type: LinkType::File,
                 links: batch.to_vec(),
                 total_size: Some(batch_size),
-                metadata: None,
             };
             let (data, hash) = encode_and_hash(&node)?;
             self.store
@@ -621,8 +636,10 @@ impl<S: Store> StreamBuilder<S> {
             sub_trees.push(Link {
                 hash,
                 name: None,
-                size: Some(batch_size),
+                size: batch_size,
                 key: None,
+                link_type: LinkType::File, // Internal tree node
+                meta: None,
             });
         }
 
@@ -744,7 +761,6 @@ mod tests {
                     DirEntry::new("a.txt", hash1).with_size(file1.len() as u64),
                     DirEntry::new("b.txt", hash2).with_size(file2.len() as u64),
                 ],
-                None,
             )
             .await
             .unwrap();
@@ -766,7 +782,6 @@ mod tests {
                     DirEntry::new("apple", hash),
                     DirEntry::new("mango", hash),
                 ],
-                None,
             )
             .await
             .unwrap();
@@ -779,25 +794,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_tree_node_with_metadata() {
+    async fn test_put_tree_node_with_link_meta() {
         let store = make_store();
         let builder = TreeBuilder::new(BuilderConfig::new(store.clone()));
 
         let hash = builder.put_blob(&[1u8]).await.unwrap();
 
-        let mut metadata = HashMap::new();
-        metadata.insert("version".to_string(), serde_json::json!(2));
-        metadata.insert("created".to_string(), serde_json::json!("2024-01-01"));
+        let mut meta = HashMap::new();
+        meta.insert("version".to_string(), serde_json::json!(2));
+        meta.insert("created".to_string(), serde_json::json!("2024-01-01"));
 
         let node_hash = builder
             .put_tree_node(
                 vec![Link {
                     hash,
                     name: Some("test".to_string()),
-                    size: Some(1),
+                    size: 1,
                     key: None,
+                    link_type: LinkType::Blob,
+                    meta: Some(meta.clone()),
                 }],
-                Some(metadata.clone()),
             )
             .await
             .unwrap();
@@ -805,8 +821,8 @@ mod tests {
         let data = store.get(&node_hash).await.unwrap().unwrap();
         let node = crate::codec::decode_tree_node(&data).unwrap();
 
-        assert!(node.metadata.is_some());
-        let m = node.metadata.unwrap();
+        assert!(node.links[0].meta.is_some());
+        let m = node.links[0].meta.as_ref().unwrap();
         assert_eq!(m.get("version"), Some(&serde_json::json!(2)));
     }
 

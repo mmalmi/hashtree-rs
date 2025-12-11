@@ -9,9 +9,10 @@
 //! 2. Converting HashMap metadata to BTreeMap before encoding (sorted keys)
 //!
 //! Format uses short keys for compact encoding:
-//! - t: type (1 = tree)
+//! - t: type (1 = File, 2 = Dir) - node type
 //! - l: links array
 //! - h: hash (in link)
+//! - t: type (in link, 0 = Blob, 1 = File, 2 = Dir)
 //! - n: name (in link, optional)
 //! - s: size (in link or total_size, optional)
 //! - m: metadata (optional)
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::hash::sha256;
-use crate::types::{Hash, Link, TreeNode};
+use crate::types::{Hash, Link, LinkType, TreeNode};
 
 /// Error type for codec operations
 #[derive(Debug, thiserror::Error)]
@@ -45,12 +46,14 @@ struct WireLink {
     /// Hash (required) - use serde_bytes for proper MessagePack binary encoding
     #[serde(with = "serde_bytes")]
     h: Vec<u8>,
+    /// Link type (0 = Blob, 1 = File, 2 = Dir)
+    #[serde(default)]
+    t: u8,
     /// Name (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     n: Option<String>,
-    /// Size (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    s: Option<u64>,
+    /// Size (required)
+    s: u64,
     /// Encryption key (optional) - use serde_bytes for proper MessagePack binary encoding
     #[serde(
         default,
@@ -58,6 +61,9 @@ struct WireLink {
         with = "option_bytes"
     )]
     k: Option<Vec<u8>>,
+    /// Metadata (optional) - uses BTreeMap for deterministic key ordering
+    #[serde(skip_serializing_if = "Option::is_none")]
+    m: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Helper module for optional bytes serialization
@@ -86,37 +92,36 @@ mod option_bytes {
 /// Wire format for a tree node (compact keys)
 #[derive(Serialize, Deserialize)]
 struct WireTreeNode {
-    /// Type (1 = tree)
+    /// Type (1 = File, 2 = Dir)
     t: u8,
     /// Links
     l: Vec<WireLink>,
     /// Total size (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<u64>,
-    /// Metadata (optional) - uses BTreeMap for deterministic key ordering
-    #[serde(skip_serializing_if = "Option::is_none")]
-    m: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Encode a tree node to MessagePack
 pub fn encode_tree_node(node: &TreeNode) -> Result<Vec<u8>, CodecError> {
-    // Convert HashMap to BTreeMap for deterministic key ordering
-    let sorted_metadata = node.metadata.as_ref().map(|m| m.iter().collect::<BTreeMap<_, _>>());
-
     let wire = WireTreeNode {
-        t: 1,
+        t: node.node_type as u8,
         l: node
             .links
             .iter()
-            .map(|link| WireLink {
-                h: link.hash.to_vec(),
-                n: link.name.clone(),
-                s: link.size,
-                k: link.key.map(|k| k.to_vec()),
+            .map(|link| {
+                // Convert HashMap to BTreeMap for deterministic key ordering
+                let sorted_meta = link.meta.as_ref().map(|m| m.iter().collect::<BTreeMap<_, _>>());
+                WireLink {
+                    h: link.hash.to_vec(),
+                    t: link.link_type as u8,
+                    n: link.name.clone(),
+                    s: link.size,
+                    k: link.key.map(|k| k.to_vec()),
+                    m: sorted_meta.map(|m| m.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                }
             })
             .collect(),
         s: node.total_size,
-        m: sorted_metadata.map(|m| m.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
     };
 
     rmp_serde::to_vec_named(&wire).map_err(|e| CodecError::MsgpackEncode(e.to_string()))
@@ -127,9 +132,10 @@ pub fn decode_tree_node(data: &[u8]) -> Result<TreeNode, CodecError> {
     let wire: WireTreeNode =
         rmp_serde::from_slice(data).map_err(|e| CodecError::MsgpackDecode(e.to_string()))?;
 
-    if wire.t != 1 {
-        return Err(CodecError::InvalidNodeType(wire.t));
-    }
+    // Validate node type (must be File=1 or Dir=2)
+    let node_type = LinkType::from_u8(wire.t)
+        .filter(|t| t.is_tree())
+        .ok_or(CodecError::InvalidNodeType(wire.t))?;
 
     let mut links = Vec::with_capacity(wire.l.len());
     for wl in wire.l {
@@ -148,21 +154,26 @@ pub fn decode_tree_node(data: &[u8]) -> Result<TreeNode, CodecError> {
             _ => None,
         };
 
+        // Link type defaults to Blob if not valid
+        let link_type = LinkType::from_u8(wl.t).unwrap_or(LinkType::Blob);
+
+        // Convert BTreeMap back to HashMap for the public API
+        let meta = wl.m.map(|m| m.into_iter().collect::<HashMap<_, _>>());
+
         links.push(Link {
             hash,
             name: wl.n,
             size: wl.s,
             key,
+            link_type,
+            meta,
         });
     }
 
-    // Convert BTreeMap back to HashMap for the public API
-    let metadata = wire.m.map(|m| m.into_iter().collect::<HashMap<_, _>>());
-
     Ok(TreeNode {
+        node_type,
         links,
         total_size: wire.s,
-        metadata,
     })
 }
 
@@ -173,26 +184,34 @@ pub fn encode_and_hash(node: &TreeNode) -> Result<(Vec<u8>, Hash), CodecError> {
     Ok((data, hash))
 }
 
-/// Check if data is a MessagePack-encoded tree node (vs raw blob)
-/// Tree nodes decode successfully with t=1
-pub fn is_tree_node(data: &[u8]) -> bool {
-    decode_tree_node(data).is_ok()
+/// Try to decode data as a tree node
+/// Returns Some(TreeNode) if valid tree node, None otherwise
+/// This is preferred over is_tree_node() to avoid double decoding
+pub fn try_decode_tree_node(data: &[u8]) -> Option<TreeNode> {
+    decode_tree_node(data).ok()
 }
 
-/// Check if data is a directory tree node (has named links)
-/// vs a chunked file tree node (links have no names)
+/// Get the type of data (Blob, File, or Dir)
+/// Returns LinkType::Blob for raw blobs that aren't tree nodes
+pub fn get_node_type(data: &[u8]) -> LinkType {
+    try_decode_tree_node(data)
+        .map(|n| n.node_type)
+        .unwrap_or(LinkType::Blob)
+}
+
+/// Check if data is a MessagePack-encoded tree node (vs raw blob)
+/// Tree nodes decode successfully with type = File or Dir
+/// Note: Prefer try_decode_tree_node() to avoid double decoding
+pub fn is_tree_node(data: &[u8]) -> bool {
+    try_decode_tree_node(data).is_some()
+}
+
+/// Check if data is a directory tree node (node_type == Dir)
+/// Note: Prefer try_decode_tree_node() to avoid double decoding
 pub fn is_directory_node(data: &[u8]) -> bool {
-    match decode_tree_node(data) {
-        Ok(node) => {
-            // Empty directory is still a directory
-            if node.links.is_empty() {
-                return true;
-            }
-            // Directory has named links, chunked file doesn't
-            node.links[0].name.is_some()
-        }
-        Err(_) => false,
-    }
+    try_decode_tree_node(data)
+        .map(|n| n.node_type == LinkType::Dir)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -202,12 +221,13 @@ mod tests {
 
     #[test]
     fn test_encode_decode_empty_tree() {
-        let node = TreeNode::new(vec![]);
+        let node = TreeNode::dir(vec![]);
 
         let encoded = encode_tree_node(&node).unwrap();
         let decoded = decode_tree_node(&encoded).unwrap();
 
         assert_eq!(decoded.links.len(), 0);
+        assert_eq!(decoded.node_type, LinkType::Dir);
     }
 
     #[test]
@@ -215,18 +235,22 @@ mod tests {
         let hash1 = [1u8; 32];
         let hash2 = [2u8; 32];
 
-        let node = TreeNode::new(vec![
+        let node = TreeNode::dir(vec![
             Link {
                 hash: hash1,
                 name: Some("file1.txt".to_string()),
-                size: Some(100),
+                size: 100,
                 key: None,
+                link_type: LinkType::Blob,
+                meta: None,
             },
             Link {
                 hash: hash2,
                 name: Some("dir".to_string()),
-                size: Some(500),
+                size: 0,
                 key: None,
+                link_type: LinkType::Dir,
+                meta: None,
             },
         ]);
 
@@ -235,14 +259,16 @@ mod tests {
 
         assert_eq!(decoded.links.len(), 2);
         assert_eq!(decoded.links[0].name, Some("file1.txt".to_string()));
-        assert_eq!(decoded.links[0].size, Some(100));
+        assert_eq!(decoded.links[0].size, 100);
+        assert_eq!(decoded.links[0].link_type, LinkType::Blob);
         assert_eq!(to_hex(&decoded.links[0].hash), to_hex(&hash1));
         assert_eq!(decoded.links[1].name, Some("dir".to_string()));
+        assert_eq!(decoded.links[1].link_type, LinkType::Dir);
     }
 
     #[test]
     fn test_preserve_total_size() {
-        let node = TreeNode::new(vec![]).with_total_size(12345);
+        let node = TreeNode::file(vec![]).with_total_size(12345);
 
         let encoded = encode_tree_node(&node).unwrap();
         let decoded = decode_tree_node(&encoded).unwrap();
@@ -251,39 +277,46 @@ mod tests {
     }
 
     #[test]
-    fn test_preserve_metadata() {
-        let mut metadata = HashMap::new();
-        metadata.insert("version".to_string(), serde_json::json!(1));
-        metadata.insert("author".to_string(), serde_json::json!("test"));
+    fn test_preserve_link_meta() {
+        let mut meta = HashMap::new();
+        meta.insert("createdAt".to_string(), serde_json::json!(1234567890));
+        meta.insert("mimeType".to_string(), serde_json::json!("image/png"));
 
-        let node = TreeNode::new(vec![]).with_metadata(metadata.clone());
+        let node = TreeNode::dir(vec![
+            Link::new([1u8; 32])
+                .with_name("file.png")
+                .with_size(1024)
+                .with_meta(meta.clone())
+        ]);
 
         let encoded = encode_tree_node(&node).unwrap();
         let decoded = decode_tree_node(&encoded).unwrap();
 
-        assert!(decoded.metadata.is_some());
-        let m = decoded.metadata.unwrap();
-        assert_eq!(m.get("version"), Some(&serde_json::json!(1)));
-        assert_eq!(m.get("author"), Some(&serde_json::json!("test")));
+        assert!(decoded.links[0].meta.is_some());
+        let m = decoded.links[0].meta.as_ref().unwrap();
+        assert_eq!(m.get("createdAt"), Some(&serde_json::json!(1234567890)));
+        assert_eq!(m.get("mimeType"), Some(&serde_json::json!("image/png")));
     }
 
     #[test]
     fn test_links_without_optional_fields() {
         let hash = [42u8; 32];
 
-        let node = TreeNode::new(vec![Link::new(hash)]);
+        let node = TreeNode::file(vec![Link::new(hash)]);
 
         let encoded = encode_tree_node(&node).unwrap();
         let decoded = decode_tree_node(&encoded).unwrap();
 
         assert_eq!(decoded.links[0].name, None);
-        assert_eq!(decoded.links[0].size, None);
+        assert_eq!(decoded.links[0].size, 0);
+        assert_eq!(decoded.links[0].link_type, LinkType::Blob);
+        assert_eq!(decoded.links[0].meta, None);
         assert_eq!(to_hex(&decoded.links[0].hash), to_hex(&hash));
     }
 
     #[test]
     fn test_encode_and_hash() {
-        let node = TreeNode::new(vec![]);
+        let node = TreeNode::dir(vec![]);
 
         let (data, hash) = encode_and_hash(&node).unwrap();
         let expected_hash = sha256(&data);
@@ -293,11 +326,13 @@ mod tests {
 
     #[test]
     fn test_encode_and_hash_consistent() {
-        let node = TreeNode::new(vec![Link {
+        let node = TreeNode::dir(vec![Link {
             hash: [1u8; 32],
             name: Some("test".to_string()),
-            size: None,
+            size: 100,
             key: None,
+            link_type: LinkType::Blob,
+            meta: None,
         }]);
 
         let (_, hash1) = encode_and_hash(&node).unwrap();
@@ -308,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_is_tree_node() {
-        let node = TreeNode::new(vec![]);
+        let node = TreeNode::dir(vec![]);
         let encoded = encode_tree_node(&node).unwrap();
 
         assert!(is_tree_node(&encoded));
@@ -328,11 +363,13 @@ mod tests {
 
     #[test]
     fn test_is_directory_node() {
-        let node = TreeNode::new(vec![Link {
+        let node = TreeNode::dir(vec![Link {
             hash: [1u8; 32],
             name: Some("file.txt".to_string()),
-            size: None,
+            size: 100,
             key: None,
+            link_type: LinkType::Blob,
+            meta: None,
         }]);
         let encoded = encode_tree_node(&node).unwrap();
 
@@ -341,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_is_directory_node_empty() {
-        let node = TreeNode::new(vec![]);
+        let node = TreeNode::dir(vec![]);
         let encoded = encode_tree_node(&node).unwrap();
 
         assert!(is_directory_node(&encoded));
@@ -349,7 +386,8 @@ mod tests {
 
     #[test]
     fn test_is_not_directory_node() {
-        let node = TreeNode::new(vec![Link::new([1u8; 32])]);
+        // A File node is not a directory
+        let node = TreeNode::file(vec![Link::new([1u8; 32])]);
         let encoded = encode_tree_node(&node).unwrap();
 
         assert!(!is_directory_node(&encoded));
@@ -360,11 +398,13 @@ mod tests {
         let hash = [1u8; 32];
         let key = [2u8; 32];
 
-        let node = TreeNode::new(vec![Link {
+        let node = TreeNode::dir(vec![Link {
             hash,
             name: Some("encrypted.dat".to_string()),
-            size: Some(1024),
+            size: 1024,
             key: Some(key),
+            link_type: LinkType::Blob,
+            meta: None,
         }]);
 
         let encoded = encode_tree_node(&node).unwrap();
@@ -379,12 +419,14 @@ mod tests {
         // This is critical for content-addressed storage where hash must be stable
         let hash = [42u8; 32];
 
-        let node = TreeNode::new(vec![
+        let node = TreeNode::dir(vec![
             Link {
                 hash,
                 name: Some("file.txt".to_string()),
-                size: Some(100),
+                size: 100,
                 key: None,
+                link_type: LinkType::Blob,
+                meta: None,
             },
         ]);
 
@@ -398,24 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_determinism() {
-        // Test that metadata encoding is deterministic regardless of HashMap insertion order
+    fn test_link_meta_determinism() {
+        // Test that link meta encoding is deterministic regardless of HashMap insertion order
         // We use BTreeMap internally to ensure sorted keys
         let hash = [1u8; 32];
 
-        // Create metadata with keys in different orders
-        let mut metadata1 = HashMap::new();
-        metadata1.insert("zebra".to_string(), serde_json::json!("last"));
-        metadata1.insert("alpha".to_string(), serde_json::json!("first"));
-        metadata1.insert("middle".to_string(), serde_json::json!("mid"));
+        // Create meta with keys in different orders
+        let mut meta1 = HashMap::new();
+        meta1.insert("zebra".to_string(), serde_json::json!("last"));
+        meta1.insert("alpha".to_string(), serde_json::json!("first"));
+        meta1.insert("middle".to_string(), serde_json::json!("mid"));
 
-        let mut metadata2 = HashMap::new();
-        metadata2.insert("alpha".to_string(), serde_json::json!("first"));
-        metadata2.insert("middle".to_string(), serde_json::json!("mid"));
-        metadata2.insert("zebra".to_string(), serde_json::json!("last"));
+        let mut meta2 = HashMap::new();
+        meta2.insert("alpha".to_string(), serde_json::json!("first"));
+        meta2.insert("middle".to_string(), serde_json::json!("mid"));
+        meta2.insert("zebra".to_string(), serde_json::json!("last"));
 
-        let node1 = TreeNode::new(vec![Link::new(hash)]).with_metadata(metadata1);
-        let node2 = TreeNode::new(vec![Link::new(hash)]).with_metadata(metadata2);
+        let node1 = TreeNode::dir(vec![Link::new(hash).with_name("file").with_size(100).with_meta(meta1)]);
+        let node2 = TreeNode::dir(vec![Link::new(hash).with_name("file").with_size(100).with_meta(meta2)]);
 
         let encoded1 = encode_tree_node(&node1).unwrap();
         let encoded2 = encode_tree_node(&node2).unwrap();
@@ -423,12 +465,43 @@ mod tests {
         // Both should produce identical bytes (keys sorted alphabetically)
         assert_eq!(
             encoded1, encoded2,
-            "Metadata encoding should be deterministic regardless of insertion order"
+            "Link meta encoding should be deterministic regardless of insertion order"
         );
 
         // Verify the hash is also identical
         let hash1 = crate::hash::sha256(&encoded1);
         let hash2 = crate::hash::sha256(&encoded2);
         assert_eq!(hash1, hash2, "Hashes should match for identical content");
+    }
+
+    #[test]
+    fn test_get_node_type() {
+        let dir_node = TreeNode::dir(vec![]);
+        let dir_encoded = encode_tree_node(&dir_node).unwrap();
+        assert_eq!(get_node_type(&dir_encoded), LinkType::Dir);
+
+        let file_node = TreeNode::file(vec![]);
+        let file_encoded = encode_tree_node(&file_node).unwrap();
+        assert_eq!(get_node_type(&file_encoded), LinkType::File);
+
+        // Raw blob returns Blob type
+        let blob = vec![1u8, 2, 3, 4, 5];
+        assert_eq!(get_node_type(&blob), LinkType::Blob);
+    }
+
+    #[test]
+    fn test_link_type_roundtrip() {
+        let node = TreeNode::dir(vec![
+            Link::new([1u8; 32]).with_link_type(LinkType::Blob),
+            Link::new([2u8; 32]).with_link_type(LinkType::File),
+            Link::new([3u8; 32]).with_link_type(LinkType::Dir),
+        ]);
+
+        let encoded = encode_tree_node(&node).unwrap();
+        let decoded = decode_tree_node(&encoded).unwrap();
+
+        assert_eq!(decoded.links[0].link_type, LinkType::Blob);
+        assert_eq!(decoded.links[1].link_type, LinkType::File);
+        assert_eq!(decoded.links[2].link_type, LinkType::Dir);
     }
 }

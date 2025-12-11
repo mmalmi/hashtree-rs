@@ -4,7 +4,7 @@
 //! hashes and MessagePack encodings as the TypeScript implementation.
 
 use hashtree::{
-    sha256, encode_tree_node, to_hex, from_hex, Link, TreeNode,
+    sha256, encode_tree_node, to_hex, from_hex, Link, LinkType, TreeNode,
     HashTree, HashTreeConfig, MemoryStore,
 };
 use serde::Deserialize;
@@ -37,10 +37,13 @@ struct NodeInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LinkInput {
     hash: String,
     name: Option<String>,
     size: Option<u64>,
+    #[serde(default)]
+    is_tree_node: bool,
 }
 
 #[allow(dead_code)]
@@ -95,54 +98,54 @@ fn test_tree_node_encoding_vectors() {
             Link {
                 hash,
                 name: l.name.clone(),
-                size: l.size,
+                size: l.size.unwrap_or(0),
                 key: None,
+                // is_tree_node: true means it's a Dir, false means Blob (for interop with old format)
+                link_type: if l.is_tree_node { LinkType::Dir } else { LinkType::Blob },
+                meta: None,
             }
         }).collect();
 
-        let mut node = TreeNode::new(links);
+        // Determine node type: File only if ALL links are unnamed (chunks), Dir otherwise
+        // An empty node is considered Dir (empty directory)
+        let all_links_unnamed = !node_input.links.is_empty() && node_input.links.iter().all(|l| l.name.is_none());
+        let node_type = if all_links_unnamed { LinkType::File } else { LinkType::Dir };
+        let mut node = TreeNode::new(node_type, links);
         if let Some(total_size) = node_input.total_size {
             node = node.with_total_size(total_size);
         }
-        if let Some(ref metadata) = node_input.metadata {
-            node = node.with_metadata(metadata.clone());
-        }
+        // Note: TreeNode no longer has metadata - metadata now lives on individual links
+        // The interop vectors with metadata are for the old format, so we skip those checks
 
         // Encode and hash
         let encoded = encode_tree_node(&node).unwrap();
         let hash = sha256(&encoded);
 
-        // Verify MessagePack matches (only for non-metadata cases, as HashMap order is not deterministic)
-        if let Some(ref expected_msgpack) = vector.expected.msgpack {
-            if node_input.metadata.is_none() {
-                assert_eq!(
-                    hex::encode(&encoded),
-                    *expected_msgpack,
-                    "MessagePack mismatch for {}",
-                    vector.name
-                );
-                println!("✓ {}: MessagePack matches", vector.name);
-            } else {
-                // For metadata cases, just verify it roundtrips correctly
-                let decoded = hashtree::decode_tree_node(&encoded).unwrap();
-                assert_eq!(decoded.metadata, node.metadata, "Metadata roundtrip failed for {}", vector.name);
-                println!("✓ {}: metadata roundtrips correctly", vector.name);
-            }
+        // Skip vectors with metadata - those are for the old format
+        if node_input.metadata.is_some() {
+            println!("⊘ {}: skipped (old format with TreeNode.metadata)", vector.name);
+            continue;
         }
 
-        // Verify hash matches (note: metadata ordering affects hash, so we skip strict hash match for metadata)
-        if node_input.metadata.is_none() {
+        // Verify MessagePack matches
+        if let Some(ref expected_msgpack) = vector.expected.msgpack {
             assert_eq!(
-                to_hex(&hash),
-                vector.expected.hash,
-                "Hash mismatch for {}",
+                hex::encode(&encoded),
+                *expected_msgpack,
+                "MessagePack mismatch for {}",
                 vector.name
             );
-            println!("✓ {}: hash matches", vector.name);
-        } else {
-            // For metadata, hash may differ due to key ordering - just verify encoding/decoding works
-            println!("✓ {}: encoding/decoding works (hash varies due to key order)", vector.name);
+            println!("✓ {}: MessagePack matches", vector.name);
         }
+
+        // Verify hash matches
+        assert_eq!(
+            to_hex(&hash),
+            vector.expected.hash,
+            "Hash mismatch for {}",
+            vector.name
+        );
+        println!("✓ {}: hash matches", vector.name);
     }
 }
 
@@ -252,7 +255,7 @@ fn generate_msgpack_vectors() {
     println!("\n=== MessagePack Test Vectors ===\n");
 
     // Empty tree node
-    let node = TreeNode::new(vec![]);
+    let node = TreeNode::new(LinkType::Dir, vec![]);
     let encoded = encode_tree_node(&node).unwrap();
     let hash = sha256(&encoded);
     println!("tree_node_empty:");
@@ -262,11 +265,13 @@ fn generate_msgpack_vectors() {
 
     // Single link
     let hash1: [u8; 32] = from_hex("abababababababababababababababababababababababababababababababab").unwrap();
-    let node = TreeNode::new(vec![Link {
+    let node = TreeNode::new(LinkType::Dir, vec![Link {
         hash: hash1,
         name: Some("test.txt".to_string()),
-        size: Some(100),
+        size: 100,
         key: None,
+        link_type: LinkType::Blob,
+        meta: None,
     }]);
     let encoded = encode_tree_node(&node).unwrap();
     let hash = sha256(&encoded);
@@ -279,10 +284,10 @@ fn generate_msgpack_vectors() {
     let h1 = from_hex("0101010101010101010101010101010101010101010101010101010101010101").unwrap();
     let h2 = from_hex("0202020202020202020202020202020202020202020202020202020202020202").unwrap();
     let h3 = from_hex("0303030303030303030303030303030303030303030303030303030303030303").unwrap();
-    let node = TreeNode::new(vec![
-        Link { hash: h1, name: Some("a.txt".to_string()), size: Some(10), key: None },
-        Link { hash: h2, name: Some("b.txt".to_string()), size: Some(20), key: None },
-        Link { hash: h3, name: Some("c.txt".to_string()), size: Some(30), key: None },
+    let node = TreeNode::new(LinkType::Dir, vec![
+        Link { hash: h1, name: Some("a.txt".to_string()), size: 10, key: None, link_type: LinkType::Blob, meta: None },
+        Link { hash: h2, name: Some("b.txt".to_string()), size: 20, key: None, link_type: LinkType::Blob, meta: None },
+        Link { hash: h3, name: Some("c.txt".to_string()), size: 30, key: None, link_type: LinkType::Blob, meta: None },
     ]).with_total_size(60);
     let encoded = encode_tree_node(&node).unwrap();
     let hash = sha256(&encoded);
@@ -294,9 +299,9 @@ fn generate_msgpack_vectors() {
     // Unnamed links
     let ha = from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     let hb = from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-    let node = TreeNode::new(vec![
-        Link { hash: ha, name: None, size: Some(100), key: None },
-        Link { hash: hb, name: None, size: Some(50), key: None },
+    let node = TreeNode::new(LinkType::File, vec![
+        Link { hash: ha, name: None, size: 100, key: None, link_type: LinkType::Blob, meta: None },
+        Link { hash: hb, name: None, size: 50, key: None, link_type: LinkType::Blob, meta: None },
     ]).with_total_size(150);
     let encoded = encode_tree_node(&node).unwrap();
     let hash = sha256(&encoded);
@@ -305,17 +310,17 @@ fn generate_msgpack_vectors() {
     println!("  hash: {}", to_hex(&hash));
     println!();
 
-    // With metadata (sorted keys for determinism)
+    // With link meta (sorted keys for determinism)
     let hc = from_hex("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap();
-    let mut metadata = HashMap::new();
-    metadata.insert("author".to_string(), serde_json::json!("test"));
-    metadata.insert("version".to_string(), serde_json::json!(1));
-    let node = TreeNode::new(vec![
-        Link { hash: hc, name: None, size: None, key: None },
-    ]).with_metadata(metadata);
+    let mut link_meta = HashMap::new();
+    link_meta.insert("author".to_string(), serde_json::json!("test"));
+    link_meta.insert("version".to_string(), serde_json::json!(1));
+    let node = TreeNode::new(LinkType::Dir, vec![
+        Link { hash: hc, name: None, size: 0, key: None, link_type: LinkType::Blob, meta: Some(link_meta) },
+    ]);
     let encoded = encode_tree_node(&node).unwrap();
     let hash = sha256(&encoded);
-    println!("tree_node_with_metadata:");
+    println!("tree_node_with_link_meta:");
     println!("  msgpack: {}", hex::encode(&encoded));
     println!("  hash: {}", to_hex(&hash));
 }

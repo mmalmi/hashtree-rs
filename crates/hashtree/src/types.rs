@@ -5,6 +5,37 @@
 
 use std::collections::HashMap;
 
+/// Link type - distinguishes blobs, chunked files, and directories
+/// Uses small integer values for efficient MessagePack encoding
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum LinkType {
+    /// Raw blob data (not a tree node)
+    #[default]
+    Blob = 0,
+    /// Chunked file (tree node with unnamed links)
+    File = 1,
+    /// Directory (tree node with named links)
+    Dir = 2,
+}
+
+impl LinkType {
+    /// Create from u8 value
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(LinkType::Blob),
+            1 => Some(LinkType::File),
+            2 => Some(LinkType::Dir),
+            _ => None,
+        }
+    }
+
+    /// Check if this type represents a tree node (File or Dir)
+    pub fn is_tree(&self) -> bool {
+        matches!(self, LinkType::File | LinkType::Dir)
+    }
+}
+
 /// 32-byte SHA256 hash used as content address
 pub type Hash = [u8; 32];
 
@@ -36,10 +67,15 @@ pub struct Link {
     pub hash: Hash,
     /// Optional name (for directory entries)
     pub name: Option<String>,
-    /// Size of subtree in bytes (for efficient seeks)
-    pub size: Option<u64>,
+    /// Size of subtree in bytes (for efficient seeks). 0 for Dir links.
+    pub size: u64,
     /// Optional decryption key for encrypted links (CHK: content hash)
     pub key: Option<[u8; 32]>,
+    /// Type of content this link points to (Blob, File, or Dir)
+    /// Always set explicitly - no probing needed during tree traversal
+    pub link_type: LinkType,
+    /// Optional metadata (for directory entries: createdAt, mimeType, thumbnail, etc.)
+    pub meta: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl Link {
@@ -47,8 +83,10 @@ impl Link {
         Self {
             hash,
             name: None,
-            size: None,
+            size: 0,
             key: None,
+            link_type: LinkType::Blob, // Default to Blob (raw data)
+            meta: None,
         }
     }
 
@@ -58,7 +96,7 @@ impl Link {
     }
 
     pub fn with_size(mut self, size: u64) -> Self {
-        self.size = Some(size);
+        self.size = size;
         self
     }
 
@@ -66,31 +104,52 @@ impl Link {
         self.key = Some(key);
         self
     }
+
+    pub fn with_link_type(mut self, link_type: LinkType) -> Self {
+        self.link_type = link_type;
+        self
+    }
+
+    pub fn with_meta(mut self, meta: std::collections::HashMap<String, serde_json::Value>) -> Self {
+        self.meta = Some(meta);
+        self
+    }
 }
 
 /// Tree node - contains links to children
 /// Stored as: SHA256(msgpack(TreeNode)) -> msgpack(TreeNode)
 ///
-/// For directories: links have names
-/// For chunked files: links are ordered chunks
+/// For directories: links have names, node_type = Dir
+/// For chunked files: links are ordered chunks, node_type = File
 /// For large directories: links can be other tree nodes (fanout)
 #[derive(Debug, Clone, PartialEq)]
 pub struct TreeNode {
+    /// Type of this node (File or Dir)
+    pub node_type: LinkType,
     /// Links to child nodes
     pub links: Vec<Link>,
     /// Total size of all data in this subtree
     pub total_size: Option<u64>,
-    /// Optional metadata
-    pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl TreeNode {
-    pub fn new(links: Vec<Link>) -> Self {
+    /// Create a new tree node with specified type
+    pub fn new(node_type: LinkType, links: Vec<Link>) -> Self {
         Self {
+            node_type,
             links,
             total_size: None,
-            metadata: None,
         }
+    }
+
+    /// Create a File node (chunked file)
+    pub fn file(links: Vec<Link>) -> Self {
+        Self::new(LinkType::File, links)
+    }
+
+    /// Create a Dir node (directory)
+    pub fn dir(links: Vec<Link>) -> Self {
+        Self::new(LinkType::Dir, links)
     }
 
     pub fn with_total_size(mut self, size: u64) -> Self {
@@ -98,9 +157,14 @@ impl TreeNode {
         self
     }
 
-    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
-        self.metadata = Some(metadata);
-        self
+    /// Check if this is a directory node
+    pub fn is_dir(&self) -> bool {
+        self.node_type == LinkType::Dir
+    }
+
+    /// Check if this is a file node
+    pub fn is_file(&self) -> bool {
+        self.node_type == LinkType::File
     }
 }
 
@@ -191,8 +255,12 @@ impl std::error::Error for CidParseError {}
 pub struct DirEntry {
     pub name: String,
     pub hash: Hash,
-    pub size: Option<u64>,
+    pub size: u64,
     pub key: Option<[u8; 32]>,
+    /// Type of content this entry points to (Blob, File, or Dir)
+    pub link_type: LinkType,
+    /// Optional metadata (createdAt, mimeType, thumbnail, etc.)
+    pub meta: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl DirEntry {
@@ -200,8 +268,10 @@ impl DirEntry {
         Self {
             name: name.into(),
             hash,
-            size: None,
+            size: 0,
             key: None,
+            link_type: LinkType::Blob, // Default to Blob (raw data)
+            meta: None,
         }
     }
 
@@ -210,18 +280,30 @@ impl DirEntry {
         Self {
             name: name.into(),
             hash: cid.hash,
-            size: Some(cid.size),
+            size: cid.size,
             key: cid.key,
+            link_type: LinkType::Blob, // Caller should set this appropriately
+            meta: None,
         }
     }
 
     pub fn with_size(mut self, size: u64) -> Self {
-        self.size = Some(size);
+        self.size = size;
         self
     }
 
     pub fn with_key(mut self, key: [u8; 32]) -> Self {
         self.key = Some(key);
+        self
+    }
+
+    pub fn with_link_type(mut self, link_type: LinkType) -> Self {
+        self.link_type = link_type;
+        self
+    }
+
+    pub fn with_meta(mut self, meta: std::collections::HashMap<String, serde_json::Value>) -> Self {
+        self.meta = Some(meta);
         self
     }
 }

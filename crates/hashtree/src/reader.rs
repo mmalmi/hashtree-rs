@@ -2,11 +2,12 @@
 //!
 //! Read files and directories from content-addressed storage
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::codec::{decode_tree_node, is_directory_node, is_tree_node};
+use crate::codec::{decode_tree_node, is_directory_node, is_tree_node, try_decode_tree_node};
 use crate::store::Store;
-use crate::types::{to_hex, Cid, Hash, Link, TreeNode};
+use crate::types::{to_hex, Cid, Hash, Link, LinkType, TreeNode};
 
 #[cfg(feature = "encryption")]
 use crate::crypto::{decrypt_chk, EncryptionKey};
@@ -16,10 +17,13 @@ use crate::crypto::{decrypt_chk, EncryptionKey};
 pub struct TreeEntry {
     pub name: String,
     pub hash: Hash,
-    pub size: Option<u64>,
-    pub is_tree: bool,
+    pub size: u64,
+    /// Type of content this entry points to (Blob, File, or Dir)
+    pub link_type: LinkType,
     /// Optional decryption key (for encrypted content)
     pub key: Option<[u8; 32]>,
+    /// Optional metadata (createdAt, mimeType, thumbnail, etc.)
+    pub meta: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Walk entry for tree traversal
@@ -27,8 +31,9 @@ pub struct TreeEntry {
 pub struct WalkEntry {
     pub path: String,
     pub hash: Hash,
-    pub is_tree: bool,
-    pub size: Option<u64>,
+    /// Type of content this entry points to (Blob, File, or Dir)
+    pub link_type: LinkType,
+    pub size: u64,
     /// Optional decryption key (for encrypted content)
     pub key: Option<[u8; 32]>,
 }
@@ -287,13 +292,13 @@ impl<S: Store> TreeReader<S> {
                 }
             }
 
-            let child_is_dir = self.is_directory(&link.hash).await?;
             entries.push(TreeEntry {
                 name: link.name.clone().unwrap_or_else(|| to_hex(&link.hash)),
                 hash: link.hash,
                 size: link.size,
-                is_tree: child_is_dir,
+                link_type: link.link_type,
                 key: link.key,
+                meta: link.meta.clone(),
             });
         }
 
@@ -380,10 +385,7 @@ impl<S: Store> TreeReader<S> {
         // Calculate from children
         let mut total = 0u64;
         for link in &node.links {
-            total += match link.size {
-                Some(s) => s,
-                None => Box::pin(self.get_size(&link.hash)).await?,
-            };
+            total += link.size;
         }
         Ok(total)
     }
@@ -406,23 +408,25 @@ impl<S: Store> TreeReader<S> {
             None => return Ok(()),
         };
 
-        if !is_tree_node(&data) {
-            entries.push(WalkEntry {
-                path: path.to_string(),
-                hash: *hash,
-                is_tree: false,
-                size: Some(data.len() as u64),
-                key: None, // TreeReader doesn't track keys
-            });
-            return Ok(());
-        }
+        let node = match try_decode_tree_node(&data) {
+            Some(n) => n,
+            None => {
+                entries.push(WalkEntry {
+                    path: path.to_string(),
+                    hash: *hash,
+                    link_type: LinkType::Blob,
+                    size: data.len() as u64,
+                    key: None, // TreeReader doesn't track keys
+                });
+                return Ok(());
+            }
+        };
 
-        let node = decode_tree_node(&data).map_err(ReaderError::Codec)?;
         entries.push(WalkEntry {
             path: path.to_string(),
             hash: *hash,
-            is_tree: true,
-            size: node.total_size,
+            link_type: node.node_type,
+            size: node.total_size.unwrap_or(0),
             key: None, // directories are not encrypted
         });
 
@@ -558,7 +562,7 @@ mod tests {
 
         let file_hash = builder.put_blob(&[1u8]).await.unwrap();
         let dir_hash = builder
-            .put_directory(vec![DirEntry::new("test.txt", file_hash).with_size(1)], None)
+            .put_directory(vec![DirEntry::new("test.txt", file_hash).with_size(1)])
             .await
             .unwrap();
 
@@ -586,7 +590,7 @@ mod tests {
 
         let file_hash = builder.put_blob(&[1u8]).await.unwrap();
         let dir_hash = builder
-            .put_directory(vec![DirEntry::new("test.txt", file_hash)], None)
+            .put_directory(vec![DirEntry::new("test.txt", file_hash)])
             .await
             .unwrap();
 
@@ -641,7 +645,6 @@ mod tests {
                     DirEntry::new("first.txt", h1).with_size(1),
                     DirEntry::new("second.txt", h2).with_size(1),
                 ],
-                None,
             )
             .await
             .unwrap();
@@ -663,7 +666,7 @@ mod tests {
         let file_hash = builder.put_blob(&file_data).await.unwrap();
 
         let dir_hash = builder
-            .put_directory(vec![DirEntry::new("test.txt", file_hash)], None)
+            .put_directory(vec![DirEntry::new("test.txt", file_hash)])
             .await
             .unwrap();
 
@@ -680,17 +683,17 @@ mod tests {
         let file_hash = builder.put_blob(&[1u8]).await.unwrap();
 
         let sub_sub_dir = builder
-            .put_directory(vec![DirEntry::new("deep.txt", file_hash)], None)
+            .put_directory(vec![DirEntry::new("deep.txt", file_hash)])
             .await
             .unwrap();
 
         let sub_dir = builder
-            .put_directory(vec![DirEntry::new("level2", sub_sub_dir)], None)
+            .put_directory(vec![DirEntry::new("level2", sub_sub_dir)])
             .await
             .unwrap();
 
         let root_dir = builder
-            .put_directory(vec![DirEntry::new("level1", sub_dir)], None)
+            .put_directory(vec![DirEntry::new("level1", sub_dir)])
             .await
             .unwrap();
 
@@ -723,7 +726,7 @@ mod tests {
         let f2 = builder.put_blob(&[2u8, 3]).await.unwrap();
 
         let sub_dir = builder
-            .put_directory(vec![DirEntry::new("nested.txt", f2).with_size(2)], None)
+            .put_directory(vec![DirEntry::new("nested.txt", f2).with_size(2)])
             .await
             .unwrap();
 
@@ -733,7 +736,6 @@ mod tests {
                     DirEntry::new("root.txt", f1).with_size(1),
                     DirEntry::new("sub", sub_dir),
                 ],
-                None,
             )
             .await
             .unwrap();

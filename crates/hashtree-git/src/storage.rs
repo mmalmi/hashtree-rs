@@ -19,7 +19,7 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use hashtree::{sha256, HashTree, HashTreeConfig, DirEntry, Store, Cid};
+use hashtree::{sha256, HashTree, HashTreeConfig, DirEntry, Store, Cid, LinkType};
 use hashtree_lmdb::LmdbBlobStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -358,7 +358,7 @@ impl GitStorage {
             }
 
             let root_cid = tree
-                .put_directory(root_entries, None)
+                .put_directory(root_entries)
                 .await
                 .map_err(|e| Error::StorageError(format!("build tree: {}", e)))?;
 
@@ -530,7 +530,7 @@ async fn build_objects_dir<S: Store>(
     }
 
     tree
-        .put_directory(entries, None)
+        .put_directory(entries)
         .await
         .map(|cid| cid.hash)
         .map_err(|e| Error::StorageError(format!("put objects dir: {}", e)))
@@ -583,7 +583,7 @@ async fn build_refs_dir<S: Store>(
                 cat_entries.push(DirEntry::new(name, hash).with_size(value.len() as u64));
             }
             let cat_cid = tree
-                .put_directory(cat_entries, None)
+                .put_directory(cat_entries)
                 .await
                 .map_err(|e| Error::StorageError(format!("put {} dir: {}", category, e)))?;
             ref_entries.push(DirEntry::new(category, cat_cid.hash));
@@ -600,7 +600,7 @@ async fn build_refs_dir<S: Store>(
     }
 
     tree
-        .put_directory(ref_entries, None)
+        .put_directory(ref_entries)
         .await
         .map(|cid| cid.hash)
         .map_err(|e| Error::StorageError(format!("put refs dir: {}", e)))
@@ -633,7 +633,7 @@ async fn build_git_dir<S: Store>(
     }
 
     tree
-        .put_directory(git_entries, None)
+        .put_directory(git_entries)
         .await
         .map(|cid| cid.hash)
         .map_err(|e| Error::StorageError(format!("put .git dir: {}", e)))
@@ -678,7 +678,7 @@ async fn build_working_tree<S: Store>(
     for (dir_name, sub_entries) in dirs {
         let sub_dir_entries = build_working_tree_recursive(tree, sub_entries).await?;
         let dir_cid = tree
-            .put_directory(sub_dir_entries, None)
+            .put_directory(sub_dir_entries)
             .await
             .map_err(|e| Error::StorageError(format!("put dir {}: {}", dir_name, e)))?;
         result.push(DirEntry::new(dir_name, dir_cid.hash));
@@ -724,7 +724,7 @@ async fn build_working_tree_recursive<S: Store>(
     for (dir_name, sub_entries) in dirs {
         let sub_dir_entries = Box::pin(build_working_tree_recursive(tree, sub_entries)).await?;
         let dir_cid = tree
-            .put_directory(sub_dir_entries, None)
+            .put_directory(sub_dir_entries)
             .await
             .map_err(|e| Error::StorageError(format!("put dir {}: {}", dir_name, e)))?;
         result.push(DirEntry::new(dir_name, dir_cid.hash));
@@ -750,7 +750,7 @@ async fn load_tree_recursive<S: Store>(
 
     for entry in entries {
         // Skip directory entries, only process files
-        if entry.is_tree {
+        if entry.link_type.is_tree() {
             continue;
         }
 

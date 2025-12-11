@@ -61,8 +61,8 @@ pub use builder::{BEP52_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_LINKS};
 
 // Low-level codec
 pub use codec::{
-    decode_tree_node, encode_and_hash, encode_tree_node, is_directory_node, is_tree_node,
-    CodecError,
+    decode_tree_node, encode_and_hash, encode_tree_node, get_node_type, is_directory_node,
+    is_tree_node, try_decode_tree_node, CodecError,
 };
 pub use hash::{sha256, verify};
 
@@ -71,7 +71,7 @@ pub use reader::{verify_tree, ReaderError, TreeEntry, VerifyResult, WalkEntry};
 
 // Store
 pub use store::{MemoryStore, Store, StoreError};
-pub use types::{from_hex, hash_equals, to_hex, Cid, CidParseError, DirEntry, Hash, Link, PutResult, TreeNode};
+pub use types::{from_hex, hash_equals, to_hex, Cid, CidParseError, DirEntry, Hash, Link, LinkType, PutResult, TreeNode};
 pub use nhash::{
     decode as nhash_or_nref_decode, is_nhash, is_nref, nhash_decode, nhash_encode,
     nhash_encode_full, nref_decode, nref_encode, DecodeResult, NHashData, NHashError, NRefData,
