@@ -41,20 +41,12 @@ pub enum CodecError {
 }
 
 /// Wire format for a link (compact keys)
-/// Field order must match TypeScript: h, s, t, n?, k?, m?
+/// Fields are ordered alphabetically for canonical encoding: h, k?, m?, n?, s, t
 #[derive(Serialize, Deserialize)]
 struct WireLink {
     /// Hash (required) - use serde_bytes for proper MessagePack binary encoding
     #[serde(with = "serde_bytes")]
     h: Vec<u8>,
-    /// Size (required)
-    s: u64,
-    /// Link type (0 = Blob, 1 = File, 2 = Dir)
-    #[serde(default)]
-    t: u8,
-    /// Name (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    n: Option<String>,
     /// Encryption key (optional) - use serde_bytes for proper MessagePack binary encoding
     #[serde(
         default,
@@ -65,6 +57,14 @@ struct WireLink {
     /// Metadata (optional) - uses BTreeMap for deterministic key ordering
     #[serde(skip_serializing_if = "Option::is_none")]
     m: Option<BTreeMap<String, serde_json::Value>>,
+    /// Name (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n: Option<String>,
+    /// Size (required)
+    s: u64,
+    /// Link type (0 = Blob, 1 = File, 2 = Dir)
+    #[serde(default)]
+    t: u8,
 }
 
 /// Helper module for optional bytes serialization
@@ -91,15 +91,16 @@ mod option_bytes {
 }
 
 /// Wire format for a tree node (compact keys)
+/// Fields are ordered alphabetically for canonical encoding: l, s?, t
 #[derive(Serialize, Deserialize)]
 struct WireTreeNode {
-    /// Type (1 = File, 2 = Dir)
-    t: u8,
     /// Links
     l: Vec<WireLink>,
     /// Total size (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<u64>,
+    /// Type (1 = File, 2 = Dir)
+    t: u8,
 }
 
 /// Encode a tree node to MessagePack
