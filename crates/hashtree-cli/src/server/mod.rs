@@ -33,11 +33,15 @@ pub struct HashtreeServer {
 
 impl HashtreeServer {
     pub fn new(store: Arc<HashtreeStore>, addr: String) -> Self {
+        // Create shared peer registry for HTTP handlers and WebSocket
+        let peers = Arc::new(data_ws::PeerRegistry::new());
+
         Self {
             state: AppState {
                 store,
                 auth: None,
                 ndb_query: None,
+                peers: Some(peers),
             },
             relay_state: None,
             git_storage: None,
@@ -139,8 +143,10 @@ impl HashtreeServer {
         }
 
         // Add data WebSocket endpoint for P2P file sharing (same protocol as WebRTC)
+        // Uses shared peer registry so HTTP handlers can also query peers
         if self.enable_data_ws {
-            let data_ws_state = data_ws::DataWsState::new(self.state.store.clone());
+            let peers = self.state.peers.clone().unwrap_or_else(|| Arc::new(data_ws::PeerRegistry::new()));
+            let data_ws_state = data_ws::DataWsState::with_peers(self.state.store.clone(), peers);
             let data_ws_routes = Router::new()
                 .route("/ws/data", get(data_ws::data_ws_handler))
                 .with_state(data_ws_state);
@@ -164,7 +170,10 @@ impl HashtreeServer {
             .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024)); // 10GB limit
 
         let listener = tokio::net::TcpListener::bind(&self.addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        ).await?;
 
         Ok(())
     }

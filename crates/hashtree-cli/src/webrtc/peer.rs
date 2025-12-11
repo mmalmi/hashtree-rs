@@ -21,7 +21,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use super::types::{DataMessage, PeerDirection, PeerId, SignalingMessage};
+use super::types::{DataMessage, DataRequest, DataResponse, PeerDirection, PeerId, SignalingMessage, encode_message, encode_request, encode_response, parse_message, hash_to_hex};
 
 /// Trait for content storage that can be used by WebRTC peers
 pub trait ContentStore: Send + Sync + 'static {
@@ -29,9 +29,9 @@ pub trait ContentStore: Send + Sync + 'static {
     fn get(&self, hash_hex: &str) -> Result<Option<Vec<u8>>>;
 }
 
-/// Pending request tracking
+/// Pending request tracking (keyed by hash hex)
 struct PendingRequest {
-    hash: String,
+    hash: Vec<u8>,
     response_tx: oneshot::Sender<Option<Vec<u8>>>,
 }
 
@@ -50,9 +50,8 @@ pub struct Peer {
     // Content store for serving requests
     store: Option<Arc<dyn ContentStore>>,
 
-    // Track pending outgoing requests
-    pending_requests: Arc<Mutex<HashMap<u32, PendingRequest>>>,
-    next_request_id: Arc<std::sync::atomic::AtomicU32>,
+    // Track pending outgoing requests (keyed by hash hex)
+    pending_requests: Arc<Mutex<HashMap<String, PendingRequest>>>,
 
     // Channel for incoming data messages
     message_tx: mpsc::Sender<(DataMessage, Option<Vec<u8>>)>,
@@ -125,7 +124,6 @@ impl Peer {
             my_peer_id,
             store,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
-            next_request_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             message_tx,
             message_rx: Some(message_rx),
         })
@@ -325,7 +323,7 @@ impl Peer {
         dc: Arc<RTCDataChannel>,
         peer_id: PeerId,
         message_tx: mpsc::Sender<(DataMessage, Option<Vec<u8>>)>,
-        pending_requests: Arc<Mutex<HashMap<u32, PendingRequest>>>,
+        pending_requests: Arc<Mutex<HashMap<String, PendingRequest>>>,
         store: Option<Arc<dyn ContentStore>>,
     ) {
         let label = dc.label().to_string();
@@ -355,123 +353,67 @@ impl Peer {
             let store = store_clone.clone();
 
             Box::pin(async move {
-                if msg.is_string {
-                    // JSON message
-                    if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
-                        trace!("[Peer {}] Received JSON: {}", peer_short, text);
+                // All messages are binary with type prefix + MessagePack body
+                if let Ok(data_msg) = parse_message(&msg.data) {
+                    match data_msg {
+                        DataMessage::Request(req) => {
+                            let hash_hex = hash_to_hex(&req.h);
+                            let hash_short = &hash_hex[..8.min(hash_hex.len())];
+                            debug!(
+                                "[Peer {}] Received request for {}",
+                                peer_short, hash_short
+                            );
 
-                        if let Ok(data_msg) = serde_json::from_str::<DataMessage>(&text) {
-                            match &data_msg {
-                                DataMessage::Request { id, hash } => {
-                                    debug!(
-                                        "[Peer {}] Received request {} for {}",
-                                        peer_short, id, &hash[..8.min(hash.len())]
-                                    );
-
-                                    // Handle request - look up in store
-                                    let (found, data) = if let Some(ref store) = store {
-                                        match store.get(hash) {
-                                            Ok(Some(data)) => (true, Some(data)),
-                                            Ok(None) => (false, None),
-                                            Err(e) => {
-                                                warn!("[Peer {}] Store error: {}", peer_short, e);
-                                                (false, None)
-                                            }
-                                        }
-                                    } else {
-                                        (false, None)
-                                    };
-
-                                    // Send response
-                                    let response = DataMessage::Response {
-                                        id: *id,
-                                        hash: hash.clone(),
-                                        found,
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&response) {
-                                        if let Err(e) = dc.send_text(json).await {
-                                            error!(
-                                                "[Peer {}] Failed to send response: {}",
-                                                peer_short, e
-                                            );
-                                        }
-                                    }
-
-                                    // Send binary data if found
-                                    if let Some(data) = data {
-                                        // Format: [4 bytes request_id (little-endian)][data]
-                                        let mut packet = Vec::with_capacity(4 + data.len());
-                                        packet.extend_from_slice(&id.to_le_bytes());
-                                        packet.extend_from_slice(&data);
-
-                                        if let Err(e) = dc.send(&Bytes::from(packet)).await {
-                                            error!(
-                                                "[Peer {}] Failed to send binary data: {}",
-                                                peer_short, e
-                                            );
-                                        } else {
-                                            debug!(
-                                                "[Peer {}] Sent {} bytes for request {}",
-                                                peer_short,
-                                                data.len(),
-                                                id
-                                            );
-                                        }
+                            // Handle request - look up in store
+                            let data = if let Some(ref store) = store {
+                                match store.get(&hash_hex) {
+                                    Ok(Some(data)) => Some(data),
+                                    Ok(None) => None,
+                                    Err(e) => {
+                                        warn!("[Peer {}] Store error: {}", peer_short, e);
+                                        None
                                     }
                                 }
-                                DataMessage::Response { id, hash, found } => {
-                                    debug!(
-                                        "[Peer {}] Received response {} for {}: found={}",
-                                        peer_short,
-                                        id,
-                                        &hash[..8.min(hash.len())],
-                                        found
-                                    );
+                            } else {
+                                None
+                            };
 
-                                    if *found {
-                                        // Expect binary data next
-                                        *pending_binary.lock().await = Some(*id);
+                            // Send response only if we have data
+                            if let Some(data) = data {
+                                let response = DataResponse {
+                                    h: req.h,
+                                    d: data,
+                                };
+                                if let Ok(wire) = encode_response(&response) {
+                                    if let Err(e) = dc.send(&Bytes::from(wire)).await {
+                                        error!(
+                                            "[Peer {}] Failed to send response: {}",
+                                            peer_short, e
+                                        );
                                     } else {
-                                        // Not found - resolve request with None
-                                        let mut pending = pending_requests.lock().await;
-                                        if let Some(req) = pending.remove(id) {
-                                            let _ = req.response_tx.send(None);
-                                        }
+                                        debug!(
+                                            "[Peer {}] Sent response for {}",
+                                            peer_short, hash_short
+                                        );
                                     }
-                                }
-                                _ => {
-                                    // Forward other messages
-                                    let _ = message_tx.send((data_msg, None)).await;
                                 }
                             }
+                            // If not found, stay silent - requester will timeout
                         }
-                    }
-                } else {
-                    // Binary message - should follow a response with found=true
-                    let data = msg.data.to_vec();
-                    trace!("[Peer {}] Received {} bytes binary", peer_short, data.len());
+                        DataMessage::Response(res) => {
+                            let hash_hex = hash_to_hex(&res.h);
+                            let hash_short = &hash_hex[..8.min(hash_hex.len())];
+                            debug!(
+                                "[Peer {}] Received response for {} ({} bytes)",
+                                peer_short, hash_short, res.d.len()
+                            );
 
-                    if data.len() >= 4 {
-                        // Extract request ID
-                        let request_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                        let payload = data[4..].to_vec();
-
-                        debug!(
-                            "[Peer {}] Binary data for request {}: {} bytes",
-                            peer_short,
-                            request_id,
-                            payload.len()
-                        );
-
-                        // Resolve the pending request
-                        let mut pending = pending_requests.lock().await;
-                        if let Some(req) = pending.remove(&request_id) {
-                            // TODO: Verify hash matches
-                            let _ = req.response_tx.send(Some(payload));
+                            // Resolve the pending request by hash
+                            let mut pending = pending_requests.lock().await;
+                            if let Some(req) = pending.remove(&hash_hex) {
+                                let _ = req.response_tx.send(Some(res.d));
+                            }
                         }
-
-                        // Clear pending binary
-                        *pending_binary.lock().await = None;
                     }
                 }
             })
@@ -490,37 +432,36 @@ impl Peer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No data channel"))?;
 
-        let request_id = self
-            .next_request_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Convert hex to binary hash
+        let hash = hex::decode(hash_hex)
+            .map_err(|e| anyhow::anyhow!("Invalid hex hash: {}", e))?;
 
         // Create response channel
         let (tx, rx) = oneshot::channel();
 
-        // Store pending request
+        // Store pending request (keyed by hash hex)
         {
             let mut pending = self.pending_requests.lock().await;
             pending.insert(
-                request_id,
+                hash_hex.to_string(),
                 PendingRequest {
-                    hash: hash_hex.to_string(),
+                    hash: hash.clone(),
                     response_tx: tx,
                 },
             );
         }
 
-        // Send request
-        let request = DataMessage::Request {
-            id: request_id,
-            hash: hash_hex.to_string(),
+        // Send request with MAX_HTL (fresh request from us)
+        let req = DataRequest {
+            h: hash,
+            htl: crate::webrtc::types::MAX_HTL,
         };
-        let json = serde_json::to_string(&request)?;
-        dc.send_text(json).await?;
+        let wire = encode_request(&req)?;
+        dc.send(&Bytes::from(wire)).await?;
 
         debug!(
-            "[Peer {}] Sent request {} for {}",
+            "[Peer {}] Sent request for {}",
             self.peer_id.short(),
-            request_id,
             &hash_hex[..8.min(hash_hex.len())]
         );
 
@@ -534,17 +475,17 @@ impl Peer {
             Err(_) => {
                 // Timeout - clean up pending request
                 let mut pending = self.pending_requests.lock().await;
-                pending.remove(&request_id);
+                pending.remove(hash_hex);
                 Ok(None)
             }
         }
     }
 
-    /// Send a JSON message over the data channel
+    /// Send a message over the data channel
     pub async fn send_message(&self, msg: &DataMessage) -> Result<()> {
         if let Some(ref dc) = self.data_channel {
-            let json = serde_json::to_string(msg)?;
-            dc.send_text(json).await?;
+            let wire = encode_message(msg)?;
+            dc.send(&Bytes::from(wire)).await?;
         }
         Ok(())
     }

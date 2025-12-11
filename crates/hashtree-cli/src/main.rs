@@ -563,7 +563,7 @@ async fn main() -> Result<()> {
                     }
                     for (i, link) in node.links.iter().enumerate() {
                         let name = link.name.as_ref().map(|n| n.as_str()).unwrap_or("<unnamed>");
-                        let size_str = link.size.map(|s| format!("{} bytes", s)).unwrap_or_else(|| "?".to_string());
+                        let size_str = format!("{} bytes", link.size);
                         println!("    [{}] {} -> {} ({})", i, name, hashtree::to_hex(&link.hash), size_str);
                     }
                 }
@@ -918,7 +918,7 @@ async fn add_directory<S: hashtree::store::Store>(
             }
         }
 
-        let cid = tree.put_directory(entries, None).await
+        let cid = tree.put_directory(entries).await
             .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))?;
 
         dir_cids.insert(dir_path, cid);

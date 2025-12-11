@@ -1,6 +1,72 @@
 //! WebRTC signaling types compatible with iris-client and hashtree-ts
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+
+// HTL (Hops To Live) constants - Freenet-style probabilistic decrement
+pub const MAX_HTL: u8 = 10;
+pub const DECREMENT_AT_MAX_PROB: f64 = 0.5;  // 50% chance to decrement at max
+pub const DECREMENT_AT_MIN_PROB: f64 = 0.25; // 25% chance to decrement at 1
+
+/// Per-peer HTL decrement configuration (Freenet-style)
+/// Stored per peer connection to prevent probing attacks
+#[derive(Debug, Clone)]
+pub struct PeerHTLConfig {
+    pub decrement_at_max: bool,  // Whether to decrement when HTL is at max
+    pub decrement_at_min: bool,  // Whether to decrement when HTL is 1
+}
+
+impl PeerHTLConfig {
+    /// Generate random HTL decrement config for a new peer connection
+    /// This is decided once per peer, not per request, to prevent probing
+    pub fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        Self {
+            decrement_at_max: rng.gen_bool(DECREMENT_AT_MAX_PROB),
+            decrement_at_min: rng.gen_bool(DECREMENT_AT_MIN_PROB),
+        }
+    }
+}
+
+impl Default for PeerHTLConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Decrement HTL using Freenet-style probabilistic rules
+/// - At max HTL: probabilistic decrement (50% by default)
+/// - At HTL=1: probabilistic decrement (25% by default)
+/// - Otherwise: always decrement
+///
+/// Returns new HTL value
+pub fn decrement_htl(htl: u8, config: &PeerHTLConfig) -> u8 {
+    // Clamp to max
+    let htl = htl.min(MAX_HTL);
+
+    // Already dead
+    if htl == 0 {
+        return 0;
+    }
+
+    // At max: probabilistic decrement
+    if htl == MAX_HTL {
+        return if config.decrement_at_max { htl - 1 } else { htl };
+    }
+
+    // At min (1): probabilistic decrement
+    if htl == 1 {
+        return if config.decrement_at_min { 0 } else { htl };
+    }
+
+    // Middle: always decrement
+    htl - 1
+}
+
+/// Check if a request should be forwarded based on HTL
+pub fn should_forward(htl: u8) -> bool {
+    htl > 0
+}
 
 /// Event kind for WebRTC signaling (same as iris-client's KIND_APP_DATA)
 pub const WEBRTC_KIND: u64 = 30078;
@@ -329,26 +395,96 @@ impl std::fmt::Display for PeerDirection {
     }
 }
 
+/// Message type bytes (prefix before MessagePack body)
+pub const MSG_TYPE_REQUEST: u8 = 0x00;
+pub const MSG_TYPE_RESPONSE: u8 = 0x01;
+
 /// Hashtree data channel protocol messages
 /// Shared between WebRTC data channels and WebSocket transport
+///
+/// Wire format: [type byte][msgpack body]
+/// Request:  [0x00][msgpack: {h: bytes32, htl?: u8}]
+/// Response: [0x01][msgpack: {h: bytes32, d: bytes}]
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+pub struct DataRequest {
+    #[serde(with = "serde_bytes")]
+    pub h: Vec<u8>,  // 32-byte hash
+    #[serde(default = "default_htl", skip_serializing_if = "is_max_htl")]
+    pub htl: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataResponse {
+    #[serde(with = "serde_bytes")]
+    pub h: Vec<u8>,  // 32-byte hash
+    #[serde(with = "serde_bytes")]
+    pub d: Vec<u8>,  // Data
+}
+
+#[derive(Debug, Clone)]
 pub enum DataMessage {
-    #[serde(rename = "req")]
-    Request { id: u32, hash: String },
+    Request(DataRequest),
+    Response(DataResponse),
+}
 
-    #[serde(rename = "res")]
-    Response { id: u32, hash: String, found: bool },
+fn default_htl() -> u8 {
+    MAX_HTL
+}
 
-    #[serde(rename = "push")]
-    Push { hash: String },
+fn is_max_htl(htl: &u8) -> bool {
+    *htl == MAX_HTL
+}
 
-    #[serde(rename = "have")]
-    Have { hashes: Vec<String> },
+/// Encode a request to wire format: [0x00][msgpack body]
+pub fn encode_request(req: &DataRequest) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let body = rmp_serde::to_vec(req)?;
+    let mut result = Vec::with_capacity(1 + body.len());
+    result.push(MSG_TYPE_REQUEST);
+    result.extend(body);
+    Ok(result)
+}
 
-    #[serde(rename = "want")]
-    Want { hashes: Vec<String> },
+/// Encode a response to wire format: [0x01][msgpack body]
+pub fn encode_response(res: &DataResponse) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let body = rmp_serde::to_vec(res)?;
+    let mut result = Vec::with_capacity(1 + body.len());
+    result.push(MSG_TYPE_RESPONSE);
+    result.extend(body);
+    Ok(result)
+}
 
-    #[serde(rename = "root")]
-    Root { hash: String },
+/// Parse a wire format message
+pub fn parse_message(data: &[u8]) -> Result<DataMessage, rmp_serde::decode::Error> {
+    if data.is_empty() {
+        return Err(rmp_serde::decode::Error::LengthMismatch(0));
+    }
+
+    let msg_type = data[0];
+    let body = &data[1..];
+
+    match msg_type {
+        MSG_TYPE_REQUEST => {
+            let req: DataRequest = rmp_serde::from_slice(body)?;
+            Ok(DataMessage::Request(req))
+        }
+        MSG_TYPE_RESPONSE => {
+            let res: DataResponse = rmp_serde::from_slice(body)?;
+            Ok(DataMessage::Response(res))
+        }
+        _ => Err(rmp_serde::decode::Error::LengthMismatch(msg_type as u32)),
+    }
+}
+
+/// Convert hash to hex string for logging/map keys
+pub fn hash_to_hex(hash: &[u8]) -> String {
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Encode a DataMessage to wire format (deprecated - use encode_request/encode_response)
+pub fn encode_message(msg: &DataMessage) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    match msg {
+        DataMessage::Request(req) => encode_request(req),
+        DataMessage::Response(res) => encode_response(res),
+    }
 }

@@ -266,7 +266,7 @@ impl HashtreeStore {
                 }
             }
 
-            let cid = tree.put_directory(entries, None).await
+            let cid = tree.put_directory(entries).await
                 .map_err(|e| anyhow::anyhow!("Failed to create directory node: {}", e))?;
 
             dir_cids.insert(dir_path, cid);
@@ -553,7 +553,7 @@ impl HashtreeStore {
 
             // Extract chunk info from links
             let chunk_cids: Vec<String> = node.links.iter().map(|l| to_hex(&l.hash)).collect();
-            let chunk_sizes: Vec<u64> = node.links.iter().map(|l| l.size.unwrap_or(0)).collect();
+            let chunk_sizes: Vec<u64> = node.links.iter().map(|l| l.size).collect();
 
             Ok(Some(FileChunkMetadata {
                 total_size,
@@ -687,8 +687,8 @@ impl HashtreeStore {
             let entries: Vec<DirEntry> = tree_entries.into_iter().map(|e| DirEntry {
                 name: e.name,
                 cid: to_hex(&e.hash),
-                is_directory: e.is_tree,
-                size: e.size.unwrap_or(0),
+                is_directory: e.link_type.is_tree(),
+                size: e.size,
             }).collect();
 
             Ok(Some(DirectoryListing {

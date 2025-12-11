@@ -208,11 +208,19 @@ async fn serve_content_internal(
 
 /// Serve content by CID or blossom SHA256 hash
 /// Tries CID first, then falls back to blossom lookup if input looks like SHA256
+/// If not found locally, queries connected WebSocket/WebRTC peers
 pub async fn serve_content_or_blob(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
+    connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> impl IntoResponse {
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| connect_info.0.ip().to_string());
     // Parse potential extension for blossom
     let (hash_part, _ext) = if let Some(dot_pos) = id.rfind('.') {
         (&id[..dot_pos], Some(&id[dot_pos..]))
@@ -237,7 +245,49 @@ pub async fn serve_content_or_blob(
         }
     }
 
-    // Not found in either
+    // Not found locally - try querying connected peers
+    // Use peer_id 0 to exclude no one (HTTP request, not from a peer)
+    // Rate limited per client IP to prevent abuse (10 queries/second/client)
+    if is_sha256 {
+        if let Some(ref peers) = state.peers {
+            // Check rate limit for this client before querying peers
+            if peers.check_http_rate_limit(&client_ip).await {
+                let hash_hex = hash_part.to_lowercase();
+                tracing::debug!("Hash {} not found locally, querying peers", &hash_hex[..16.min(hash_hex.len())]);
+
+                // Convert hex to binary hash
+                let hash_bytes = match hex::decode(&hash_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("Invalid hash format"))
+                            .unwrap_or_else(|_| Response::new(Body::from("Error")));
+                    }
+                };
+
+                // Use MAX_HTL for HTTP requests (they're fresh requests from gateway)
+                if let Some(data) = peers.forward_request(0, &hash_bytes, crate::webrtc::types::MAX_HTL).await {
+                    // Cache locally for future requests
+                    if let Err(e) = state.store.put_blob(&data) {
+                        tracing::warn!("Failed to cache peer data: {}", e);
+                    }
+
+                    // Return the data directly
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, data.len())
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(Body::from(data))
+                        .unwrap()
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    // Not found anywhere
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")

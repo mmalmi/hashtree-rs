@@ -1,8 +1,8 @@
 //! WebSocket endpoint for hashtree data exchange
 //!
-//! Speaks the same protocol as WebRTC data channels in hashtree-ts:
-//! - JSON messages: req, res, push, have, want, root
-//! - Binary messages: [4-byte LE request_id][data]
+//! Wire format: [type byte][msgpack body]
+//! Request:  [0x00][msgpack: {h: bytes32, htl?: u8}]
+//! Response: [0x01][msgpack: {h: bytes32, d: bytes}]
 //!
 //! This allows hashtree-ts to fall back to WebSocket when WebRTC fails.
 //! The server can also forward requests to other connected peers.
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, error, warn};
 
 use crate::storage::HashtreeStore;
-use crate::webrtc::types::DataMessage;
+use crate::webrtc::types::{DataMessage, DataRequest, DataResponse, PeerHTLConfig, MAX_HTL, decrement_htl, should_forward, encode_request, encode_response, parse_message, hash_to_hex};
 
 /// Delay between sequential peer queries (ms)
 const PEER_QUERY_DELAY_MS: u64 = 500;
@@ -36,20 +36,31 @@ const PEER_QUERY_TIMEOUT_MS: u64 = 2000;
 /// A connected peer
 struct Peer {
     tx: mpsc::Sender<Message>,
+    /// Per-peer HTL config (Freenet-style probabilistic)
+    htl_config: PeerHTLConfig,
 }
 
 /// Max number of hashes to track per peer (LRU eviction after this)
 const MAX_REQUESTED_HASHES_PER_PEER: usize = 1000;
 
+/// Rate limit: max peer queries per window per client
+const HTTP_PEER_QUERY_LIMIT: usize = 10;
+/// Rate limit window in seconds
+const HTTP_PEER_QUERY_WINDOW_SECS: u64 = 10;
+/// Max clients to track for rate limiting (LRU eviction)
+const MAX_RATE_LIMIT_CLIENTS: usize = 1000;
+
 /// Registry of all connected peers
 pub struct PeerRegistry {
     peers: RwLock<HashMap<u64, Peer>>,
     next_id: RwLock<u64>,
-    /// Pending requests waiting for responses from peers
-    pending_requests: RwLock<HashMap<(u64, u32), oneshot::Sender<Option<Vec<u8>>>>>,
+    /// Pending requests waiting for responses from peers (keyed by peer_id + hash_hex)
+    pending_requests: RwLock<HashMap<(u64, String), oneshot::Sender<Option<Vec<u8>>>>>,
     /// Track hashes we've already requested from each peer (peer_id -> LRU cache of hashes)
     /// Value is () since we only care about presence
     requested_from_peer: Mutex<HashMap<u64, LruCache<String, ()>>>,
+    /// Rate limiter for HTTP peer queries per client IP
+    http_rate_limits: Mutex<LruCache<String, Vec<std::time::Instant>>>,
 }
 
 impl PeerRegistry {
@@ -59,6 +70,32 @@ impl PeerRegistry {
             next_id: RwLock::new(1),
             pending_requests: RwLock::new(HashMap::new()),
             requested_from_peer: Mutex::new(HashMap::new()),
+            http_rate_limits: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_RATE_LIMIT_CLIENTS).unwrap()
+            )),
+        }
+    }
+
+    /// Check if HTTP peer query is allowed for a client (rate limiting)
+    /// Returns true if allowed, false if rate limited
+    pub async fn check_http_rate_limit(&self, client_id: &str) -> bool {
+        let mut rate_limits = self.http_rate_limits.lock().await;
+        let now = std::time::Instant::now();
+        let window = Duration::from_secs(HTTP_PEER_QUERY_WINDOW_SECS);
+
+        // Get or create timestamps for this client
+        let timestamps = rate_limits.get_or_insert_mut(client_id.to_string(), Vec::new);
+
+        // Remove old timestamps outside the window
+        timestamps.retain(|t| now.duration_since(*t) < window);
+
+        if timestamps.len() >= HTTP_PEER_QUERY_LIMIT {
+            debug!("HTTP peer query rate limited for {} ({} queries in {}s)",
+                   client_id, timestamps.len(), HTTP_PEER_QUERY_WINDOW_SECS);
+            false
+        } else {
+            timestamps.push(now);
+            true
         }
     }
 
@@ -68,9 +105,18 @@ impl PeerRegistry {
         *next_id += 1;
 
         let mut peers = self.peers.write().await;
-        peers.insert(id, Peer { tx });
+        peers.insert(id, Peer {
+            tx,
+            htl_config: PeerHTLConfig::new(),
+        });
         debug!("Peer {} registered, total: {}", id, peers.len());
         id
+    }
+
+    /// Get the HTL config for a peer
+    async fn get_htl_config(&self, peer_id: u64) -> Option<PeerHTLConfig> {
+        let peers = self.peers.read().await;
+        peers.get(&peer_id).map(|p| p.htl_config.clone())
     }
 
     async fn unregister(&self, id: u64) {
@@ -86,12 +132,18 @@ impl PeerRegistry {
 
     /// Forward a request to other peers (excluding the requester)
     /// Returns data if any peer has it, None otherwise
-    async fn forward_request(&self, exclude_peer: u64, hash: &str) -> Option<Vec<u8>> {
+    /// Used by WebSocket handler and HTTP handler for peer queries
+    /// @param hash - Binary 32-byte hash
+    /// @param htl - Hops To Live (will be decremented per-peer before sending)
+    pub async fn forward_request(&self, exclude_peer: u64, hash: &[u8], htl: u8) -> Option<Vec<u8>> {
+        let hash_hex = hash_to_hex(hash);
+        let hash_short = &hash_hex[..16.min(hash_hex.len())];
+
         let peers = self.peers.read().await;
-        let other_peers: Vec<(u64, mpsc::Sender<Message>)> = peers
+        let other_peers: Vec<(u64, mpsc::Sender<Message>, PeerHTLConfig)> = peers
             .iter()
             .filter(|(id, _)| **id != exclude_peer)
-            .map(|(id, p)| (*id, p.tx.clone()))
+            .map(|(id, p)| (*id, p.tx.clone(), p.htl_config.clone()))
             .collect();
         drop(peers);
 
@@ -103,9 +155,9 @@ impl PeerRegistry {
         let mut requested = self.requested_from_peer.lock().await;
         let peers_to_query: Vec<_> = other_peers
             .into_iter()
-            .filter(|(peer_id, _)| {
+            .filter(|(peer_id, _, _)| {
                 if let Some(cache) = requested.get(peer_id) {
-                    !cache.contains(hash)
+                    !cache.contains(&hash_hex)
                 } else {
                     true
                 }
@@ -114,43 +166,46 @@ impl PeerRegistry {
         drop(requested);
 
         if peers_to_query.is_empty() {
-            debug!("Already requested {} from all peers, skipping", &hash[..16.min(hash.len())]);
+            debug!("Already requested {} from all peers, skipping", hash_short);
             return None;
         }
 
-        debug!("Forwarding request for {} to {} peers", &hash[..16.min(hash.len())], peers_to_query.len());
+        debug!("Forwarding request for {} to {} peers", hash_short, peers_to_query.len());
 
         // Query peers sequentially with delay
-        for (peer_id, tx) in peers_to_query {
+        for (peer_id, tx, htl_config) in peers_to_query {
+            // Decrement HTL using this peer's config before sending
+            let peer_htl = decrement_htl(htl, &htl_config);
+
+            // Skip this peer if HTL expired
+            if !should_forward(peer_htl) {
+                debug!("HTL expired for peer {}, skipping", peer_id);
+                continue;
+            }
+
             // Mark this hash as requested from this peer
             {
                 let mut requested = self.requested_from_peer.lock().await;
                 let cache = requested.entry(peer_id).or_insert_with(|| {
                     LruCache::new(NonZeroUsize::new(MAX_REQUESTED_HASHES_PER_PEER).unwrap())
                 });
-                cache.put(hash.to_string(), ());
+                cache.put(hash_hex.clone(), ());
             }
 
-            // Create a unique request ID for this forward
-            let forward_id = {
-                let next_id = self.next_id.read().await;
-                (*next_id as u32).wrapping_add(peer_id as u32)
-            };
-
-            // Set up response channel
+            // Set up response channel (keyed by hash since no request IDs)
             let (resp_tx, resp_rx) = oneshot::channel();
             {
                 let mut pending = self.pending_requests.write().await;
-                pending.insert((peer_id, forward_id), resp_tx);
+                pending.insert((peer_id, hash_hex.clone()), resp_tx);
             }
 
-            // Send request to peer
-            let req = DataMessage::Request {
-                id: forward_id,
-                hash: hash.to_string(),
+            // Send request to peer with the decremented HTL
+            let req = DataRequest {
+                h: hash.to_vec(),
+                htl: peer_htl,
             };
-            if let Ok(json) = serde_json::to_string(&req) {
-                let _ = tx.send(Message::Text(json)).await;
+            if let Ok(wire) = encode_request(&req) {
+                let _ = tx.send(Message::Binary(wire)).await;
             }
 
             // Wait for response with timeout
@@ -163,22 +218,22 @@ impl PeerRegistry {
             // Clean up pending request
             {
                 let mut pending = self.pending_requests.write().await;
-                pending.remove(&(peer_id, forward_id));
+                pending.remove(&(peer_id, hash_hex.clone()));
             }
 
             match result {
                 Ok(Ok(Some(data))) => {
-                    debug!("Got data from peer {} for {}", peer_id, &hash[..16.min(hash.len())]);
+                    debug!("Got data from peer {} for {}", peer_id, hash_short);
                     return Some(data);
                 }
                 Ok(Ok(None)) => {
-                    debug!("Peer {} doesn't have {}", peer_id, &hash[..16.min(hash.len())]);
+                    debug!("Peer {} doesn't have {}", peer_id, hash_short);
                 }
                 Ok(Err(_)) => {
                     debug!("Peer {} channel closed", peer_id);
                 }
                 Err(_) => {
-                    debug!("Peer {} timeout for {}", peer_id, &hash[..16.min(hash.len())]);
+                    debug!("Peer {} timeout for {}", peer_id, hash_short);
                 }
             }
         }
@@ -187,9 +242,10 @@ impl PeerRegistry {
     }
 
     /// Handle a response from a peer (for forwarded requests)
-    async fn handle_peer_response(&self, peer_id: u64, id: u32, data: Option<Vec<u8>>) {
+    async fn handle_peer_response(&self, peer_id: u64, hash: &[u8], data: Option<Vec<u8>>) {
+        let hash_hex = hash_to_hex(hash);
         let mut pending = self.pending_requests.write().await;
-        if let Some(tx) = pending.remove(&(peer_id, id)) {
+        if let Some(tx) = pending.remove(&(peer_id, hash_hex)) {
             let _ = tx.send(data);
         }
     }
@@ -208,6 +264,11 @@ impl DataWsState {
             store,
             peers: Arc::new(PeerRegistry::new()),
         }
+    }
+
+    /// Create with an existing peer registry (shared with HTTP handlers)
+    pub fn with_peers(store: Arc<HashtreeStore>, peers: Arc<PeerRegistry>) -> Self {
+        Self { store, peers }
     }
 }
 
@@ -236,25 +297,16 @@ async fn handle_data_socket(socket: WebSocket, state: DataWsState) {
         }
     });
 
-    // Process incoming messages
+    // Process incoming messages (all MessagePack encoded)
     while let Some(result) = ws_rx.next().await {
         match result {
-            Ok(Message::Text(text)) => {
-                if let Err(e) = handle_json_message(&text, peer_id, &state, &tx).await {
-                    warn!("Error handling JSON message: {}", e);
-                }
-            }
             Ok(Message::Binary(data)) => {
-                // Binary data is a response to a forwarded request
-                // Format: [4-byte LE request_id][data]
-                if data.len() >= 4 {
-                    let id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    let payload = data[4..].to_vec();
-                    state.peers.handle_peer_response(peer_id, id, Some(payload)).await;
+                if let Err(e) = handle_message(&data, peer_id, &state, &tx).await {
+                    warn!("Error handling message: {}", e);
                 }
             }
             Ok(Message::Close(_)) => break,
-            Ok(_) => {} // Ping/Pong handled by axum
+            Ok(_) => {} // Ping/Pong handled by axum, Text ignored (protocol is MessagePack only)
             Err(e) => {
                 error!("WebSocket error: {}", e);
                 break;
@@ -268,50 +320,22 @@ async fn handle_data_socket(socket: WebSocket, state: DataWsState) {
     let _ = send_task.await;
 }
 
-/// Handle a JSON data message
-async fn handle_json_message(
-    text: &str,
+/// Handle a MessagePack data message
+async fn handle_message(
+    data: &[u8],
     peer_id: u64,
     state: &DataWsState,
     tx: &mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
-    let msg: DataMessage = serde_json::from_str(text)?;
+    let msg = parse_message(data)?;
 
     match msg {
-        DataMessage::Request { id, hash } => {
-            handle_request(id, &hash, peer_id, state, tx).await?;
+        DataMessage::Request(req) => {
+            handle_request(&req.h, req.htl, peer_id, state, tx).await?;
         }
-        DataMessage::Response { id, found, .. } => {
-            // Response from a peer - if not found, notify pending request
-            if !found {
-                state.peers.handle_peer_response(peer_id, id, None).await;
-            }
-            // If found, binary data will follow
-        }
-        DataMessage::Want { hashes } => {
-            // Client wants multiple hashes - respond with what we have
-            for hash in hashes {
-                // Check if we have it without sending data
-                if let Ok(Some(_)) = state.store.get_file(&hash) {
-                    let have_msg = DataMessage::Have {
-                        hashes: vec![hash],
-                    };
-                    let json = serde_json::to_string(&have_msg)?;
-                    tx.send(Message::Text(json)).await?;
-                }
-            }
-        }
-        DataMessage::Have { hashes } => {
-            // Client is telling us what they have - we could track this
-            debug!("Peer {} has {} hashes", peer_id, hashes.len());
-        }
-        DataMessage::Root { hash } => {
-            // Client updated their root - we could track this
-            debug!("Peer {} root: {}", peer_id, hash);
-        }
-        DataMessage::Push { .. } => {
-            // Push from peer - we could handle this to receive pushed data
-            debug!("Received push from peer {}", peer_id);
+        DataMessage::Response(res) => {
+            // Response from a peer with data
+            state.peers.handle_peer_response(peer_id, &res.h, Some(res.d)).await;
         }
     }
 
@@ -320,73 +344,70 @@ async fn handle_json_message(
 
 /// Handle a data request
 async fn handle_request(
-    id: u32,
-    hash: &str,
+    hash: &[u8],
+    htl: u8,
     peer_id: u64,
     state: &DataWsState,
     tx: &mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
+    let hash_hex = hash_to_hex(hash);
+    let hash_short = &hash_hex[..16.min(hash_hex.len())];
+
     // First, try local storage
-    let result = state.store.get_file(hash);
+    let result = state.store.get_file(&hash_hex);
 
     match result {
         Ok(Some(data)) => {
-            send_found_response(id, hash, &data, tx).await?;
+            send_found_response(hash, &data, tx).await?;
             return Ok(());
         }
         Ok(None) => {
             // Not in local storage, try forwarding to other peers
-            debug!("Hash {} not in local storage, forwarding to peers", &hash[..16.min(hash.len())]);
+            debug!("Hash {} not in local storage, forwarding to peers", hash_short);
         }
         Err(e) => {
-            warn!("Store error for hash {}: {}", hash, e);
+            warn!("Store error for hash {}: {}", hash_hex, e);
         }
     }
 
+    // HTL was already decremented by sender before sending to us.
+    // We just check if we should forward (HTL > 0).
+    // When we forward to other peers, forward_request will decrement using each peer's config.
+    if !should_forward(htl) {
+        debug!("HTL expired for {}, not forwarding", hash_short);
+        // Stay silent - requester will timeout
+        return Ok(());
+    }
+
     // Forward to other peers
-    if let Some(data) = state.peers.forward_request(peer_id, hash).await {
+    // The forward_request will decrement HTL using each peer's config before sending
+    if let Some(data) = state.peers.forward_request(peer_id, hash, htl).await {
         // Store locally for future requests (put_blob computes hash internally)
         if let Err(e) = state.store.put_blob(&data) {
             warn!("Failed to cache forwarded data: {}", e);
         }
-        send_found_response(id, hash, &data, tx).await?;
-        return Ok(());
+        send_found_response(hash, &data, tx).await?;
     }
 
-    // Not found anywhere
-    let response = DataMessage::Response {
-        id,
-        hash: hash.to_string(),
-        found: false,
-    };
-    let json = serde_json::to_string(&response)?;
-    tx.send(Message::Text(json)).await?;
-
+    // Not found - stay silent, requester will timeout
     Ok(())
 }
 
 async fn send_found_response(
-    id: u32,
-    hash: &str,
+    hash: &[u8],
     data: &[u8],
     tx: &mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
-    // Send response indicating found
-    let response = DataMessage::Response {
-        id,
-        hash: hash.to_string(),
-        found: true,
+    // Send response with embedded data
+    let response = DataResponse {
+        h: hash.to_vec(),
+        d: data.to_vec(),
     };
-    let json = serde_json::to_string(&response)?;
-    tx.send(Message::Text(json)).await?;
+    let wire = encode_response(&response)?;
+    tx.send(Message::Binary(wire)).await?;
 
-    // Send binary data: [4-byte LE id][data]
-    let mut packet = Vec::with_capacity(4 + data.len());
-    packet.extend_from_slice(&id.to_le_bytes());
-    packet.extend_from_slice(data);
-    tx.send(Message::Binary(packet)).await?;
-
-    debug!("Sent {} bytes for hash {}", data.len(), &hash[..16.min(hash.len())]);
+    let hash_hex = hash_to_hex(hash);
+    debug!("Sent {} bytes for hash {}", data.len(), &hash_hex[..16.min(hash_hex.len())]);
     Ok(())
 }
 
@@ -395,76 +416,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_data_message_serialize_request() {
-        let msg = DataMessage::Request {
-            id: 42,
-            hash: "abc123".to_string(),
+    fn test_data_message_msgpack_request() {
+        let hash = vec![0xab; 32];
+        let req = DataRequest {
+            h: hash.clone(),
+            htl: MAX_HTL,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"req\""));
-        assert!(json.contains("\"id\":42"));
-        assert!(json.contains("\"hash\":\"abc123\""));
-    }
-
-    #[test]
-    fn test_data_message_serialize_response() {
-        let msg = DataMessage::Response {
-            id: 42,
-            hash: "abc123".to_string(),
-            found: true,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"res\""));
-        assert!(json.contains("\"found\":true"));
-    }
-
-    #[test]
-    fn test_data_message_deserialize_request() {
-        let json = r#"{"type":"req","id":123,"hash":"deadbeef"}"#;
-        let msg: DataMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            DataMessage::Request { id, hash } => {
-                assert_eq!(id, 123);
-                assert_eq!(hash, "deadbeef");
+        let encoded = encode_request(&req).unwrap();
+        let decoded = parse_message(&encoded).unwrap();
+        match decoded {
+            DataMessage::Request(req) => {
+                assert_eq!(req.h, hash);
+                assert_eq!(req.htl, MAX_HTL);
             }
             _ => panic!("Expected Request"),
         }
     }
 
     #[test]
-    fn test_data_message_deserialize_want() {
-        let json = r#"{"type":"want","hashes":["hash1","hash2","hash3"]}"#;
-        let msg: DataMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            DataMessage::Want { hashes } => {
-                assert_eq!(hashes.len(), 3);
-                assert_eq!(hashes[0], "hash1");
+    fn test_data_message_msgpack_response() {
+        let hash = vec![0xcd; 32];
+        let res = DataResponse {
+            h: hash.clone(),
+            d: vec![1, 2, 3, 4, 5],
+        };
+        let encoded = encode_response(&res).unwrap();
+        let decoded = parse_message(&encoded).unwrap();
+        match decoded {
+            DataMessage::Response(res) => {
+                assert_eq!(res.h, hash);
+                assert_eq!(res.d, vec![1, 2, 3, 4, 5]);
             }
-            _ => panic!("Expected Want"),
+            _ => panic!("Expected Response"),
         }
     }
 
     #[test]
-    fn test_data_message_deserialize_have() {
-        let json = r#"{"type":"have","hashes":["hash1"]}"#;
-        let msg: DataMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            DataMessage::Have { hashes } => {
-                assert_eq!(hashes.len(), 1);
+    fn test_data_message_msgpack_large_data() {
+        // Test with 16KB of data (BT v2 chunk size)
+        let large_data: Vec<u8> = (0..16 * 1024).map(|i| (i % 256) as u8).collect();
+        let hash = vec![0x12; 32];
+        let res = DataResponse {
+            h: hash.clone(),
+            d: large_data.clone(),
+        };
+        let encoded = encode_response(&res).unwrap();
+        let decoded = parse_message(&encoded).unwrap();
+        match decoded {
+            DataMessage::Response(res) => {
+                assert_eq!(res.d.len(), 16 * 1024);
+                assert_eq!(res.d[0], 0);
+                assert_eq!(res.d[255], 255);
             }
-            _ => panic!("Expected Have"),
-        }
-    }
-
-    #[test]
-    fn test_data_message_deserialize_root() {
-        let json = r#"{"type":"root","hash":"roothash"}"#;
-        let msg: DataMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            DataMessage::Root { hash } => {
-                assert_eq!(hash, "roothash");
-            }
-            _ => panic!("Expected Root"),
+            _ => panic!("Expected Response"),
         }
     }
 
@@ -499,7 +503,8 @@ mod tests {
         let registry = PeerRegistry::new();
 
         // With no peers, should return None
-        let result = registry.forward_request(999, "somehash").await;
+        let test_hash = vec![0x34; 32];
+        let result = registry.forward_request(999, &test_hash, MAX_HTL).await;
         assert!(result.is_none());
     }
 
@@ -512,7 +517,8 @@ mod tests {
 
         // Forward should exclude the peer making the request
         // Since there's only one peer (which is excluded), should return None
-        let result = registry.forward_request(id, "somehash").await;
+        let test_hash = vec![0x12; 32];
+        let result = registry.forward_request(id, &test_hash, MAX_HTL).await;
         assert!(result.is_none());
     }
 
@@ -521,18 +527,19 @@ mod tests {
         let registry = PeerRegistry::new();
         let (tx, _rx) = mpsc::channel(32);
         let peer_id = registry.register(tx).await;
-        let request_id = 42u32;
 
-        // Create a pending request
+        // Create a pending request (keyed by hash hex)
+        let test_hash = vec![0xab; 32];
+        let hash_hex = hash_to_hex(&test_hash);
         let (resp_tx, resp_rx) = oneshot::channel();
         {
             let mut pending = registry.pending_requests.write().await;
-            pending.insert((peer_id, request_id), resp_tx);
+            pending.insert((peer_id, hash_hex.clone()), resp_tx);
         }
 
         // Handle response
         let test_data = vec![1, 2, 3, 4];
-        registry.handle_peer_response(peer_id, request_id, Some(test_data.clone())).await;
+        registry.handle_peer_response(peer_id, &test_hash, Some(test_data.clone())).await;
 
         // Should receive the data
         let result = resp_rx.await.unwrap();
@@ -544,17 +551,18 @@ mod tests {
         let registry = PeerRegistry::new();
         let (tx, _rx) = mpsc::channel(32);
         let peer_id = registry.register(tx).await;
-        let request_id = 42u32;
 
-        // Create a pending request
+        // Create a pending request (keyed by hash hex)
+        let test_hash = vec![0xcd; 32];
+        let hash_hex = hash_to_hex(&test_hash);
         let (resp_tx, resp_rx) = oneshot::channel();
         {
             let mut pending = registry.pending_requests.write().await;
-            pending.insert((peer_id, request_id), resp_tx);
+            pending.insert((peer_id, hash_hex.clone()), resp_tx);
         }
 
         // Handle response with None (not found)
-        registry.handle_peer_response(peer_id, request_id, None).await;
+        registry.handle_peer_response(peer_id, &test_hash, None).await;
 
         // Should receive None
         let result = resp_rx.await.unwrap();
@@ -563,22 +571,41 @@ mod tests {
 
     #[test]
     fn test_binary_message_format() {
-        // Test that binary messages match the expected format: [4-byte LE id][data]
-        let id: u32 = 0x12345678;
-        let data = b"test data";
+        // Test the new wire format: [type byte][msgpack body]
+        let hash = vec![0x12; 32];
+        let req = DataRequest { h: hash.clone(), htl: 10 };
+        let wire = encode_request(&req).unwrap();
 
-        let mut packet = Vec::with_capacity(4 + data.len());
-        packet.extend_from_slice(&id.to_le_bytes());
-        packet.extend_from_slice(data);
-
-        // Verify format
-        assert_eq!(packet.len(), 4 + data.len());
-        assert_eq!(&packet[0..4], &[0x78, 0x56, 0x34, 0x12]); // Little endian
-        assert_eq!(&packet[4..], data);
+        // Verify format: first byte is type
+        assert_eq!(wire[0], 0x00); // MSG_TYPE_REQUEST
 
         // Verify we can parse it back
-        let parsed_id = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
-        assert_eq!(parsed_id, id);
-        assert_eq!(&packet[4..], data);
+        let parsed = parse_message(&wire).unwrap();
+        match parsed {
+            DataMessage::Request(req) => {
+                assert_eq!(req.h, hash);
+                assert_eq!(req.htl, 10);
+            }
+            _ => panic!("Expected Request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_limit_per_client() {
+        let registry = PeerRegistry::new();
+
+        // First 10 queries from client A should be allowed
+        for i in 0..HTTP_PEER_QUERY_LIMIT {
+            assert!(registry.check_http_rate_limit("192.168.1.1").await,
+                    "Query {} from client A should be allowed", i);
+        }
+
+        // 11th query from client A should be rate limited
+        assert!(!registry.check_http_rate_limit("192.168.1.1").await,
+                "Query beyond limit from client A should be blocked");
+
+        // But client B should still be allowed
+        assert!(registry.check_http_rate_limit("192.168.1.2").await,
+                "Query from different client B should be allowed");
     }
 }
