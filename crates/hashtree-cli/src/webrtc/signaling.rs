@@ -69,6 +69,95 @@ impl WebRTCState {
             connected_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
+
+    /// Request content by hash from connected peers
+    /// Queries peers sequentially with 500ms intervals until one responds
+    /// Returns the first successful response, or None if no peer has it
+    pub async fn request_from_peers(&self, hash_hex: &str) -> Option<Vec<u8>> {
+        use super::types::{DataRequest, MAX_HTL, encode_request};
+
+        let peers = self.peers.read().await;
+
+        // Collect connected peers with data channels
+        let connected_peers: Vec<_> = peers
+            .values()
+            .filter(|p| p.state == ConnectionState::Connected && p.peer.is_some())
+            .filter_map(|p| {
+                p.peer.as_ref().and_then(|peer| {
+                    peer.data_channel.as_ref().map(|dc| {
+                        (p.peer_id.short(), peer.pending_requests.clone(), dc.clone())
+                    })
+                })
+            })
+            .collect();
+
+        drop(peers); // Release the read lock
+
+        if connected_peers.is_empty() {
+            debug!("No connected peers to query for {}", &hash_hex[..8.min(hash_hex.len())]);
+            return None;
+        }
+
+        debug!(
+            "Querying {} connected peers for {} (sequential with 500ms delay)",
+            connected_peers.len(),
+            &hash_hex[..8.min(hash_hex.len())]
+        );
+
+        // Convert hex to binary hash once
+        let hash_bytes = match hex::decode(hash_hex) {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+
+        // Query peers sequentially with 500ms delay between each
+        for (i, (peer_id, pending_requests, dc)) in connected_peers.iter().enumerate() {
+            debug!("Querying peer {} for {}", peer_id, &hash_hex[..8.min(hash_hex.len())]);
+
+            // Create response channel
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            // Store pending request
+            {
+                let mut pending = pending_requests.lock().await;
+                pending.insert(
+                    hash_hex.to_string(),
+                    super::PendingRequest {
+                        hash: hash_bytes.clone(),
+                        response_tx: tx,
+                    },
+                );
+            }
+
+            // Send request
+            let req = DataRequest {
+                h: hash_bytes.clone(),
+                htl: MAX_HTL,
+            };
+            if let Ok(wire) = encode_request(&req) {
+                if dc.send(&bytes::Bytes::from(wire)).await.is_ok() {
+                    // Wait 500ms for response from this peer
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), rx).await {
+                        Ok(Ok(Some(data))) => {
+                            debug!("Got response from peer {} for {}", peer_id, &hash_hex[..8.min(hash_hex.len())]);
+                            return Some(data);
+                        }
+                        _ => {
+                            // Timeout or no data - clean up and try next peer
+                            debug!("No response from peer {} for {}", peer_id, &hash_hex[..8.min(hash_hex.len())]);
+                        }
+                    }
+                }
+            }
+
+            // Clean up pending request
+            let mut pending = pending_requests.lock().await;
+            pending.remove(hash_hex);
+        }
+
+        debug!("No peer had data for {}", &hash_hex[..8.min(hash_hex.len())]);
+        None
+    }
 }
 
 /// WebRTC manager handles peer discovery and connection management
