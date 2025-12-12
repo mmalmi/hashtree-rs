@@ -558,9 +558,6 @@ async fn main() -> Result<()> {
                 if let Ok(Some(node)) = store.get_tree_node(&cid) {
                     println!("\nTree node info:");
                     println!("  Links: {}", node.links.len());
-                    if let Some(total_size) = node.total_size {
-                        println!("  Stored total_size: {}", total_size);
-                    }
                     for (i, link) in node.links.iter().enumerate() {
                         let name = link.name.as_ref().map(|n| n.as_str()).unwrap_or("<unnamed>");
                         let size_str = format!("{} bytes", link.size);
