@@ -246,12 +246,19 @@ fn escape_json_string(s: &str) -> String {
 }
 
 /// CORS preflight handler for all Blossom endpoints
-pub async fn cors_preflight() -> impl IntoResponse {
+/// Echoes back Access-Control-Request-Headers to allow any headers
+pub async fn cors_preflight(headers: HeaderMap) -> impl IntoResponse {
+    // Echo back requested headers, or use sensible defaults
+    let allowed_headers = headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("Authorization, Content-Type, X-SHA-256");
+
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, PUT, DELETE, OPTIONS")
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Authorization, Content-Type, *")
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, allowed_headers)
         .header(header::ACCESS_CONTROL_MAX_AGE, "86400")
         .body(Body::empty())
         .unwrap()
