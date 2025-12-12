@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 
 use crate::object::{GitObject, ObjectId, ObjectType, parse_tree};
 use crate::refs::{validate_ref_name, NamedRef, Ref};
@@ -49,18 +49,48 @@ struct GitStorageState {
     root_hash: Option<[u8; 32]>,
 }
 
+/// Runtime executor for GitStorage - either owns a runtime or reuses an existing one
+enum RuntimeExecutor {
+    /// Owned runtime (for standalone use outside async context)
+    Owned(Runtime),
+    /// Handle to existing runtime (for use within async context)
+    Handle(Handle),
+}
+
+impl RuntimeExecutor {
+    /// Run a future to completion
+    fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
+        match self {
+            RuntimeExecutor::Owned(rt) => rt.block_on(f),
+            RuntimeExecutor::Handle(handle) => {
+                // Use block_in_place to allow blocking within async context
+                tokio::task::block_in_place(|| handle.block_on(f))
+            }
+        }
+    }
+}
+
 /// Git storage backed by hashtree with LMDB persistence
 pub struct GitStorage {
     store: Arc<LmdbBlobStore>,
-    runtime: Runtime,
+    runtime: RuntimeExecutor,
     state: RwLock<GitStorageState>,
 }
 
 impl GitStorage {
     /// Open or create a git storage at the given path
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let runtime =
-            Runtime::new().map_err(|e| Error::StorageError(format!("tokio runtime: {}", e)))?;
+        // Try to use existing runtime handle if we're already in an async context,
+        // otherwise create a new runtime. This avoids the "Cannot drop a runtime
+        // in a context where blocking is not allowed" panic when nested.
+        let runtime = match Handle::try_current() {
+            Ok(handle) => RuntimeExecutor::Handle(handle),
+            Err(_) => {
+                let rt = Runtime::new()
+                    .map_err(|e| Error::StorageError(format!("tokio runtime: {}", e)))?;
+                RuntimeExecutor::Owned(rt)
+            }
+        };
 
         // Use "blobs" subdirectory to match hashtree-cli's HashtreeStore
         let store_path = path.as_ref().join("blobs");

@@ -1,6 +1,5 @@
 mod auth;
 pub mod blossom;
-pub mod data_ws;
 mod git;
 mod handlers;
 mod mime;
@@ -15,6 +14,7 @@ use axum::{
     Router,
 };
 use crate::storage::HashtreeStore;
+use crate::webrtc::WebRTCState;
 use hashtree_git::GitStorage;
 use nostrdb::Ndb;
 use hashtree_relay::{ws_handler, RelayState};
@@ -28,32 +28,27 @@ pub struct HashtreeServer {
     git_storage: Option<Arc<GitStorage>>,
     local_pubkey: Option<String>,
     addr: String,
-    enable_data_ws: bool,
 }
 
 impl HashtreeServer {
     pub fn new(store: Arc<HashtreeStore>, addr: String) -> Self {
-        // Create shared peer registry for HTTP handlers and WebSocket
-        let peers = Arc::new(data_ws::PeerRegistry::new());
-
         Self {
             state: AppState {
                 store,
                 auth: None,
                 ndb_query: None,
-                peers: Some(peers),
+                webrtc_peers: None,
             },
             relay_state: None,
             git_storage: None,
             local_pubkey: None,
             addr,
-            enable_data_ws: true, // Enabled by default
         }
     }
 
-    /// Enable or disable the /ws/data WebSocket endpoint for P2P data exchange
-    pub fn with_data_ws(mut self, enabled: bool) -> Self {
-        self.enable_data_ws = enabled;
+    /// Set WebRTC state for P2P peer queries
+    pub fn with_webrtc_peers(mut self, webrtc_state: Arc<WebRTCState>) -> Self {
+        self.state.webrtc_peers = Some(webrtc_state);
         self
     }
 
@@ -115,6 +110,7 @@ impl HashtreeServer {
             // Hashtree API endpoints
             .route("/api/pins", get(handlers::list_pins))
             .route("/api/stats", get(handlers::storage_stats))
+            .route("/api/peers", get(handlers::webrtc_peers))
             .route("/api/socialgraph", get(handlers::socialgraph_stats))
             // Resolver API endpoints
             .route("/api/resolve/:pubkey/:treename", get(handlers::resolve_to_hash))
@@ -140,17 +136,6 @@ impl HashtreeServer {
                 .route("/api/git/repos", get(git::list_repos))
                 .with_state(git_state);
             public_routes = public_routes.merge(git_routes);
-        }
-
-        // Add data WebSocket endpoint for P2P file sharing (same protocol as WebRTC)
-        // Uses shared peer registry so HTTP handlers can also query peers
-        if self.enable_data_ws {
-            let peers = self.state.peers.clone().unwrap_or_else(|| Arc::new(data_ws::PeerRegistry::new()));
-            let data_ws_state = data_ws::DataWsState::with_peers(self.state.store.clone(), peers);
-            let data_ws_routes = Router::new()
-                .route("/ws/data", get(data_ws::data_ws_handler))
-                .with_state(data_ws_state);
-            public_routes = public_routes.merge(data_ws_routes);
         }
 
         // Protected endpoints (require auth if enabled)

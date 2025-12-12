@@ -5,7 +5,7 @@ use axum::{
     middleware::Next,
 };
 use crate::storage::HashtreeStore;
-use crate::server::data_ws::PeerRegistry;
+use crate::webrtc::WebRTCState;
 use hashtree_relay::NdbQuerySender;
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ pub struct AppState {
     pub store: Arc<HashtreeStore>,
     pub auth: Option<AuthCredentials>,
     pub ndb_query: Option<NdbQuerySender>,
-    /// Peer registry for forwarding requests to connected WebSocket/WebRTC peers
-    pub peers: Option<Arc<PeerRegistry>>,
+    /// WebRTC peer state for forwarding requests to connected P2P peers
+    pub webrtc_peers: Option<Arc<WebRTCState>>,
 }
 
 #[derive(Clone)]

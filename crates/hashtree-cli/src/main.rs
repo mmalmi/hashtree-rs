@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
             };
 
             // Start WebRTC signaling manager if enabled
-            let webrtc_handle = if config.server.enable_webrtc {
+            let (webrtc_handle, webrtc_state) = if config.server.enable_webrtc {
                 let webrtc_config = WebRTCConfig {
                     relays: config.nostr.relays.clone(),
                     ..Default::default()
@@ -243,15 +243,18 @@ async fn main() -> Result<()> {
                     peer_classifier,
                 );
 
+                // Get the WebRTC state before spawning (for HTTP handler to query peers)
+                let webrtc_state = manager.state();
+
                 // Spawn the manager in a background task
                 let handle = tokio::spawn(async move {
                     if let Err(e) = manager.run().await {
                         tracing::error!("WebRTC manager error: {}", e);
                     }
                 });
-                Some(handle)
+                (Some(handle), Some(webrtc_state))
             } else {
-                None
+                (None, None)
             };
 
             // Set up server with nostr relay (inbound) and query sender
@@ -260,6 +263,11 @@ async fn main() -> Result<()> {
                 .with_ndb_query(relay_handle.query.clone())
                 .with_max_write_distance(config.nostr.max_write_distance)
                 .with_git(git_storage, hex::encode(pk_bytes));
+
+            // Add WebRTC peer state for P2P queries from HTTP handler
+            if let Some(webrtc_state) = webrtc_state {
+                server = server.with_webrtc_peers(webrtc_state);
+            }
 
             // Print startup info
             println!("Starting hashtree daemon on {}", addr);

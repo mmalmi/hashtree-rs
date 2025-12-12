@@ -9,11 +9,13 @@ use futures::stream::{self, StreamExt};
 use hashtree::{nhash_decode, to_hex};
 use hashtree_resolver::{nostr::{NostrRootResolver, NostrResolverConfig}, RootResolver};
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use super::auth::AppState;
 use super::mime::get_mime_type;
 use super::ui::{root_page, serve_directory_html, serve_directory_json};
+use crate::webrtc::{ConnectionState, WebRTCState};
 
 pub async fn serve_root() -> impl IntoResponse {
     root_page()
@@ -245,44 +247,28 @@ pub async fn serve_content_or_blob(
         }
     }
 
-    // Not found locally - try querying connected peers
-    // Use peer_id 0 to exclude no one (HTTP request, not from a peer)
-    // Rate limited per client IP to prevent abuse (10 queries/second/client)
+    // Not found locally - try querying connected WebRTC peers
     if is_sha256 {
-        if let Some(ref peers) = state.peers {
-            // Check rate limit for this client before querying peers
-            if peers.check_http_rate_limit(&client_ip).await {
-                let hash_hex = hash_part.to_lowercase();
-                tracing::debug!("Hash {} not found locally, querying peers", &hash_hex[..16.min(hash_hex.len())]);
+        if let Some(ref webrtc_state) = state.webrtc_peers {
+            let hash_hex = hash_part.to_lowercase();
+            tracing::info!("Hash {} not found locally, querying WebRTC peers", &hash_hex[..16.min(hash_hex.len())]);
 
-                // Convert hex to binary hash
-                let hash_bytes = match hex::decode(&hash_hex) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Body::from("Invalid hash format"))
-                            .unwrap_or_else(|_| Response::new(Body::from("Error")));
-                    }
-                };
-
-                // Use MAX_HTL for HTTP requests (they're fresh requests from gateway)
-                if let Some(data) = peers.forward_request(0, &hash_bytes, crate::webrtc::types::MAX_HTL).await {
-                    // Cache locally for future requests
-                    if let Err(e) = state.store.put_blob(&data) {
-                        tracing::warn!("Failed to cache peer data: {}", e);
-                    }
-
-                    // Return the data directly
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CONTENT_LENGTH, data.len())
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .body(Body::from(data))
-                        .unwrap()
-                        .into_response();
+            // Query connected WebRTC peers
+            if let Some(data) = query_webrtc_peers(webrtc_state, &hash_hex).await {
+                // Cache locally for future requests
+                if let Err(e) = state.store.put_blob(&data) {
+                    tracing::warn!("Failed to cache peer data: {}", e);
                 }
+
+                // Return the data directly
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_LENGTH, data.len())
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(data))
+                    .unwrap()
+                    .into_response();
             }
         }
     }
@@ -530,6 +516,38 @@ pub async fn storage_stats(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Get connected WebRTC peers
+pub async fn webrtc_peers(State(state): State<AppState>) -> impl IntoResponse {
+    use crate::webrtc::ConnectionState;
+
+    let Some(ref webrtc_state) = state.webrtc_peers else {
+        return Json(json!({
+            "enabled": false,
+            "peers": []
+        }));
+    };
+
+    let peers = webrtc_state.peers.read().await;
+    let peer_list: Vec<_> = peers.iter().map(|(id, entry)| {
+        json!({
+            "id": id,
+            "pubkey": entry.peer_id.pubkey,
+            "state": format!("{:?}", entry.state),
+            "pool": format!("{:?}", entry.pool),
+            "connected": entry.state == ConnectionState::Connected,
+            "has_data_channel": entry.peer.as_ref().map(|p| p.has_data_channel()).unwrap_or(false),
+        })
+    }).collect();
+
+    Json(json!({
+        "enabled": true,
+        "total": peers.len(),
+        "connected": peer_list.iter().filter(|p| p["connected"].as_bool().unwrap_or(false)).count(),
+        "with_data_channel": peer_list.iter().filter(|p| p["has_data_channel"].as_bool().unwrap_or(false)).count(),
+        "peers": peer_list
+    }))
+}
+
 pub async fn garbage_collect(State(state): State<AppState>) -> impl IntoResponse {
     let store = &state.store;
     match store.gc() {
@@ -715,4 +733,64 @@ pub async fn list_trees(
 
     let _ = resolver.stop().await;
     result
+}
+
+/// Query connected WebRTC peers for content by hash
+/// Returns the first successful response, or None if no peer has it
+async fn query_webrtc_peers(webrtc_state: &Arc<WebRTCState>, hash_hex: &str) -> Option<Vec<u8>> {
+    let peers = webrtc_state.peers.read().await;
+
+    // Collect connected peers that have data channels
+    let connected_peers: Vec<_> = peers
+        .values()
+        .filter(|entry| {
+            entry.state == ConnectionState::Connected
+                && entry.peer.as_ref().map(|p| p.has_data_channel()).unwrap_or(false)
+        })
+        .collect();
+
+    if connected_peers.is_empty() {
+        tracing::debug!("No connected WebRTC peers with data channels to query");
+        return None;
+    }
+
+    tracing::debug!(
+        "Querying {} connected WebRTC peers for {}",
+        connected_peers.len(),
+        &hash_hex[..16.min(hash_hex.len())]
+    );
+
+    // Query peers sequentially (could be parallelized with timeout)
+    for entry in connected_peers {
+        if let Some(ref peer) = entry.peer {
+            match peer.request(hash_hex).await {
+                Ok(Some(data)) => {
+                    tracing::info!(
+                        "Got {} bytes from peer {} for hash {}",
+                        data.len(),
+                        entry.peer_id.short(),
+                        &hash_hex[..16.min(hash_hex.len())]
+                    );
+                    return Some(data);
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        "Peer {} doesn't have hash {}",
+                        entry.peer_id.short(),
+                        &hash_hex[..16.min(hash_hex.len())]
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Error querying peer {} for {}: {}",
+                        entry.peer_id.short(),
+                        &hash_hex[..16.min(hash_hex.len())],
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    None
 }

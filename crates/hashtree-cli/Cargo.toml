@@ -69,3 +69,6 @@ ignore = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true
+walkdir = "2"
+nostr.workspace = true
+serde_json.workspace = true

@@ -515,9 +515,18 @@ impl HashtreeStore {
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
         let store = Arc::clone(&self.blobs);
-        let tree = HashTree::new(HashTreeConfig::new(store).public());
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
 
         sync_block_on(async {
+            // First check if the hash exists in the store at all
+            // (either as a blob or tree node)
+            let exists = store.has(&hash).await
+                .map_err(|e| anyhow::anyhow!("Failed to check existence: {}", e))?;
+
+            if !exists {
+                return Ok(None);
+            }
+
             // Get total size
             let total_size = tree.get_size(&hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to get size: {}", e))?;

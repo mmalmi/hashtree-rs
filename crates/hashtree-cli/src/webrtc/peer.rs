@@ -43,7 +43,8 @@ pub struct Peer {
     pub connected_at: Option<std::time::Instant>,
 
     pc: Arc<RTCPeerConnection>,
-    data_channel: Option<Arc<RTCDataChannel>>,
+    /// Data channel - can be set from callback when receiving channel from peer
+    data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     signaling_tx: mpsc::Sender<SignalingMessage>,
     my_peer_id: PeerId,
 
@@ -119,7 +120,7 @@ impl Peer {
             created_at: std::time::Instant::now(),
             connected_at: None,
             pc,
-            data_channel: None,
+            data_channel: Arc::new(Mutex::new(None)),
             signaling_tx,
             my_peer_id,
             store,
@@ -195,7 +196,10 @@ impl Peer {
         // Create data channel first
         let dc = self.pc.create_data_channel("hashtree", None).await?;
         self.setup_data_channel(dc.clone()).await?;
-        self.data_channel = Some(dc);
+        {
+            let mut dc_guard = self.data_channel.lock().await;
+            *dc_guard = Some(dc);
+        }
 
         // Create offer
         let offer = self.pc.create_offer(None).await?;
@@ -225,6 +229,7 @@ impl Peer {
         let message_tx = self.message_tx.clone();
         let pending_requests = self.pending_requests.clone();
         let store = self.store.clone();
+        let data_channel_holder = self.data_channel.clone();
 
         self.pc
             .on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
@@ -232,9 +237,16 @@ impl Peer {
                 let message_tx = message_tx.clone();
                 let pending_requests = pending_requests.clone();
                 let store = store.clone();
+                let data_channel_holder = data_channel_holder.clone();
 
                 Box::pin(async move {
                     info!("Peer {} received data channel: {}", peer_id.short(), dc.label());
+
+                    // Store the received data channel
+                    {
+                        let mut dc_guard = data_channel_holder.lock().await;
+                        *dc_guard = Some(dc.clone());
+                    }
 
                     // Set up message handlers
                     Self::setup_dc_handlers(
@@ -422,15 +434,21 @@ impl Peer {
 
     /// Check if data channel is ready
     pub fn has_data_channel(&self) -> bool {
-        self.data_channel.is_some()
+        // Use try_lock for non-async context
+        self.data_channel
+            .try_lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 
     /// Request content by hash from this peer
     pub async fn request(&self, hash_hex: &str) -> Result<Option<Vec<u8>>> {
-        let dc = self
-            .data_channel
+        let dc_guard = self.data_channel.lock().await;
+        let dc = dc_guard
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No data channel"))?;
+            .ok_or_else(|| anyhow::anyhow!("No data channel"))?
+            .clone();
+        drop(dc_guard);  // Release lock before async operations
 
         // Convert hex to binary hash
         let hash = hex::decode(hash_hex)
@@ -483,7 +501,8 @@ impl Peer {
 
     /// Send a message over the data channel
     pub async fn send_message(&self, msg: &DataMessage) -> Result<()> {
-        if let Some(ref dc) = self.data_channel {
+        let dc_guard = self.data_channel.lock().await;
+        if let Some(ref dc) = *dc_guard {
             let wire = encode_message(msg)?;
             dc.send(&Bytes::from(wire)).await?;
         }
@@ -492,8 +511,11 @@ impl Peer {
 
     /// Close the connection
     pub async fn close(&self) -> Result<()> {
-        if let Some(ref dc) = self.data_channel {
-            dc.close().await?;
+        {
+            let dc_guard = self.data_channel.lock().await;
+            if let Some(ref dc) = *dc_guard {
+                dc.close().await?;
+            }
         }
         self.pc.close().await?;
         Ok(())
