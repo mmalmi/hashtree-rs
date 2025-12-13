@@ -15,6 +15,8 @@ pub struct Config {
     pub nostr: NostrConfig,
     #[serde(default)]
     pub blossom: BlossomConfig,
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,10 +64,56 @@ pub struct BlossomConfig {
     pub servers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Enable background sync (auto-pull trees)
+    #[serde(default = "default_sync_enabled")]
+    pub enabled: bool,
+    /// Sync own trees (subscribed via Nostr)
+    #[serde(default = "default_sync_own")]
+    pub sync_own: bool,
+    /// Sync followed users' public trees
+    #[serde(default = "default_sync_followed")]
+    pub sync_followed: bool,
+    /// Max concurrent sync tasks
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// WebRTC request timeout in milliseconds
+    #[serde(default = "default_webrtc_timeout_ms")]
+    pub webrtc_timeout_ms: u64,
+    /// Blossom request timeout in milliseconds
+    #[serde(default = "default_blossom_timeout_ms")]
+    pub blossom_timeout_ms: u64,
+}
+
 fn default_blossom_servers() -> Vec<String> {
     vec![
         "https://blossom.iris.to".to_string(),
     ]
+}
+
+fn default_sync_enabled() -> bool {
+    true
+}
+
+fn default_sync_own() -> bool {
+    true
+}
+
+fn default_sync_followed() -> bool {
+    true
+}
+
+fn default_max_concurrent() -> usize {
+    3
+}
+
+fn default_webrtc_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_blossom_timeout_ms() -> u64 {
+    10000
 }
 
 fn default_crawl_depth() -> u32 {
@@ -147,6 +195,19 @@ impl Default for BlossomConfig {
     }
 }
 
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_sync_enabled(),
+            sync_own: default_sync_own(),
+            sync_followed: default_sync_followed(),
+            max_concurrent: default_max_concurrent(),
+            webrtc_timeout_ms: default_webrtc_timeout_ms(),
+            blossom_timeout_ms: default_blossom_timeout_ms(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -154,6 +215,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             nostr: NostrConfig::default(),
             blossom: BlossomConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }

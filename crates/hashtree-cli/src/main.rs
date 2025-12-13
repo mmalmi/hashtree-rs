@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
 use hashtree_cli::{
-    init_nostrdb_at, spawn_relay_thread, Config, GitStorage, HashtreeServer, HashtreeStore,
+    init_nostrdb_at, spawn_relay_thread, BackgroundSync, Config, GitStorage, HashtreeServer, HashtreeStore,
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RelayConfig, RootResolver,
     WebRTCConfig, WebRTCManager,
 };
@@ -266,16 +266,53 @@ async fn main() -> Result<()> {
             };
 
             // Set up server with nostr relay (inbound) and query sender
-            let mut server = HashtreeServer::new(store, addr.clone())
+            let mut server = HashtreeServer::new(Arc::clone(&store), addr.clone())
                 .with_ndb(ndb)
                 .with_ndb_query(relay_handle.query.clone())
                 .with_max_write_distance(config.nostr.max_write_distance)
                 .with_git(git_storage, hex::encode(pk_bytes));
 
             // Add WebRTC peer state for P2P queries from HTTP handler
-            if let Some(webrtc_state) = webrtc_state {
-                server = server.with_webrtc_peers(webrtc_state);
+            if let Some(ref webrtc_state) = webrtc_state {
+                server = server.with_webrtc_peers(webrtc_state.clone());
             }
+
+            // Start background sync service if enabled
+            let sync_handle = if config.sync.enabled {
+                let sync_config = hashtree_cli::sync::SyncConfig {
+                    sync_own: config.sync.sync_own,
+                    sync_followed: config.sync.sync_followed,
+                    blossom_servers: config.blossom.servers.clone(),
+                    relays: config.nostr.relays.clone(),
+                    max_concurrent: config.sync.max_concurrent,
+                    webrtc_timeout_ms: config.sync.webrtc_timeout_ms,
+                    blossom_timeout_ms: config.sync.blossom_timeout_ms,
+                };
+
+                // Create nostr-sdk Keys from our nostr Keys
+                let sync_keys = nostr_sdk::Keys::parse(&keys.secret_key().to_bech32()?)
+                    .context("Failed to parse keys for sync")?;
+
+                let sync_service = BackgroundSync::new(
+                    sync_config,
+                    Arc::clone(&store),
+                    sync_keys,
+                    webrtc_state.clone(),
+                ).await.context("Failed to create background sync service")?;
+
+                let contacts_file = data_dir.join("contacts.json");
+
+                // Spawn the sync service
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = sync_service.run(contacts_file).await {
+                        tracing::error!("Background sync error: {}", e);
+                    }
+                });
+
+                Some(handle)
+            } else {
+                None
+            };
 
             // Print startup info
             println!("Starting hashtree daemon on {}", addr);
@@ -304,6 +341,16 @@ async fn main() -> Result<()> {
             if config.server.enable_webrtc {
                 println!("WebRTC: enabled (P2P connections)");
             }
+            if config.sync.enabled {
+                let mut sync_features = Vec::new();
+                if config.sync.sync_own {
+                    sync_features.push("own trees");
+                }
+                if config.sync.sync_followed {
+                    sync_features.push("followed trees");
+                }
+                println!("Background sync: enabled ({})", sync_features.join(", "));
+            }
 
             if config.server.enable_auth {
                 let (username, password) = ensure_auth_cookie()?;
@@ -316,6 +363,11 @@ async fn main() -> Result<()> {
             }
 
             server.run().await?;
+
+            // Shutdown background sync
+            if let Some(handle) = sync_handle {
+                handle.abort();
+            }
 
             // Shutdown WebRTC manager
             if let Some(handle) = webrtc_handle {
