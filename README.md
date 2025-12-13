@@ -7,7 +7,7 @@ Content-addressed merkle tree storage for Rust.
 - **SHA256** hashing
 - **MessagePack** encoding for tree nodes (deterministic)
 - **Simple**: No multicodec, multibase, or CID versioning
-- **CHK encryption** by default (Content Hash Key)
+- **CHK encryption** by default (Content Hash Key) — ~2-3x overhead vs plain (still 500+ MiB/s)
 - **Dumb storage**: Works with any key-value store (hash → bytes). Unlike BitTorrent, no active merkle proof computation needed—just store and retrieve blobs by hash.
 - **16KB chunks** by default: Fits WebRTC data channel limits and matches BitTorrent v2 piece size.
 
