@@ -78,6 +78,34 @@ git push origin main
 git clone htree://npub1.../repo-name
 ```
 
+## CLI
+
+```bash
+# Add content
+htree add myfile.txt                    # Add file (encrypted)
+htree add mydir/ --public               # Add directory (unencrypted)
+htree add myfile.txt --publish mydata   # Add and publish to Nostr
+
+# Push to Blossom servers
+htree push <hash>                       # Push to configured servers
+htree push <hash> -s https://blossom.example.com  # Push to specific server
+
+# Get/cat content
+htree get <hash>                        # Download to file
+htree cat <hash>                        # Print to stdout
+
+# Pins
+htree pins                              # List pinned content
+htree pin <hash>                        # Pin content
+htree unpin <hash>                      # Unpin content
+
+# Nostr identity
+htree user                              # Show npub
+htree publish mydata <hash>             # Publish hash to npub.../mydata
+htree follow npub1...                   # Follow user
+htree following                         # List followed users
+```
+
 ## Development
 
 ```bash

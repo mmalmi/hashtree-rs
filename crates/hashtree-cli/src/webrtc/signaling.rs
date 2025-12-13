@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-use super::peer::{ContentStore, Peer};
+use super::peer::{ContentStore, Peer, PendingRequest};
 use super::types::{
     generate_uuid, PeerDirection, PeerId, PeerPool, PeerStatus, PoolConfig, SignalingMessage, WebRTCConfig, WEBRTC_TAG,
 };
@@ -79,19 +79,27 @@ impl WebRTCState {
         let peers = self.peers.read().await;
 
         // Collect connected peers with data channels
-        let connected_peers: Vec<_> = peers
+        // We need to collect the Arc references first, then acquire locks outside the iterator
+        let peer_refs: Vec<_> = peers
             .values()
             .filter(|p| p.state == ConnectionState::Connected && p.peer.is_some())
             .filter_map(|p| {
-                p.peer.as_ref().and_then(|peer| {
-                    peer.data_channel.as_ref().map(|dc| {
-                        (p.peer_id.short(), peer.pending_requests.clone(), dc.clone())
-                    })
+                p.peer.as_ref().map(|peer| {
+                    (p.peer_id.short(), peer.data_channel.clone(), peer.pending_requests.clone())
                 })
             })
             .collect();
 
         drop(peers); // Release the read lock
+
+        // Now acquire locks and filter to peers with active data channels
+        let mut connected_peers: Vec<(String, Arc<Mutex<HashMap<String, PendingRequest>>>, Arc<webrtc::data_channel::RTCDataChannel>)> = Vec::new();
+        for (peer_id, dc_mutex, pending) in peer_refs {
+            let dc_guard = dc_mutex.lock().await;
+            if let Some(dc) = dc_guard.as_ref() {
+                connected_peers.push((peer_id, pending, dc.clone()));
+            }
+        }
 
         if connected_peers.is_empty() {
             debug!("No connected peers to query for {}", &hash_hex[..8.min(hash_hex.len())]);
@@ -111,7 +119,7 @@ impl WebRTCState {
         };
 
         // Query peers sequentially with 500ms delay between each
-        for (i, (peer_id, pending_requests, dc)) in connected_peers.iter().enumerate() {
+        for (i, (peer_id, pending_requests, dc)) in connected_peers.into_iter().enumerate() {
             debug!("Querying peer {} for {}", peer_id, &hash_hex[..8.min(hash_hex.len())]);
 
             // Create response channel

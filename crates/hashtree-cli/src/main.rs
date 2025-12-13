@@ -123,6 +123,14 @@ enum Commands {
     },
     /// List users you follow
     Following,
+    /// Push content to Blossom servers
+    Push {
+        /// CID (hash or hash:key) to push
+        cid: String,
+        /// Blossom server URL (overrides config)
+        #[arg(long, short)]
+        server: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -717,6 +725,9 @@ async fn main() -> Result<()> {
         Commands::Following => {
             list_following(&cli.data_dir).await?;
         }
+        Commands::Push { cid, server } => {
+            push_to_blossom(&cli.data_dir, &cid, server).await?;
+        }
     }
 
     Ok(())
@@ -835,6 +846,177 @@ async fn list_following(data_dir: &PathBuf) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Push content to Blossom servers
+async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Option<String>) -> Result<()> {
+    use hashtree::{from_hex, to_hex};
+    use sha2::{Sha256, Digest};
+    use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
+
+    // Load config
+    let config = Config::load()?;
+
+    // Get servers (override or from config)
+    let servers = if let Some(s) = server_override {
+        vec![s]
+    } else {
+        config.blossom.servers.clone()
+    };
+
+    if servers.is_empty() {
+        anyhow::bail!("No Blossom servers configured. Use --server or add servers to config.toml");
+    }
+
+    // Ensure nsec exists for signing
+    let (nsec_str, _) = ensure_nsec_string()?;
+    let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
+
+    // Open local store
+    let store = HashtreeStore::new(data_dir)?;
+
+    // Parse CID (hash or hash:key)
+    let (hash_hex, _key_hex) = if let Some((h, k)) = cid_str.split_once(':') {
+        (h.to_string(), Some(k.to_string()))
+    } else {
+        (cid_str.to_string(), None)
+    };
+
+    let _root_hash = from_hex(&hash_hex).context("Invalid hash")?;
+
+    // Collect all blocks to push (walk the DAG)
+    println!("Collecting blocks...");
+    let mut blocks_to_push: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = vec![hash_hex.clone()];
+
+    while let Some(hash) = queue.pop() {
+        if visited.contains(&hash) {
+            continue;
+        }
+        visited.insert(hash.clone());
+
+        // Try to get as tree node first (for directories/internal nodes)
+        if let Ok(Some(node)) = store.get_tree_node(&hash) {
+            // Get raw block data
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash.clone(), data));
+            }
+            // Queue child hashes
+            for link in &node.links {
+                let child_hash = to_hex(&link.hash);
+                if !visited.contains(&child_hash) {
+                    queue.push(child_hash);
+                }
+            }
+        } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
+            // It's a file - get the file data
+            if metadata.is_chunked {
+                // Get chunks
+                for chunk_cid in &metadata.chunk_cids {
+                    if !visited.contains(chunk_cid) {
+                        if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
+                            blocks_to_push.push((chunk_cid.clone(), chunk_data));
+                            visited.insert(chunk_cid.clone());
+                        }
+                    }
+                }
+            }
+            // Get the file's own block
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash.clone(), data));
+            }
+        } else if let Ok(Some(data)) = store.get_blob(&hash) {
+            // Raw block
+            blocks_to_push.push((hash.clone(), data));
+        }
+    }
+
+    println!("Found {} blocks to push", blocks_to_push.len());
+
+    // Create HTTP client
+    let client = reqwest::Client::new();
+
+    // Push to each server
+    for server in &servers {
+        println!("\nPushing to {}...", server);
+        let mut uploaded = 0;
+        let mut skipped = 0;
+        let mut errors = 0;
+
+        for (hash, data) in &blocks_to_push {
+            // Check if already exists (HEAD request)
+            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
+            let head_resp = client.head(&url).send().await;
+
+            if let Ok(resp) = head_resp {
+                if resp.status().is_success() || resp.status().as_u16() == 200 {
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            // Create Blossom auth event (kind 24242)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let expiration = now + 300; // 5 minutes
+
+            // Compute SHA256 of the data
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let computed_hash = hex::encode(hasher.finalize());
+
+            // Build auth event
+            let auth_event = EventBuilder::new(
+                Kind::Custom(24242),
+                "Upload",
+            )
+            .tags(vec![
+                Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
+                Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
+                Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
+            ])
+            .sign(&keys)
+            .await
+            .context("Failed to sign auth event")?;
+
+            let auth_json = auth_event.as_json();
+            let auth_header = format!("Nostr {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth_json));
+
+            // Upload
+            let upload_url = format!("{}/upload", server.trim_end_matches('/'));
+            let resp = client.put(&upload_url)
+                .header("Authorization", auth_header)
+                .header("Content-Type", "application/octet-stream")
+                .header("X-SHA-256", &computed_hash)
+                .body(data.clone())
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
+                    uploaded += 1;
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    eprintln!("  Error uploading {}: {} {}", &hash[..12], status, text);
+                    errors += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Error uploading {}: {}", &hash[..12], e);
+                    errors += 1;
+                }
+            }
+        }
+
+        println!("  Uploaded: {}, Skipped: {}, Errors: {}", uploaded, skipped, errors);
+    }
+
+    println!("\nDone!");
     Ok(())
 }
 

@@ -13,6 +13,8 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub nostr: NostrConfig,
+    #[serde(default)]
+    pub blossom: BlossomConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,19 @@ pub struct NostrConfig {
     /// 0 = only root user, 1 = root + direct follows, 2 = friends of friends, etc.
     #[serde(default)]
     pub max_write_distance: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlossomConfig {
+    /// Blossom servers for push/pull
+    #[serde(default = "default_blossom_servers")]
+    pub servers: Vec<String>,
+}
+
+fn default_blossom_servers() -> Vec<String> {
+    vec![
+        "https://blossom.iris.to".to_string(),
+    ]
 }
 
 fn default_crawl_depth() -> u32 {
@@ -124,12 +139,21 @@ impl Default for NostrConfig {
     }
 }
 
+impl Default for BlossomConfig {
+    fn default() -> Self {
+        Self {
+            servers: default_blossom_servers(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
             nostr: NostrConfig::default(),
+            blossom: BlossomConfig::default(),
         }
     }
 }

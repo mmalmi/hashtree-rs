@@ -31,9 +31,9 @@ pub trait ContentStore: Send + Sync + 'static {
 }
 
 /// Pending request tracking (keyed by hash hex)
-struct PendingRequest {
-    hash: Vec<u8>,
-    response_tx: oneshot::Sender<Option<Vec<u8>>>,
+pub struct PendingRequest {
+    pub hash: Vec<u8>,
+    pub response_tx: oneshot::Sender<Option<Vec<u8>>>,
 }
 
 /// WebRTC peer connection with data channel protocol
@@ -45,7 +45,7 @@ pub struct Peer {
 
     pc: Arc<RTCPeerConnection>,
     /// Data channel - can be set from callback when receiving channel from peer
-    data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    pub data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     signaling_tx: mpsc::Sender<SignalingMessage>,
     my_peer_id: PeerId,
 
@@ -53,7 +53,7 @@ pub struct Peer {
     store: Option<Arc<dyn ContentStore>>,
 
     // Track pending outgoing requests (keyed by hash hex)
-    pending_requests: Arc<Mutex<HashMap<String, PendingRequest>>>,
+    pub pending_requests: Arc<Mutex<HashMap<String, PendingRequest>>>,
 
     // Channel for incoming data messages
     message_tx: mpsc::Sender<(DataMessage, Option<Vec<u8>>)>,
