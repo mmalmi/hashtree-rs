@@ -11,6 +11,7 @@ use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
@@ -194,7 +195,12 @@ impl Peer {
     /// Initiate connection (create offer) - for outbound connections
     pub async fn connect(&mut self) -> Result<serde_json::Value> {
         // Create data channel first
-        let dc = self.pc.create_data_channel("hashtree", None).await?;
+        // Use unordered for better performance - protocol is stateless (each message self-describes)
+        let dc_init = RTCDataChannelInit {
+            ordered: Some(false),
+            ..Default::default()
+        };
+        let dc = self.pc.create_data_channel("hashtree", Some(dc_init)).await?;
         self.setup_data_channel(dc.clone()).await?;
         {
             let mut dc_guard = self.data_channel.lock().await;

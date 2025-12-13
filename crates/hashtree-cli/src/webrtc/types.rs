@@ -310,6 +310,7 @@ impl Default for WebRTCConfig {
             hello_interval_ms: 10000,
             message_timeout_ms: 15000,
             stun_servers: vec![
+                "stun:stun.iris.to:3478".to_string(),
                 "stun:stun.l.google.com:19302".to_string(),
                 "stun:stun.cloudflare.com:3478".to_string(),
             ],

@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
@@ -120,12 +121,13 @@ impl<S: Store + 'static> Peer<S> {
             .with_interceptor_registry(registry)
             .build();
 
-        // Configure ICE servers
+        // Configure ICE servers (matches hashtree-ts)
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
                 urls: vec![
+                    "stun:stun.iris.to:3478".to_string(),
                     "stun:stun.l.google.com:19302".to_string(),
-                    "stun:stun1.l.google.com:19302".to_string(),
+                    "stun:stun.cloudflare.com:3478".to_string(),
                 ],
                 ..Default::default()
             }],
@@ -391,9 +393,14 @@ impl<S: Store + 'static> Peer<S> {
         *self.state.write().await = PeerState::Connecting;
 
         // Create data channel
+        // Use unordered for better performance - protocol is stateless (each message self-describes)
+        let dc_init = RTCDataChannelInit {
+            ordered: Some(false),
+            ..Default::default()
+        };
         let dc = self
             .connection
-            .create_data_channel(DATA_CHANNEL_LABEL, None)
+            .create_data_channel(DATA_CHANNEL_LABEL, Some(dc_init))
             .await?;
 
         Self::setup_data_channel_handlers(
