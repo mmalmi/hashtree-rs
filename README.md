@@ -60,6 +60,8 @@ The `Store` trait is just `get(hash) → bytes` and `put(hash, bytes)`. The core
 - `hashtree-sim` - P2P network simulation (Freenet-style HTL forwarding)
 - `git-remote-htree` - Git remote helper (`htree://` protocol)
 
+WebRTC transport falls back to Blossom servers when data isn't found on peers or WebRTC isn't available.
+
 ## Git Remote Helper
 
 Push/pull git repos via hashtree:
