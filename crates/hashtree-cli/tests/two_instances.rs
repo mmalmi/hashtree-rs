@@ -34,14 +34,14 @@ impl TestInstance {
         let config_dir = home_dir.join(".hashtree");
         std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
 
-        // Create config - use temp.iris.to relay for discovery
+        // Create config - use relays that don't require PoW
         let config_content = r#"
 [server]
 enable_auth = false
 stun_port = 0
 
 [nostr]
-relays = ["wss://temp.iris.to"]
+relays = ["wss://temp.iris.to", "wss://relay.damus.io", "wss://relay.snort.social"]
 crawl_depth = 0
 "#;
         std::fs::write(config_dir.join("config.toml"), config_content)
@@ -69,9 +69,9 @@ crawl_depth = 0
             .arg("--addr")
             .arg(format!("127.0.0.1:{}", port))
             .env("HOME", &home_dir)
-            .env("RUST_LOG", "info,hashtree_cli::webrtc=debug")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // Show stderr for debugging
+            .env("RUST_LOG", "warn,hashtree_cli::webrtc::signaling=info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()) // Show errors on stderr
             .spawn()
             .expect("Failed to start htree instance");
 
