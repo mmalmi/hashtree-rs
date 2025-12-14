@@ -15,7 +15,6 @@ tokio = { workspace = true, features = ["sync", "time"] }
 nostr-sdk = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["encryption"]
 nostr = ["nostr-sdk"]
-# Note: encryption feature requires hashtree to export {encrypt, decrypt, key_from_hex, key_to_hex}
-encryption = []
+encryption = ["hashtree/encryption"]
