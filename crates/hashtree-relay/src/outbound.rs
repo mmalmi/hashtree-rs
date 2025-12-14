@@ -77,6 +77,15 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://temp.iris.to",
 ];
 
+/// Result of processing relay events
+#[derive(Default)]
+pub struct ProcessResult {
+    /// Number of events processed
+    pub event_count: usize,
+    /// Subscription IDs that received EOSE
+    pub eose_subs: Vec<String>,
+}
+
 /// Relay manager that handles connections and event ingestion
 pub struct RelayManager {
     pool: RelayPool,
@@ -122,9 +131,12 @@ impl RelayManager {
     }
 
     /// Process pending relay events, ingesting into nostrdb
-    /// Returns number of events processed
-    pub fn process_events(&mut self) -> usize {
-        let mut count = 0;
+    /// Returns processing results including event count and completed subscriptions
+    pub fn process_events(&mut self) -> ProcessResult {
+        let mut result = ProcessResult {
+            event_count: 0,
+            eose_subs: Vec::new(),
+        };
 
         loop {
             let pool_event = if let Some(ev) = self.pool.try_recv() {
@@ -147,8 +159,8 @@ impl RelayManager {
                 RelayEvent::Message(msg) => {
                     use enostr::RelayMessage;
                     match msg {
-                        RelayMessage::Event(_subid, ev) => {
-                            trace!("Event from {}", pool_event.relay);
+                        RelayMessage::Event(subid, ev) => {
+                            info!("EVENT received from {} sub={}", pool_event.relay, subid);
                             if let Err(e) = self.ndb.process_event_with(
                                 &ev,
                                 nostrdb::IngestMetadata::new()
@@ -157,7 +169,7 @@ impl RelayManager {
                             ) {
                                 debug!("Error processing event: {}", e);
                             } else {
-                                count += 1;
+                                result.event_count += 1;
                             }
                         }
                         RelayMessage::Notice(msg) => {
@@ -168,13 +180,14 @@ impl RelayManager {
                         }
                         RelayMessage::Eose(subid) => {
                             debug!("EOSE from {} for {}", pool_event.relay, subid);
+                            result.eose_subs.push(subid.to_string());
                         }
                     }
                 }
             }
         }
 
-        count
+        result
     }
 
     /// Keep connections alive
@@ -236,7 +249,7 @@ pub struct RelayThreadHandle {
 /// Spawn a background thread that polls relays and ingests events.
 /// Uses a dedicated thread since nostrdb::Filter is not Send.
 pub fn spawn_relay_thread(ndb: Ndb, config: RelayConfig) -> RelayThreadHandle {
-    use crate::crawler::{CrawlerState, contact_list_filter, extract_p_tags, KIND_CONTACTS};
+    use crate::crawler::{CrawlerState, contact_list_filter, contact_and_mute_filter, extract_p_tags, KIND_CONTACTS, KIND_MUTE_LIST};
     use std::collections::HashMap;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -297,6 +310,11 @@ pub fn spawn_relay_thread(ndb: Ndb, config: RelayConfig) -> RelayThreadHandle {
         let mut last_crawl_batch = std::time::Instant::now();
         let crawl_batch_interval = Duration::from_millis(500);
 
+        // Live subscription state - subscribed to follows/mutes of social graph users
+        let mut live_sub_active = false;
+        // Track when crawl appears complete to add delay for ndb indexing
+        let mut crawl_complete_time: Option<std::time::Instant> = None;
+
         info!(
             "Relay thread started with {} relays",
             config.relays.len()
@@ -307,12 +325,24 @@ pub fn spawn_relay_thread(ndb: Ndb, config: RelayConfig) -> RelayThreadHandle {
 
         while !shutdown_clone.load(Ordering::SeqCst) {
             // Wait for wakeup or timeout
-            let _ = wakeup_rx.recv_timeout(Duration::from_millis(100));
+            match wakeup_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(_) => trace!("Wakeup received"),
+                Err(_) => {} // timeout, normal
+            }
 
             // Process relay events
-            let count = manager.process_events();
-            if count > 0 {
-                trace!("Processed {} events", count);
+            let result = manager.process_events();
+            if result.event_count > 0 {
+                info!("Processed {} events from relays", result.event_count);
+            }
+
+            // Handle EOSE for crawl subscriptions
+            for subid in result.eose_subs {
+                if subid.starts_with("crawl_") {
+                    if crawl_subs.remove(&subid).is_some() {
+                        debug!("Crawl subscription {} completed (EOSE)", subid);
+                    }
+                }
             }
 
             // All database operations use a single transaction per iteration
@@ -337,20 +367,32 @@ pub fn spawn_relay_thread(ndb: Ndb, config: RelayConfig) -> RelayThreadHandle {
                         }
                     }
 
-                    // Process contact lists from ndb to extract follows
-                    let contact_filter = FilterBuilder::new()
-                        .kinds(vec![KIND_CONTACTS])
-                        .limit(100)
-                        .build();
+                    // Process contact lists and mute lists from ndb to extract follows
+                    // Query specifically for users in our depth_map, in batches to avoid filter limits
+                    let known_users: Vec<[u8; 32]> = crawler_state.seen.iter().copied().collect();
+                    let query_batch_size = 500; // Limit authors per query to avoid nostrdb filter limits
+                    for chunk in known_users.chunks(query_batch_size) {
+                        let contact_filter = FilterBuilder::new()
+                            .kinds(vec![KIND_CONTACTS, KIND_MUTE_LIST])
+                            .authors(chunk.iter())
+                            .build();
 
-                    if let Ok(results) = manager.ndb.query(&txn, &[contact_filter], 100) {
-                        for result in results.iter() {
-                            let author = result.note.pubkey();
-                            if let Some(depth) = crawler_state.get_depth(author) {
-                                let p_tags = extract_p_tags(&manager.ndb, &txn, result.note_key);
-                                if !p_tags.is_empty() {
-                                    crawler_state.process_contact_list(author, p_tags, depth);
+                        match manager.ndb.query(&txn, &[contact_filter], chunk.len() as i32) {
+                            Ok(results) => {
+                                for result in results.iter() {
+                                    let author = result.note.pubkey();
+                                    if let Some(depth) = crawler_state.get_depth(author) {
+                                        let p_tags = extract_p_tags(&manager.ndb, &txn, result.note_key);
+                                        if !p_tags.is_empty() {
+                                            debug!("Contact list from {} has {} follows at depth {}",
+                                                hex::encode(author), p_tags.len(), depth);
+                                            crawler_state.process_contact_list(author, p_tags, depth);
+                                        }
+                                    }
                                 }
+                            }
+                            Err(e) => {
+                                debug!("Failed to query contact lists: {}", e);
                             }
                         }
                     }
@@ -364,6 +406,37 @@ pub fn spawn_relay_thread(ndb: Ndb, config: RelayConfig) -> RelayThreadHandle {
                             stats.queue_count,
                             crawl_subs.len()
                         );
+                    }
+
+                    // Start live subscription once crawl is complete (with delay for ndb indexing)
+                    let crawl_appears_done = stats.queue_count == 0 && crawl_subs.is_empty();
+                    if crawl_appears_done && crawl_complete_time.is_none() {
+                        crawl_complete_time = Some(std::time::Instant::now());
+                        debug!("Crawl appears complete, waiting for ndb to index...");
+                    } else if !crawl_appears_done {
+                        crawl_complete_time = None; // Reset if more work appears
+                    }
+
+                    // Wait 2 seconds after crawl appears complete to ensure ndb has indexed
+                    let ready_for_live = crawl_complete_time
+                        .map(|t| t.elapsed() >= Duration::from_secs(2))
+                        .unwrap_or(false);
+
+                    if !live_sub_active && ready_for_live && stats.seen_count > 0 {
+                        // Subscribe to follows/mutes of all discovered users
+                        let users: Vec<[u8; 32]> = crawler_state.seen.iter().copied().collect();
+                        if !users.is_empty() {
+                            // Split into batches to avoid too large subscriptions
+                            let batch_size = 500;
+                            for (i, chunk) in users.chunks(batch_size).enumerate() {
+                                let filter = contact_and_mute_filter(chunk);
+                                let sub_id = format!("live_{}", i);
+                                manager.subscribe(sub_id.clone(), vec![filter]);
+                                info!("Started live subscription {} for {} users", sub_id, chunk.len());
+                            }
+                            live_sub_active = true;
+                            info!("Live subscription active for {} social graph users (follows & mutes)", users.len());
+                        }
                     }
                 }
             }

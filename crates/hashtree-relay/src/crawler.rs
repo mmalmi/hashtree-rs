@@ -143,42 +143,56 @@ pub struct CrawlerStats {
     pub queue_count: usize,
 }
 
-/// Build a filter for contact lists from specific authors
-pub fn contact_list_filter(authors: &[[u8; 32]]) -> Filter {
+/// Build a filter for contact lists and mute lists from specific authors
+pub fn contact_and_mute_filter(authors: &[[u8; 32]]) -> Filter {
     FilterBuilder::new()
-        .kinds(vec![KIND_CONTACTS])
+        .kinds(vec![KIND_CONTACTS, KIND_MUTE_LIST])
         .authors(authors.iter())
         .build()
+}
+
+/// Build a filter for contact lists from specific authors (legacy, use contact_and_mute_filter)
+pub fn contact_list_filter(authors: &[[u8; 32]]) -> Filter {
+    contact_and_mute_filter(authors)
 }
 
 /// Extract p-tags (followed pubkeys) from a contact list note
 pub fn extract_p_tags(ndb: &Ndb, txn: &Transaction, note_key: nostrdb::NoteKey) -> Vec<[u8; 32]> {
     let note = match ndb.get_note_by_key(txn, note_key) {
         Ok(n) => n,
-        Err(_) => return vec![],
+        Err(e) => {
+            debug!("Failed to get note by key: {}", e);
+            return vec![];
+        }
     };
 
     let mut followed = Vec::new();
     let tags = note.tags();
+    let tag_count = tags.count();
 
+    debug!("Note has {} tags", tag_count);
+
+    let mut p_count = 0;
     for tag in tags.iter() {
         // p-tag format: ["p", <pubkey>, ...optional relay/petname]
-        if tag.count() >= 2 {
-            if let Some(tag_name) = tag.get(0).and_then(|e| e.str()) {
-                if tag_name == "p" {
-                    if let Some(pk_str) = tag.get(1).and_then(|e| e.str()) {
-                        if let Ok(pk_bytes) = hex::decode(pk_str) {
-                            if pk_bytes.len() == 32 {
-                                let mut pk = [0u8; 32];
-                                pk.copy_from_slice(&pk_bytes);
-                                followed.push(pk);
-                            }
-                        }
+        let elem_count = tag.count();
+        if elem_count >= 2 {
+            let tag_name = tag.get(0).and_then(|e| e.str());
+            if p_count == 0 {
+                debug!("First tag: name={:?}, elem_count={}", tag_name, elem_count);
+            }
+            if let Some(name) = tag_name {
+                if name == "p" {
+                    p_count += 1;
+                    // Use get_id() for 32-byte pubkey extraction
+                    if let Some(pk) = tag.get_id(1) {
+                        followed.push(*pk);
                     }
                 }
             }
         }
     }
+    debug!("Found {} p-tags, extracted {} follows", p_count, followed.len());
 
     followed
 }
