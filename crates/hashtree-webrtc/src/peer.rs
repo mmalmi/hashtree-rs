@@ -58,6 +58,7 @@ struct TheirRequest {
     /// Their request ID (for response correlation)
     id: u32,
     /// When they requested it
+    #[allow(dead_code)]
     requested_at: std::time::Instant,
 }
 

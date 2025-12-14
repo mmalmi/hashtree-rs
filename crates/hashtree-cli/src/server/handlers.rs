@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use super::auth::AppState;
-use super::mime::get_mime_type;
 use super::ui::{root_page, serve_directory_html, serve_directory_json};
 use crate::webrtc::{ConnectionState, WebRTCState};
 
@@ -217,7 +216,7 @@ pub async fn serve_content_or_blob(
     headers: axum::http::HeaderMap,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> impl IntoResponse {
-    let client_ip = headers
+    let _client_ip = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())

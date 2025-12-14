@@ -7,7 +7,7 @@
 //! 4. Recursively crawling up to a configurable depth
 
 use nostrdb::{Filter, FilterBuilder, Ndb, Transaction};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use tracing::{debug, trace};
 
 /// Contact list event kind (NIP-02)

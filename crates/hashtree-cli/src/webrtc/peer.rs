@@ -5,7 +5,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
@@ -57,6 +57,7 @@ pub struct Peer {
 
     // Channel for incoming data messages
     message_tx: mpsc::Sender<(DataMessage, Option<Vec<u8>>)>,
+    #[allow(dead_code)]
     message_rx: Option<mpsc::Receiver<(DataMessage, Option<Vec<u8>>)>>,
 }
 
@@ -350,7 +351,6 @@ impl Peer {
         // Track pending binary data (request_id -> expected after response)
         let pending_binary: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
-        let dc_for_open = dc.clone();
         let peer_short_open = peer_short.clone();
         dc.on_open(Box::new(move || {
             info!("[Peer {}] Data channel '{}' open", peer_short_open, label);
@@ -366,8 +366,8 @@ impl Peer {
             let dc = dc_for_msg.clone();
             let peer_short = peer_short_msg.clone();
             let pending_requests = pending_requests.clone();
-            let pending_binary = pending_binary_clone.clone();
-            let message_tx = message_tx.clone();
+            let _pending_binary = pending_binary_clone.clone();
+            let _message_tx = message_tx.clone();
             let store = store_clone.clone();
 
             Box::pin(async move {

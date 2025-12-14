@@ -17,3 +17,5 @@ nostr-sdk = { workspace = true, optional = true }
 [features]
 default = []
 nostr = ["nostr-sdk"]
+# Note: encryption feature requires hashtree to export {encrypt, decrypt, key_from_hex, key_to_hex}
+encryption = []

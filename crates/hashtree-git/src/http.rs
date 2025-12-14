@@ -109,8 +109,6 @@ pub fn handle_upload_pack(storage: &GitStorage, body: &[u8]) -> Result<Vec<u8>> 
     let mut reader = PktLineReader::new(body);
     let mut wants = Vec::new();
     let mut haves = Vec::new();
-    let mut done = false;
-
     // Parse want/have lines
     while let Some(pkt) = reader.read()? {
         match pkt {
@@ -129,24 +127,21 @@ pub fn handle_upload_pack(storage: &GitStorage, body: &[u8]) -> Result<Vec<u8>> 
                     if let Some(oid) = ObjectId::from_hex(oid_hex.trim()) {
                         haves.push(oid);
                     }
-                } else if line == "done" {
-                    done = true;
                 }
+                // Note: "done" is parsed by protocol but not used in this implementation
             }
             _ => {}
         }
     }
 
-    // Check for "done" in remaining data after flush
+    // Check for additional "have" lines in remaining data after flush
     let remaining = reader.remaining();
     if !remaining.is_empty() {
         let mut reader2 = PktLineReader::new(remaining);
         while let Some(pkt) = reader2.read()? {
             if let PktLine::Data(data) = pkt {
                 let line = std::str::from_utf8(data).unwrap_or("").trim();
-                if line == "done" {
-                    done = true;
-                } else if let Some(oid_hex) = line.strip_prefix("have ") {
+                if let Some(oid_hex) = line.strip_prefix("have ") {
                     if let Some(oid) = ObjectId::from_hex(oid_hex.trim()) {
                         haves.push(oid);
                     }

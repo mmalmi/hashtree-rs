@@ -54,6 +54,7 @@ impl Default for NostrResolverConfig {
 /// Tag names for hashtree events
 const TAG_HASH: &str = "hash";
 const TAG_KEY: &str = "key";
+#[allow(dead_code)]
 const TAG_ENCRYPTED_KEY: &str = "encrypted_key";
 
 /// Subscription state
