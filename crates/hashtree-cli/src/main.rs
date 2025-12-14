@@ -14,10 +14,6 @@
 //!   htree user [<nsec>]
 //!   htree publish <ref_name> <hash> [--key <key>]
 
-// Install rustls crypto provider (required for TLS)
-#[cfg(feature = "s3")]
-use rustls::crypto::ring::default_provider;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
@@ -33,7 +29,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "htree")]
-#[command(about = "Content-addressed storage with Scionic Merkle Trees", long_about = None)]
+#[command(about = "Like Blossom, but with directories and chunking", long_about = None)]
 struct Cli {
     #[arg(long, default_value = "./hashtree-data", global = true, env = "HTREE_DATA_DIR")]
     data_dir: PathBuf,
@@ -139,9 +135,8 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install rustls crypto provider (required for TLS in reqwest/S3)
-    #[cfg(feature = "s3")]
-    let _ = default_provider().install_default();
+    // Install rustls crypto provider (required for TLS connections)
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize tracing (respects RUST_LOG env var)
     tracing_subscriber::fmt::init();

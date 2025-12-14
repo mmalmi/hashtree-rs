@@ -1,12 +1,13 @@
 //! WebRTC signaling over Nostr relays
 //!
-//! Uses the same protocol as iris-client for compatibility:
-//! - Event kind: 30078 (KIND_APP_DATA)
-//! - Tag: ["l", "webrtc"]
+//! Protocol (compatible with hashtree-ts):
+//! - All signaling uses ephemeral kind 25050
+//! - Hello messages: #l: "hello" tag, broadcast for peer discovery (unencrypted)
+//! - Directed signaling (offer, answer, candidate, candidates): NIP-17 style
+//!   gift wrap for privacy - wrapped with ephemeral key, #p tag with recipient
 //!
-//! Security: Directed signaling messages (offer, answer, candidate, candidates)
-//! are encrypted with NIP-44 for privacy. Hello messages remain unencrypted
-//! for peer discovery.
+//! Security: Directed messages use gift wrapping with ephemeral keys so that
+//! relays cannot see the actual sender or correlate messages.
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
@@ -20,7 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use super::peer::{ContentStore, Peer, PendingRequest};
 use super::types::{
-    generate_uuid, PeerDirection, PeerId, PeerPool, PeerStatus, PoolConfig, SignalingMessage, WebRTCConfig, WEBRTC_TAG,
+    generate_uuid, PeerDirection, PeerId, PeerPool, PeerStatus, PoolConfig, SignalingMessage, WebRTCConfig, WEBRTC_KIND, HELLO_TAG,
 };
 
 /// Callback type for classifying peers into pools
@@ -432,20 +433,30 @@ impl WebRTCManager {
         let (ws_stream, _) = connect_async(&url).await?;
         let (mut write, mut read) = ws_stream.split();
 
-        // Subscribe to webrtc events
-        let filter = Filter::new()
-            .kind(Kind::ApplicationSpecificData)
+        // Subscribe to webrtc events - two filters:
+        // 1. Hello messages: kind 25050 with #l: "hello" tag
+        // 2. Directed messages: kind 25050 with #p tag (our pubkey)
+        let hello_filter = Filter::new()
+            .kind(Kind::Ephemeral(WEBRTC_KIND as u16))
             .custom_tag(
                 nostr::SingleLetterTag::lowercase(nostr::Alphabet::L),
-                vec![WEBRTC_TAG],
+                vec![HELLO_TAG],
+            )
+            .since(nostr::Timestamp::now() - Duration::from_secs(60));
+
+        let directed_filter = Filter::new()
+            .kind(Kind::Ephemeral(WEBRTC_KIND as u16))
+            .custom_tag(
+                nostr::SingleLetterTag::lowercase(nostr::Alphabet::P),
+                vec![keys.public_key().to_hex()],
             )
             .since(nostr::Timestamp::now() - Duration::from_secs(60));
 
         let sub_id = nostr::SubscriptionId::generate();
-        let sub_msg = ClientMessage::req(sub_id.clone(), vec![filter]);
+        let sub_msg = ClientMessage::req(sub_id.clone(), vec![hello_filter, directed_filter]);
         write.send(Message::Text(sub_msg.as_json().into())).await?;
 
-        info!("Subscribed to {} for WebRTC events", url);
+        info!("Subscribed to {} for WebRTC events (kind {})", url, WEBRTC_KIND);
 
         let mut last_hello = Instant::now() - hello_interval; // Send immediately
         let mut hello_ticker = tokio::time::interval(Duration::from_secs(1));
@@ -509,41 +520,60 @@ impl WebRTCManager {
 
     /// Create a signaling event
     ///
-    /// For directed messages (offer, answer, candidate, candidates), the content
-    /// is encrypted with NIP-04 using the recipient's public key.
-    /// Hello messages use tags only (d="hello", peerId tag), no content needed.
+    /// For directed messages (offer, answer, candidate, candidates), use NIP-17 style
+    /// gift wrapping with ephemeral keys for privacy.
+    /// Hello messages use kind 25050 with #l: "hello" tag and peerId.
     async fn create_signaling_event(keys: &Keys, msg: &SignalingMessage) -> Result<nostr::Event> {
-        // Check if message has a recipient (needs encryption)
-        let (content, tags) = if let Some(recipient_str) = msg.recipient() {
+        // Check if message has a recipient (needs gift wrapping)
+        if let Some(recipient_str) = msg.recipient() {
             // Parse recipient to get their pubkey
-            let content = if let Some(peer_id) = PeerId::from_string(recipient_str) {
-                // Encrypt the message content with NIP-44
-                let plaintext = serde_json::to_string(msg)?;
+            if let Some(peer_id) = PeerId::from_string(recipient_str) {
                 let recipient_pubkey = PublicKey::from_hex(&peer_id.pubkey)?;
 
-                let encrypted = nip44::encrypt(keys.secret_key(), &recipient_pubkey, &plaintext, nip44::Version::V2)?;
-                encrypted
-            } else {
-                // Fallback to unencrypted if can't parse recipient
-                serde_json::to_string(msg)?
-            };
-            // Directed messages use unique UUID as d-tag
-            let tags = vec![
-                Tag::parse(["l", WEBRTC_TAG])?,
-                Tag::parse(["d", &generate_uuid()])?,
-            ];
-            (content, tags)
-        } else {
-            // Hello messages - peerId in tag, no content needed
-            let tags = vec![
-                Tag::parse(["l", WEBRTC_TAG])?,
-                Tag::parse(["d", "hello"])?,
-                Tag::parse(["peerId", msg.peer_id()])?,
-            ];
-            (String::new(), tags)
-        };
+                // Create seal with sender's actual pubkey (the "rumor")
+                let seal = serde_json::json!({
+                    "pubkey": keys.public_key().to_hex(),
+                    "kind": WEBRTC_KIND,
+                    "content": serde_json::to_string(msg)?,
+                    "tags": []
+                });
 
-        let event = EventBuilder::new(Kind::ApplicationSpecificData, content)
+                // Generate ephemeral keypair for the wrapper
+                let ephemeral_keys = Keys::generate();
+
+                // Encrypt the seal for the recipient using ephemeral key (NIP-44)
+                let encrypted_content = nip44::encrypt(
+                    ephemeral_keys.secret_key(),
+                    &recipient_pubkey,
+                    &seal.to_string(),
+                    nip44::Version::V2
+                )?;
+
+                // Create wrapper event with ephemeral key
+                let created_at = nostr::Timestamp::now();
+                let expiration = created_at + Duration::from_secs(5 * 60); // 5 minutes
+
+                let tags = vec![
+                    Tag::parse(["p", &recipient_pubkey.to_hex()])?,
+                    Tag::parse(["expiration", &expiration.as_u64().to_string()])?,
+                ];
+
+                let event = EventBuilder::new(Kind::Ephemeral(WEBRTC_KIND as u16), encrypted_content)
+                    .tags(tags)
+                    .sign(&ephemeral_keys)
+                    .await?;
+
+                return Ok(event);
+            }
+        }
+
+        // Hello messages - kind 25050 with #l: "hello" tag and peerId
+        let tags = vec![
+            Tag::parse(["l", HELLO_TAG])?,
+            Tag::parse(["peerId", msg.peer_id()])?,
+        ];
+
+        let event = EventBuilder::new(Kind::Ephemeral(WEBRTC_KIND as u16), "")
             .tags(tags)
             .sign(keys)
             .await?;
@@ -554,28 +584,16 @@ impl WebRTCManager {
     /// Handle an incoming event
     ///
     /// Messages may be:
-    /// 1. Hello messages (d-tag="hello", peerId in tag, no content)
-    /// 2. NIP-04 encrypted directed messages (offer, answer, candidate, candidates)
+    /// 1. Hello messages: kind 25050 with #l: "hello" tag and peerId
+    /// 2. Gift-wrapped directed messages: kind 25050 with #p tag, encrypted with ephemeral key
     async fn handle_event(
         &self,
         relay: &str,
         event: &nostr::Event,
         relay_write_tx: &tokio::sync::broadcast::Sender<SignalingMessage>,
     ) -> Result<()> {
-        // Check if this is a webrtc event
-        let has_webrtc_tag = event.tags.iter().any(|tag| {
-            let v: Vec<String> = tag.clone().to_vec();
-            v.len() >= 2 && v[0] == "l" && v[1] == WEBRTC_TAG
-        });
-
-        if !has_webrtc_tag || event.kind != Kind::ApplicationSpecificData {
-            return Ok(());
-        }
-
-        let sender_pubkey = event.pubkey.to_hex();
-
-        // Skip our own messages
-        if sender_pubkey == self.my_peer_id.pubkey {
+        // Must be kind 25050
+        if event.kind != Kind::Ephemeral(WEBRTC_KIND as u16) {
             return Ok(());
         }
 
@@ -591,12 +609,17 @@ impl WebRTCManager {
             })
         };
 
-        // Check if this is a hello message (d-tag = "hello")
-        let d_tag = get_tag("d");
-        let peer_id_tag = get_tag("peerId");
-        debug!("[WebRTC] Event d-tag: {:?}, peerId: {:?}", d_tag, peer_id_tag.as_ref().map(|s| &s[..8.min(s.len())]));
-        if d_tag.as_deref() == Some("hello") {
-            if let Some(their_uuid) = peer_id_tag {
+        // Check if this is a hello message (#l: "hello" tag)
+        let l_tag = get_tag("l");
+        if l_tag.as_deref() == Some(HELLO_TAG) {
+            let sender_pubkey = event.pubkey.to_hex();
+
+            // Skip our own hello messages
+            if sender_pubkey == self.my_peer_id.pubkey {
+                return Ok(());
+            }
+
+            if let Some(their_uuid) = get_tag("peerId") {
                 debug!("Received hello from {} via {}", &sender_pubkey[..8], relay);
                 self.handle_hello(&sender_pubkey, &their_uuid, relay_write_tx)
                     .await?;
@@ -604,25 +627,50 @@ impl WebRTCManager {
             return Ok(());
         }
 
-        // Directed message - must be encrypted
+        // Check if this is a directed message for us (#p tag with our pubkey)
+        let p_tag = get_tag("p");
+        if p_tag.as_deref() != Some(&self.keys.public_key().to_hex()) {
+            // Not for us - ignore silently
+            return Ok(());
+        }
+
+        // Gift-wrapped directed message - decrypt using our key and ephemeral sender's pubkey
         if event.content.is_empty() {
             return Ok(());
         }
 
-        // Try NIP-44 decryption (silently ignore messages not meant for us)
-        let msg: SignalingMessage = match nip44::decrypt(self.keys.secret_key(), &event.pubkey, &event.content) {
+        // Try to unwrap the gift - decrypt with our key and the ephemeral sender's pubkey
+        let seal: serde_json::Value = match nip44::decrypt(self.keys.secret_key(), &event.pubkey, &event.content) {
             Ok(plaintext) => {
-                debug!("Decrypted message from {}: {}", &sender_pubkey[..8], &plaintext[..50.min(plaintext.len())]);
-                serde_json::from_str(&plaintext)?
+                match serde_json::from_str(&plaintext) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(()),
+                }
             }
             Err(_) => {
-                // Not for us - ignore silently (very common, no need to log)
+                // Can't decrypt - not for us or invalid
                 return Ok(());
             }
         };
 
+        // Extract the actual sender's pubkey and content from the seal
+        let sender_pubkey = seal.get("pubkey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing pubkey in seal"))?;
+
+        // Skip our own messages
+        if sender_pubkey == self.my_peer_id.pubkey {
+            return Ok(());
+        }
+
+        let content = seal.get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing content in seal"))?;
+
+        let msg: SignalingMessage = serde_json::from_str(content)?;
+
         debug!(
-            "Received {} from {} via {}",
+            "Received {} from {} via {} (gift-wrapped)",
             msg.msg_type(),
             &sender_pubkey[..8],
             relay
@@ -630,8 +678,7 @@ impl WebRTCManager {
 
         match msg {
             SignalingMessage::Hello { .. } => {
-                // Hello messages should come via tags, not JSON content
-                // This branch handles legacy/fallback
+                // Hello messages should come via tags, not gift wrap
                 return Ok(());
             }
             SignalingMessage::Offer {
