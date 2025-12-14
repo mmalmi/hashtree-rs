@@ -6,12 +6,254 @@ use hashtree::{
     HashTree, HashTreeConfig, Cid,
     sha256, to_hex, from_hex, Hash, TreeNode, DirEntry as HashTreeDirEntry,
 };
-use hashtree::store::Store;
+use hashtree::store::{Store, StoreError};
 use std::path::Path;
 use std::collections::HashSet;
 use std::io::Read;
 use std::sync::Arc;
 use futures::executor::block_on as sync_block_on;
+
+#[cfg(feature = "s3")]
+use tokio::sync::mpsc;
+
+use crate::config::S3Config;
+
+/// Message for background S3 sync
+#[cfg(feature = "s3")]
+enum S3SyncMessage {
+    Upload { hash: Hash, data: Vec<u8> },
+    Delete { hash: Hash },
+}
+
+/// Storage router - LMDB primary with optional S3 backup
+///
+/// Write path: LMDB first (fast), then queue S3 upload (non-blocking)
+/// Read path: LMDB first, fall back to S3 if miss
+pub struct StorageRouter {
+    /// Primary local store (always used)
+    local: Arc<LmdbBlobStore>,
+    /// Optional S3 client for backup
+    #[cfg(feature = "s3")]
+    s3_client: Option<aws_sdk_s3::Client>,
+    #[cfg(feature = "s3")]
+    s3_bucket: Option<String>,
+    #[cfg(feature = "s3")]
+    s3_prefix: String,
+    /// Channel to send uploads to background task
+    #[cfg(feature = "s3")]
+    sync_tx: Option<mpsc::UnboundedSender<S3SyncMessage>>,
+}
+
+impl StorageRouter {
+    /// Create router with LMDB only
+    pub fn new(local: Arc<LmdbBlobStore>) -> Self {
+        Self {
+            local,
+            #[cfg(feature = "s3")]
+            s3_client: None,
+            #[cfg(feature = "s3")]
+            s3_bucket: None,
+            #[cfg(feature = "s3")]
+            s3_prefix: String::new(),
+            #[cfg(feature = "s3")]
+            sync_tx: None,
+        }
+    }
+
+    /// Create router with LMDB + S3 backup
+    #[cfg(feature = "s3")]
+    pub async fn with_s3(local: Arc<LmdbBlobStore>, config: &S3Config) -> Result<Self, anyhow::Error> {
+        use aws_sdk_s3::Client as S3Client;
+
+        // Build AWS config
+        let mut aws_config_loader = aws_config::from_env();
+        aws_config_loader = aws_config_loader.region(aws_sdk_s3::config::Region::new(config.region.clone()));
+        let aws_config = aws_config_loader.load().await;
+
+        // Build S3 client with custom endpoint
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
+        s3_config_builder = s3_config_builder
+            .endpoint_url(&config.endpoint)
+            .force_path_style(true);
+
+        let s3_client = S3Client::from_conf(s3_config_builder.build());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone().unwrap_or_default();
+
+        // Create background sync channel
+        let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<S3SyncMessage>();
+
+        // Spawn background sync task
+        let sync_client = s3_client.clone();
+        let sync_bucket = bucket.clone();
+        let sync_prefix = prefix.clone();
+
+        tokio::spawn(async move {
+            use aws_sdk_s3::primitives::ByteStream;
+
+            tracing::info!("S3 background sync task started");
+
+            while let Some(msg) = sync_rx.recv().await {
+                match msg {
+                    S3SyncMessage::Upload { hash, data } => {
+                        let key = format!("{}{}", sync_prefix, to_hex(&hash));
+                        tracing::debug!("S3 uploading {} ({} bytes)", &key[..16.min(key.len())], data.len());
+
+                        if let Err(e) = sync_client
+                            .put_object()
+                            .bucket(&sync_bucket)
+                            .key(&key)
+                            .body(ByteStream::from(data))
+                            .send()
+                            .await
+                        {
+                            tracing::error!("S3 upload failed for {}: {}", &key[..16.min(key.len())], e);
+                        }
+                    }
+                    S3SyncMessage::Delete { hash } => {
+                        let key = format!("{}{}", sync_prefix, to_hex(&hash));
+                        tracing::debug!("S3 deleting {}", &key[..16.min(key.len())]);
+
+                        if let Err(e) = sync_client
+                            .delete_object()
+                            .bucket(&sync_bucket)
+                            .key(&key)
+                            .send()
+                            .await
+                        {
+                            tracing::error!("S3 delete failed for {}: {}", &key[..16.min(key.len())], e);
+                        }
+                    }
+                }
+            }
+        });
+
+        tracing::info!("S3 storage initialized: bucket={}, prefix={}", bucket, prefix);
+
+        Ok(Self {
+            local,
+            s3_client: Some(s3_client),
+            s3_bucket: Some(bucket),
+            s3_prefix: prefix,
+            sync_tx: Some(sync_tx),
+        })
+    }
+
+    /// Store data - writes to LMDB, queues S3 upload in background
+    pub fn put_sync(&self, hash: Hash, data: &[u8]) -> Result<bool, StoreError> {
+        // Always write to local first
+        let is_new = self.local.put_sync(hash, data)?;
+
+        // Queue S3 upload if configured (non-blocking)
+        #[cfg(feature = "s3")]
+        if is_new {
+            if let Some(ref tx) = self.sync_tx {
+                let _ = tx.send(S3SyncMessage::Upload { hash, data: data.to_vec() });
+            }
+        }
+
+        Ok(is_new)
+    }
+
+    /// Get data - tries LMDB first, falls back to S3
+    pub fn get_sync(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+        // Try local first
+        if let Some(data) = self.local.get_sync(hash)? {
+            return Ok(Some(data));
+        }
+
+        // Fall back to S3 if configured
+        #[cfg(feature = "s3")]
+        if let (Some(ref client), Some(ref bucket)) = (&self.s3_client, &self.s3_bucket) {
+            let key = format!("{}{}", self.s3_prefix, to_hex(hash));
+
+            match sync_block_on(async {
+                client.get_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .send()
+                    .await
+            }) {
+                Ok(output) => {
+                    if let Ok(body) = sync_block_on(output.body.collect()) {
+                        let data = body.into_bytes().to_vec();
+                        // Cache locally for future reads
+                        let _ = self.local.put_sync(*hash, &data);
+                        return Ok(Some(data));
+                    }
+                }
+                Err(e) => {
+                    let service_err = e.into_service_error();
+                    if !service_err.is_no_such_key() {
+                        tracing::warn!("S3 get failed: {}", service_err);
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Check if hash exists
+    pub fn exists(&self, hash: &Hash) -> Result<bool, StoreError> {
+        // Check local first
+        if self.local.exists(hash)? {
+            return Ok(true);
+        }
+
+        // Check S3 if configured
+        #[cfg(feature = "s3")]
+        if let (Some(ref client), Some(ref bucket)) = (&self.s3_client, &self.s3_bucket) {
+            let key = format!("{}{}", self.s3_prefix, to_hex(hash));
+
+            match sync_block_on(async {
+                client.head_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .send()
+                    .await
+            }) {
+                Ok(_) => return Ok(true),
+                Err(e) => {
+                    let service_err = e.into_service_error();
+                    if !service_err.is_not_found() {
+                        tracing::warn!("S3 head failed: {}", service_err);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Delete data from both stores
+    pub fn delete_sync(&self, hash: &Hash) -> Result<bool, StoreError> {
+        let deleted = self.local.delete_sync(hash)?;
+
+        // Queue S3 delete if configured
+        #[cfg(feature = "s3")]
+        if let Some(ref tx) = self.sync_tx {
+            let _ = tx.send(S3SyncMessage::Delete { hash: *hash });
+        }
+
+        Ok(deleted)
+    }
+
+    /// Get stats from local store
+    pub fn stats(&self) -> Result<hashtree_lmdb::LmdbStats, StoreError> {
+        self.local.stats()
+    }
+
+    /// List all hashes from local store
+    pub fn list(&self) -> Result<Vec<Hash>, StoreError> {
+        self.local.list()
+    }
+
+    /// Get the underlying LMDB store for HashTree operations
+    pub fn local_store(&self) -> Arc<LmdbBlobStore> {
+        Arc::clone(&self.local)
+    }
+}
 
 pub struct HashtreeStore {
     env: heed::Env,
@@ -23,12 +265,19 @@ pub struct HashtreeStore {
     blob_owners: Database<Str, Str>,
     /// Maps pubkey -> blob metadata JSON (for blossom list)
     pubkey_blobs: Database<Str, Bytes>,
-    /// Raw blob storage (sha256-addressed) - implements hashtree Store trait
-    blobs: Arc<LmdbBlobStore>,
+    /// Storage router - handles LMDB + optional S3
+    router: StorageRouter,
 }
 
 impl HashtreeStore {
+    /// Create a new store with local LMDB storage only
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::with_s3(path, None)
+    }
+
+    /// Create a new store with optional S3 backend
+    /// If s3_config is Some, blobs will be synced to S3 in the background
+    pub fn with_s3<P: AsRef<Path>>(path: P, s3_config: Option<&S3Config>) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
@@ -46,9 +295,30 @@ impl HashtreeStore {
         let pubkey_blobs = env.create_database(&mut wtxn, Some("pubkey_blobs"))?;
         wtxn.commit()?;
 
-        // Create blob store in subdirectory
-        let blobs = Arc::new(LmdbBlobStore::new(path.join("blobs"))
+        // Create local LMDB blob store
+        let lmdb_store = Arc::new(LmdbBlobStore::new(path.join("blobs"))
             .map_err(|e| anyhow::anyhow!("Failed to create blob store: {}", e))?);
+
+        // Create storage router with optional S3
+        #[cfg(feature = "s3")]
+        let router = if let Some(s3_cfg) = s3_config {
+            tracing::info!("Initializing S3 storage backend: bucket={}, endpoint={}",
+                s3_cfg.bucket, s3_cfg.endpoint);
+
+            sync_block_on(async {
+                StorageRouter::with_s3(lmdb_store, s3_cfg).await
+            })?
+        } else {
+            StorageRouter::new(lmdb_store)
+        };
+
+        #[cfg(not(feature = "s3"))]
+        let router = {
+            if s3_config.is_some() {
+                tracing::warn!("S3 config provided but S3 feature not enabled. Using local storage only.");
+            }
+            StorageRouter::new(lmdb_store)
+        };
 
         Ok(Self {
             env,
@@ -56,18 +326,18 @@ impl HashtreeStore {
             sha256_index,
             blob_owners,
             pubkey_blobs,
-            blobs,
+            router,
         })
     }
 
-    /// Get access to the underlying blob store.
-    pub fn blob_store(&self) -> &LmdbBlobStore {
-        &self.blobs
+    /// Get the storage router
+    pub fn router(&self) -> &StorageRouter {
+        &self.router
     }
 
-    /// Get the blob store as Arc for async operations.
+    /// Get the underlying LMDB store for HashTree operations
     pub fn blob_store_arc(&self) -> Arc<LmdbBlobStore> {
-        Arc::clone(&self.blobs)
+        self.router.local_store()
     }
 
     /// Upload a file and return its CID (public/unencrypted)
@@ -80,7 +350,7 @@ impl HashtreeStore {
         let sha256_hex = to_hex(&content_sha256);
 
         // Use hashtree to store the file (public mode - no encryption)
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let cid = sync_block_on(async {
@@ -121,7 +391,7 @@ impl HashtreeStore {
         let sha256_hex = to_hex(&content_sha256);
 
         // Use HashTree.put for upload (public mode for blossom)
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let cid = sync_block_on(async {
@@ -154,7 +424,7 @@ impl HashtreeStore {
     pub fn upload_dir_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
 
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let root_cid = sync_block_on(async {
@@ -284,7 +554,7 @@ impl HashtreeStore {
         let file_content = std::fs::read(file_path)?;
 
         // Use unified API with encryption enabled (default)
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store));
 
         let cid = sync_block_on(async {
@@ -310,7 +580,7 @@ impl HashtreeStore {
     /// Returns CID as "hash:key" format for encrypted directories
     pub fn upload_dir_encrypted_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
 
         // Use unified API with encryption enabled (default)
         let tree = HashTree::new(HashTreeConfig::new(store));
@@ -334,7 +604,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
@@ -352,7 +622,7 @@ impl HashtreeStore {
     /// Store a raw blob, returns SHA256 hash as hex.
     pub fn put_blob(&self, data: &[u8]) -> Result<String> {
         let hash = sha256(data);
-        self.blobs.put_sync(hash, data)
+        self.router.put_sync(hash, data)
             .map_err(|e| anyhow::anyhow!("Failed to store blob: {}", e))?;
         Ok(to_hex(&hash))
     }
@@ -361,7 +631,7 @@ impl HashtreeStore {
     pub fn get_blob(&self, sha256_hex: &str) -> Result<Option<Vec<u8>>> {
         let hash = from_hex(sha256_hex)
             .map_err(|e| anyhow::anyhow!("invalid hex: {}", e))?;
-        self.blobs.get_sync(&hash)
+        self.router.get_sync(&hash)
             .map_err(|e| anyhow::anyhow!("Failed to get blob: {}", e))
     }
 
@@ -369,7 +639,7 @@ impl HashtreeStore {
     pub fn blob_exists(&self, sha256_hex: &str) -> Result<bool> {
         let hash = from_hex(sha256_hex)
             .map_err(|e| anyhow::anyhow!("invalid hex: {}", e))?;
-        self.blobs.exists(&hash)
+        self.router.exists(&hash)
             .map_err(|e| anyhow::anyhow!("Failed to check blob: {}", e))
     }
 
@@ -458,7 +728,7 @@ impl HashtreeStore {
         // Delete raw blob (by content hash)
         let hash = from_hex(sha256_hex)
             .map_err(|e| anyhow::anyhow!("invalid hex: {}", e))?;
-        let _ = self.blobs.delete_sync(&hash);
+        let _ = self.router.delete_sync(&hash);
 
         wtxn.commit()?;
         Ok(root_hex.is_some())
@@ -490,7 +760,7 @@ impl HashtreeStore {
     pub fn get_chunk(&self, chunk_hex: &str) -> Result<Option<Vec<u8>>> {
         let hash = from_hex(chunk_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-        self.blobs.get_sync(&hash)
+        self.router.get_sync(&hash)
             .map_err(|e| anyhow::anyhow!("Failed to get chunk: {}", e))
     }
 
@@ -500,7 +770,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
@@ -514,7 +784,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
 
         sync_block_on(async {
@@ -676,7 +946,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
@@ -745,7 +1015,7 @@ impl HashtreeStore {
     /// List all pinned hashes with names
     pub fn list_pins_with_names(&self) -> Result<Vec<PinnedItem>> {
         let rtxn = self.env.read_txn()?;
-        let store = Arc::clone(&self.blobs);
+        let store = self.router.local_store();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
         let mut pins = Vec::new();
 
@@ -777,7 +1047,7 @@ impl HashtreeStore {
         let rtxn = self.env.read_txn()?;
         let total_pins = self.pins.len(&rtxn)? as usize;
 
-        let stats = self.blobs.stats()
+        let stats = self.router.stats()
             .map_err(|e| anyhow::anyhow!("Failed to get stats: {}", e))?;
 
         Ok(StorageStats {
@@ -800,7 +1070,7 @@ impl HashtreeStore {
         drop(rtxn);
 
         // Get all stored hashes
-        let all_hashes = self.blobs.list()
+        let all_hashes = self.router.list()
             .map_err(|e| anyhow::anyhow!("Failed to list hashes: {}", e))?;
 
         // Delete unpinned hashes
@@ -810,9 +1080,9 @@ impl HashtreeStore {
         for hash in all_hashes {
             let hash_hex = to_hex(&hash);
             if !pinned.contains(&hash_hex) {
-                if let Ok(Some(data)) = self.blobs.get_sync(&hash) {
+                if let Ok(Some(data)) = self.router.get_sync(&hash) {
                     freed_bytes += data.len() as u64;
-                    let _ = self.blobs.delete_sync(&hash);
+                    let _ = self.router.delete_sync(&hash);
                     deleted += 1;
                 }
             }

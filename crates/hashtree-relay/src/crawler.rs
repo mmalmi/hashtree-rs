@@ -1,17 +1,20 @@
-//! Social graph crawler - recursively fetches follow lists
+//! Social graph crawler - recursively fetches follow lists and mute lists
 //!
 //! Crawls the social graph by:
 //! 1. Starting with seed pubkeys
-//! 2. Subscribing to their contact lists (kind 3)
+//! 2. Subscribing to their contact lists (kind 3) and mute lists (kind 10000)
 //! 3. Extracting followed pubkeys from p-tags
 //! 4. Recursively crawling up to a configurable depth
 
 use nostrdb::{Filter, FilterBuilder, Ndb, Transaction};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, trace};
 
 /// Contact list event kind (NIP-02)
 pub const KIND_CONTACTS: u64 = 3;
+
+/// Mute list event kind (NIP-51)
+pub const KIND_MUTE_LIST: u64 = 10000;
 
 /// Crawler state for tracking progress
 pub struct CrawlerState {

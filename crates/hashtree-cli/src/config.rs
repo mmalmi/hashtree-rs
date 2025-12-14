@@ -39,6 +39,37 @@ pub struct StorageConfig {
     pub data_dir: String,
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
+    /// Optional S3/R2 backend for blob storage
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+}
+
+/// S3-compatible storage configuration (works with AWS S3, Cloudflare R2, MinIO, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    /// S3 endpoint URL (e.g., "https://<account_id>.r2.cloudflarestorage.com" for R2)
+    pub endpoint: String,
+    /// S3 bucket name
+    pub bucket: String,
+    /// Optional key prefix for all blobs (e.g., "blobs/")
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// AWS region (use "auto" for R2)
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+    /// Access key ID (can also be set via AWS_ACCESS_KEY_ID env var)
+    #[serde(default)]
+    pub access_key: Option<String>,
+    /// Secret access key (can also be set via AWS_SECRET_ACCESS_KEY env var)
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Public URL for serving blobs (optional, for generating public URLs)
+    #[serde(default)]
+    pub public_url: Option<String>,
+}
+
+fn default_s3_region() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +203,7 @@ impl Default for StorageConfig {
         Self {
             data_dir: default_data_dir(),
             max_size_gb: default_max_size_gb(),
+            s3: None,
         }
     }
 }

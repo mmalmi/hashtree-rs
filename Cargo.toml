@@ -29,6 +29,11 @@ hashtree = { path = "crates/hashtree" }
 hashtree-lmdb = { path = "crates/hashtree-lmdb" }
 hashtree-relay = { path = "crates/hashtree-relay" }
 hashtree-git = { path = "crates/hashtree-git" }
+hashtree-s3 = { path = "crates/hashtree-s3" }
+
+# AWS S3
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
 
 # Storage
 heed = "0.20"

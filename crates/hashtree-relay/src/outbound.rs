@@ -23,6 +23,11 @@ pub enum NdbQuery {
     SocialGraphRootStats {
         reply: mpsc::Sender<SocialGraphStats>,
     },
+    /// Check if a pubkey is muted by root
+    IsMutedByRoot {
+        pubkey: [u8; 32],
+        reply: mpsc::Sender<bool>,
+    },
 }
 
 /// Social graph statistics
@@ -31,6 +36,8 @@ pub struct SocialGraphStats {
     pub following_count: usize,
     pub followers_count: usize,
     pub follow_distance: u32,
+    /// Number of users in the social graph who mute this user
+    pub muter_count: usize,
 }
 
 /// Handle for sending queries to the ndb thread
@@ -51,6 +58,13 @@ impl NdbQuerySender {
     pub fn socialgraph_root_stats(&self) -> Result<SocialGraphStats> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(NdbQuery::SocialGraphRootStats { reply: reply_tx })?;
+        Ok(reply_rx.recv()?)
+    }
+
+    /// Check if a pubkey is muted by the root user
+    pub fn is_muted_by_root(&self, pubkey: [u8; 32]) -> Result<bool> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx.send(NdbQuery::IsMutedByRoot { pubkey, reply: reply_tx })?;
         Ok(reply_rx.recv()?)
     }
 }
@@ -404,6 +418,14 @@ fn process_query_with_txn(ndb: &Ndb, txn: &Transaction, root_pubkey: Option<&[u8
             };
             let _ = reply.send(stats);
         }
+        NdbQuery::IsMutedByRoot { pubkey, reply } => {
+            let is_muted = if let Some(root) = root_pubkey {
+                nostrdb::socialgraph::is_muting(txn, ndb, root, &pubkey)
+            } else {
+                false
+            };
+            let _ = reply.send(is_muted);
+        }
     }
 }
 
@@ -411,10 +433,12 @@ fn query_socialgraph_stats_with_txn(ndb: &Ndb, txn: &Transaction, pubkey: &[u8; 
     let following = nostrdb::socialgraph::get_followed(txn, ndb, pubkey, 10000);
     let followers = nostrdb::socialgraph::get_followers(txn, ndb, pubkey, 10000);
     let distance = nostrdb::socialgraph::get_follow_distance(txn, ndb, pubkey);
+    let muter_count = nostrdb::socialgraph::muter_count(txn, ndb, pubkey);
     SocialGraphStats {
         following_count: following.len(),
         followers_count: followers.len(),
         follow_distance: distance,
+        muter_count,
     }
 }
 

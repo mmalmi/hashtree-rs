@@ -12,13 +12,181 @@ use axum::{
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::auth::AppState;
 use super::mime::get_mime_type;
 
+/// Social graph root pubkey (sirius - npub1g53mukxnjkcmr94fhryzkqutdz2ukq4ks0gvy5af25rgmwsl4ngq43drvk)
+pub const SOCIAL_GRAPH_ROOT: &str = "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0";
+
+/// Maximum follow distance for blossom write access (0 = root only, 3 = up to 3rd degree)
+pub const MAX_WRITE_DISTANCE: u32 = 3;
+
+/// Ratio threshold for "overmuted" - if muters/followers exceeds this ratio, deny access
+/// e.g., 0.1 means if 10% or more of your followers mute you, you're overmuted
+pub const OVERMUTED_RATIO: f64 = 0.1;
+
+/// Minimum muter count before ratio check kicks in (avoid edge cases with few followers)
+pub const OVERMUTED_MIN_MUTERS: usize = 5;
+
+/// Hardcoded subscriber list - these pubkeys always have write access regardless of social graph
+pub static HARDCODED_SUBSCRIBERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from([
+        "e2bab35b5296ec2242ded0a01f6d6723a5cd921239280c0a5f0b5589303336b6",
+        "040ab8ad2ab2447f2a702903553eb56820a6799a3edc4a6d3816e0cc41fea7f8",
+        "1faee0e854e848af26060f6ad40d278d882bb8b8f1c474b25e2f95c7fee1ac9d",
+        "df410c7a4dac30eec2437d39911e1cf812f3f6aae3f628da40e3190b582db9dc",
+        "4408b61d584b7a48373d1b2f05bc30fed614f316da272b984b4d587522470502",
+        "6eef2e68c399c8f2efbf70d831c2b618d7a84bdfd21734a81e6d7d3d817f6850",
+        "0ab915c92977c66b57c6bf64d58252db46e5d027ad2c7e1aac9aa3b4bc2ae379",
+        "2f372b6c2d615a91c9248f87417525dc202dfbb37ffea5cd2f182d7fc1ef514a",
+        "65f13e7c23321cb09909ef08da71c6d9bc44f390a92783e78b930609ab370ac9",
+        "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0", // root
+    ])
+});
+
 /// Blossom authorization event kind (NIP-98 style)
 const BLOSSOM_AUTH_KIND: u16 = 24242;
+
+/// Check if a user is "overmuted" based on their muter/follower ratio
+/// Returns true if the mute ratio exceeds the threshold
+pub fn is_overmuted(muter_count: usize, followers_count: usize) -> bool {
+    if muter_count < OVERMUTED_MIN_MUTERS || followers_count == 0 {
+        return false;
+    }
+    let mute_ratio = muter_count as f64 / followers_count as f64;
+    mute_ratio >= OVERMUTED_RATIO
+}
+
+/// Check if a pubkey has write access based on social graph distance
+/// Returns Ok(()) if allowed, Err with JSON error body if denied
+fn check_write_access(state: &AppState, pubkey: &str) -> Result<(), Response<Body>> {
+    // Always allow hardcoded subscribers
+    if HARDCODED_SUBSCRIBERS.contains(pubkey) {
+        tracing::debug!("Blossom write allowed for {}... (subscriber)", &pubkey[..8]);
+        return Ok(());
+    }
+
+    // Always allow root
+    if pubkey == SOCIAL_GRAPH_ROOT {
+        tracing::debug!("Blossom write allowed for {}... (root)", &pubkey[..8]);
+        return Ok(());
+    }
+
+    // Check social graph distance via ndb_query
+    let Some(ref ndb_query) = state.ndb_query else {
+        // No social graph configured - deny by default for safety
+        tracing::warn!("Blossom write denied for {}... (no social graph)", &pubkey[..8]);
+        return Err(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"error":"Write access requires social graph authentication. You must be within 3 degrees of separation from the server operator, or be a subscriber."}"#))
+            .unwrap());
+    };
+
+    // Convert pubkey hex to bytes
+    let pubkey_bytes: [u8; 32] = match hex::decode(pubkey) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => {
+            tracing::warn!("Blossom write denied: invalid pubkey format");
+            return Err(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"Invalid pubkey format"}"#))
+                .unwrap());
+        }
+    };
+
+    // Check if muted by root first
+    match ndb_query.is_muted_by_root(pubkey_bytes) {
+        Ok(true) => {
+            tracing::info!("Blossom write denied for {}... (muted by root)", &pubkey[..8]);
+            return Err(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"Access denied. You have been muted by the server operator."}"#))
+                .unwrap());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("Mute check failed for {}...: {}", &pubkey[..8], e);
+            // Continue with other checks even if mute check fails
+        }
+    }
+
+    // Query social graph stats (includes muter_count for overmuted check)
+    match ndb_query.socialgraph_stats(pubkey_bytes) {
+        Ok(stats) => {
+            // Check if overmuted (muter/follower ratio too high)
+            if is_overmuted(stats.muter_count, stats.followers_count) {
+                let mute_ratio = stats.muter_count as f64 / stats.followers_count as f64;
+                tracing::info!(
+                    "Blossom write denied for {}... (overmuted: {}/{} = {:.1}% >= {:.1}%)",
+                    &pubkey[..8],
+                    stats.muter_count,
+                    stats.followers_count,
+                    mute_ratio * 100.0,
+                    OVERMUTED_RATIO * 100.0
+                );
+                return Err(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"error":"Access denied. Your mute ratio is too high ({} muters / {} followers = {:.1}%, threshold: {:.1}%)."}}""#,
+                        stats.muter_count, stats.followers_count, mute_ratio * 100.0, OVERMUTED_RATIO * 100.0
+                    )))
+                    .unwrap());
+            }
+
+            // Check follow distance (u32::MAX or very high value means not in graph)
+            if stats.follow_distance <= MAX_WRITE_DISTANCE {
+                tracing::debug!(
+                    "Blossom write allowed for {}... (distance: {}, muters: {})",
+                    &pubkey[..8],
+                    stats.follow_distance,
+                    stats.muter_count
+                );
+                Ok(())
+            } else {
+                tracing::info!(
+                    "Blossom write denied for {}... (distance: {} > max: {})",
+                    &pubkey[..8],
+                    stats.follow_distance,
+                    MAX_WRITE_DISTANCE
+                );
+                Err(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"error":"Not authorized. Your follow distance is {} but max allowed is {}. You need to be within {} degrees of separation from npub1g53mukxnjkcmr94fhryzkqutdz2ukq4ks0gvy5af25rgmwsl4ngq43drvk (follow them or be followed by someone they follow)."}}"#,
+                        stats.follow_distance, MAX_WRITE_DISTANCE, MAX_WRITE_DISTANCE
+                    )))
+                    .unwrap())
+            }
+        }
+        Err(e) => {
+            tracing::error!("Social graph query failed for {}...: {}", &pubkey[..8], e);
+            Err(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"Social graph query failed"}"#))
+                .unwrap())
+        }
+    }
+}
 
 /// Blob descriptor returned by upload and list endpoints
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +499,11 @@ pub async fn upload_blob(
         }
     };
 
+    // Check social graph access control
+    if let Err(response) = check_write_access(&state, &auth.pubkey) {
+        return response;
+    }
+
     // Compute SHA256 of uploaded data
     let mut hasher = Sha256::new();
     hasher.update(&body);
@@ -615,5 +788,103 @@ fn mime_to_extension(mime: &str) -> &'static str {
         "text/html" => ".html",
         "application/json" => ".json",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hardcoded_subscribers_allowed() {
+        // All hardcoded subscribers should be in the set
+        assert!(HARDCODED_SUBSCRIBERS.contains("e2bab35b5296ec2242ded0a01f6d6723a5cd921239280c0a5f0b5589303336b6"));
+        assert!(HARDCODED_SUBSCRIBERS.contains("4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0")); // root
+
+        // Unknown pubkey should not be in the set
+        assert!(!HARDCODED_SUBSCRIBERS.contains("0000000000000000000000000000000000000000000000000000000000000000"));
+    }
+
+    #[test]
+    fn test_social_graph_root_constant() {
+        // Root pubkey should be the correct hex for npub1g53mukxnjkcmr94fhryzkqutdz2ukq4ks0gvy5af25rgmwsl4ngq43drvk
+        assert_eq!(SOCIAL_GRAPH_ROOT, "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0");
+        assert_eq!(SOCIAL_GRAPH_ROOT.len(), 64);
+    }
+
+    #[test]
+    fn test_max_write_distance() {
+        // 3 degrees of separation
+        assert_eq!(MAX_WRITE_DISTANCE, 3);
+    }
+
+    #[test]
+    fn test_is_valid_sha256() {
+        assert!(is_valid_sha256("e2bab35b5296ec2242ded0a01f6d6723a5cd921239280c0a5f0b5589303336b6"));
+        assert!(is_valid_sha256("0000000000000000000000000000000000000000000000000000000000000000"));
+
+        // Too short
+        assert!(!is_valid_sha256("e2bab35b5296ec2242ded0a01f6d6723"));
+        // Too long
+        assert!(!is_valid_sha256("e2bab35b5296ec2242ded0a01f6d6723a5cd921239280c0a5f0b5589303336b6aa"));
+        // Invalid chars
+        assert!(!is_valid_sha256("zzbab35b5296ec2242ded0a01f6d6723a5cd921239280c0a5f0b5589303336b6"));
+        // Empty
+        assert!(!is_valid_sha256(""));
+    }
+
+    #[test]
+    fn test_parse_hash_and_extension() {
+        let (hash, ext) = parse_hash_and_extension("abc123.png");
+        assert_eq!(hash, "abc123");
+        assert_eq!(ext, Some(".png"));
+
+        let (hash2, ext2) = parse_hash_and_extension("abc123");
+        assert_eq!(hash2, "abc123");
+        assert_eq!(ext2, None);
+
+        let (hash3, ext3) = parse_hash_and_extension("abc.123.jpg");
+        assert_eq!(hash3, "abc.123");
+        assert_eq!(ext3, Some(".jpg"));
+    }
+
+    #[test]
+    fn test_mime_to_extension() {
+        assert_eq!(mime_to_extension("image/png"), ".png");
+        assert_eq!(mime_to_extension("image/jpeg"), ".jpg");
+        assert_eq!(mime_to_extension("video/mp4"), ".mp4");
+        assert_eq!(mime_to_extension("application/octet-stream"), "");
+        assert_eq!(mime_to_extension("unknown/type"), "");
+    }
+
+    #[test]
+    fn test_is_overmuted() {
+        // Not enough muters - should not be overmuted
+        assert!(!is_overmuted(0, 100));
+        assert!(!is_overmuted(4, 100)); // Below OVERMUTED_MIN_MUTERS (5)
+
+        // Zero followers - should not be overmuted (avoid div by zero)
+        assert!(!is_overmuted(10, 0));
+
+        // Normal ratio - should not be overmuted
+        assert!(!is_overmuted(5, 100));  // 5% < 10%
+        assert!(!is_overmuted(9, 100));  // 9% < 10%
+
+        // High ratio - should be overmuted
+        assert!(is_overmuted(10, 100));  // 10% >= 10%
+        assert!(is_overmuted(20, 100));  // 20% >= 10%
+        assert!(is_overmuted(50, 100));  // 50% >= 10%
+
+        // Edge cases
+        assert!(is_overmuted(5, 50));    // 10% exactly
+        assert!(is_overmuted(10, 50));   // 20%
+        assert!(!is_overmuted(5, 51));   // 9.8% < 10%
+    }
+
+    #[test]
+    fn test_overmuted_constants() {
+        // Verify threshold constants are reasonable
+        assert_eq!(OVERMUTED_RATIO, 0.1); // 10%
+        assert_eq!(OVERMUTED_MIN_MUTERS, 5);
     }
 }

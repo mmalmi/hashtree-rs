@@ -14,6 +14,10 @@
 //!   htree user [<nsec>]
 //!   htree publish <ref_name> <hash> [--key <key>]
 
+// Install rustls crypto provider (required for TLS)
+#[cfg(feature = "s3")]
+use rustls::crypto::ring::default_provider;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
@@ -135,6 +139,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls crypto provider (required for TLS in reqwest/S3)
+    #[cfg(feature = "s3")]
+    let _ = default_provider().install_default();
+
     // Initialize tracing (respects RUST_LOG env var)
     tracing_subscriber::fmt::init();
 
@@ -152,7 +160,7 @@ async fn main() -> Result<()> {
                 cli.data_dir.clone()
             };
 
-            let store = Arc::new(HashtreeStore::new(&data_dir)?);
+            let store = Arc::new(HashtreeStore::with_s3(&data_dir, config.storage.s3.as_ref())?);
 
             // Initialize nostrdb for event storage
             let nostrdb_path = data_dir.join("nostrdb");

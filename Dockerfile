@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build release binary
-RUN cargo build --release --package hashtree-cli
+# Build release binary with S3 support
+RUN cargo build --release --package hashtree-cli --features s3
 
 FROM debian:bookworm-slim
 

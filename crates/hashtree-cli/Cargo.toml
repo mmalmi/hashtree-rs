@@ -18,6 +18,10 @@ hashtree-relay.workspace = true
 hashtree-git.workspace = true
 hashtree-resolver = { path = "../hashtree-resolver", features = ["nostr"] }
 
+# AWS S3 (optional)
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+
 # Storage
 heed.workspace = true
 tempfile.workspace = true
@@ -68,7 +72,14 @@ toml.workspace = true
 ignore = "0.4"
 
 # HTTP client for Blossom
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# TLS crypto provider
+rustls = { version = "0.23", features = ["ring"] }
+
+[features]
+default = []
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 
 [dev-dependencies]
 tempfile.workspace = true
