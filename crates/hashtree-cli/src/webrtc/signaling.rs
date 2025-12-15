@@ -926,7 +926,7 @@ impl WebRTCManager {
         let answer_msg = SignalingMessage::Answer {
             answer,
             recipient: full_peer_id.to_string(),
-            peer_id: self.my_peer_id.uuid.clone(),
+            peer_id: self.my_peer_id.to_string(),
         };
         if relay_write_tx.send(answer_msg).is_err() {
             warn!("Failed to send answer to {}", full_peer_id.short());
@@ -1018,6 +1018,10 @@ impl WebRTCManager {
 
         for entry in peers.values_mut() {
             if let Some(ref peer) = entry.peer {
+                let actual_state = peer.state();
+                // Log actual state for debugging
+                debug!("Peer {} actual WebRTC state: {:?}", entry.peer_id.short(), actual_state);
+
                 // Check if peer is now connected
                 if peer.is_connected() {
                     if entry.state != ConnectionState::Connected {

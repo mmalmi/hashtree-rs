@@ -9,8 +9,6 @@ use tracing::{debug, error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
-use webrtc::api::setting_engine::SettingEngine;
-use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
@@ -82,19 +80,14 @@ impl Peer {
         stun_servers: Vec<String>,
         store: Option<Arc<dyn ContentStore>>,
     ) -> Result<Self> {
-        // Create WebRTC API
+        // Create WebRTC API (matches hashtree-webrtc for cross-platform compatibility)
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
 
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut m)?;
 
-        let mut se = SettingEngine::default();
-        let ephemeral = EphemeralUDP::new(10000, 10099)?;
-        se.set_udp_network(UDPNetwork::Ephemeral(ephemeral));
-
         let api = APIBuilder::new()
-            .with_setting_engine(se)
             .with_media_engine(m)
             .with_interceptor_registry(registry)
             .build();
@@ -151,14 +144,14 @@ impl Peer {
     pub async fn setup_handlers(&mut self) -> Result<()> {
         let peer_id = self.peer_id.clone();
         let signaling_tx = self.signaling_tx.clone();
-        let my_uuid = self.my_peer_id.uuid.clone();
+        let my_peer_id_str = self.my_peer_id.to_string();
         let recipient = self.peer_id.to_string();
 
-        // Handle ICE candidates
+        // Handle ICE candidates - work MUST be inside the returned future
         self.pc
             .on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
                 let signaling_tx = signaling_tx.clone();
-                let my_uuid = my_uuid.clone();
+                let my_peer_id_str = my_peer_id_str.clone();
                 let recipient = recipient.clone();
 
                 Box::pin(async move {
@@ -168,19 +161,17 @@ impl Peer {
                             let msg = SignalingMessage::candidate(
                                 serde_json::to_value(&init).unwrap_or_default(),
                                 &recipient,
-                                &my_uuid,
+                                &my_peer_id_str,
                             );
                             if let Err(e) = signaling_tx.send(msg).await {
                                 error!("Failed to send ICE candidate: {}", e);
-                            } else {
-                                info!("Queued ICE candidate for {}", recipient);
                             }
                         }
                     }
                 })
             }));
 
-        // Handle connection state changes
+        // Handle connection state changes - work MUST be inside the returned future
         let peer_id_log = peer_id.clone();
         self.pc
             .on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
@@ -195,6 +186,7 @@ impl Peer {
 
     /// Initiate connection (create offer) - for outbound connections
     pub async fn connect(&mut self) -> Result<serde_json::Value> {
+        println!("[Peer {}] Creating data channel...", self.peer_id.short());
         // Create data channel first
         // Use unordered for better performance - protocol is stateless (each message self-describes)
         let dc_init = RTCDataChannelInit {
@@ -202,11 +194,14 @@ impl Peer {
             ..Default::default()
         };
         let dc = self.pc.create_data_channel("hashtree", Some(dc_init)).await?;
+        println!("[Peer {}] Data channel created, setting up handlers...", self.peer_id.short());
         self.setup_data_channel(dc.clone()).await?;
+        println!("[Peer {}] Handlers set up, storing data channel...", self.peer_id.short());
         {
             let mut dc_guard = self.data_channel.lock().await;
             *dc_guard = Some(dc);
         }
+        println!("[Peer {}] Data channel stored", self.peer_id.short());
 
         // Create offer
         let offer = self.pc.create_offer(None).await?;
@@ -228,10 +223,8 @@ impl Peer {
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing SDP in offer"))?;
 
-        let offer_desc = RTCSessionDescription::offer(sdp.to_string())?;
-        self.pc.set_remote_description(offer_desc).await?;
-
-        // Setup data channel handler for incoming channels
+        // Setup data channel handler BEFORE set_remote_description
+        // This ensures the handler is registered before any data channel events fire
         let peer_id = self.peer_id.clone();
         let message_tx = self.message_tx.clone();
         let pending_requests = self.pending_requests.clone();
@@ -246,6 +239,7 @@ impl Peer {
                 let store = store.clone();
                 let data_channel_holder = data_channel_holder.clone();
 
+                // Work MUST be inside the returned future
                 Box::pin(async move {
                     info!("Peer {} received data channel: {}", peer_id.short(), dc.label());
 
@@ -266,6 +260,10 @@ impl Peer {
                     .await;
                 })
             }));
+
+        // Now set remote description after handler is registered
+        let offer_desc = RTCSessionDescription::offer(sdp.to_string())?;
+        self.pc.set_remote_description(offer_desc).await?;
 
         // Create answer
         let answer = self.pc.create_answer(None).await?;
@@ -352,9 +350,14 @@ impl Peer {
         let pending_binary: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
         let peer_short_open = peer_short.clone();
+        let label_clone = label.clone();
         dc.on_open(Box::new(move || {
-            info!("[Peer {}] Data channel '{}' open", peer_short_open, label);
-            Box::pin(async {})
+            let peer_short_open = peer_short_open.clone();
+            let label_clone = label_clone.clone();
+            // Work MUST be inside the returned future
+            Box::pin(async move {
+                info!("[Peer {}] Data channel '{}' open", peer_short_open, label_clone);
+            })
         }));
 
         let dc_for_msg = dc.clone();
@@ -369,15 +372,18 @@ impl Peer {
             let _pending_binary = pending_binary_clone.clone();
             let _message_tx = message_tx.clone();
             let store = store_clone.clone();
+            let msg_data = msg.data.clone();
 
+            // Work MUST be inside the returned future
             Box::pin(async move {
                 // All messages are binary with type prefix + MessagePack body
-                if let Ok(data_msg) = parse_message(&msg.data) {
-                    match data_msg {
+                debug!("[Peer {}] Received {} bytes on data channel", peer_short, msg_data.len());
+                match parse_message(&msg_data) {
+                    Ok(data_msg) => match data_msg {
                         DataMessage::Request(req) => {
                             let hash_hex = hash_to_hex(&req.h);
                             let hash_short = &hash_hex[..8.min(hash_hex.len())];
-                            debug!(
+                            info!(
                                 "[Peer {}] Received request for {}",
                                 peer_short, hash_short
                             );
@@ -385,19 +391,27 @@ impl Peer {
                             // Handle request - look up in store
                             let data = if let Some(ref store) = store {
                                 match store.get(&hash_hex) {
-                                    Ok(Some(data)) => Some(data),
-                                    Ok(None) => None,
+                                    Ok(Some(data)) => {
+                                        info!("[Peer {}] Found {} in store ({} bytes)", peer_short, hash_short, data.len());
+                                        Some(data)
+                                    },
+                                    Ok(None) => {
+                                        info!("[Peer {}] Hash {} not in store", peer_short, hash_short);
+                                        None
+                                    },
                                     Err(e) => {
                                         warn!("[Peer {}] Store error: {}", peer_short, e);
                                         None
                                     }
                                 }
                             } else {
+                                warn!("[Peer {}] No store configured - cannot serve requests", peer_short);
                                 None
                             };
 
                             // Send response only if we have data
                             if let Some(data) = data {
+                                let data_len = data.len();
                                 let response = DataResponse {
                                     h: req.h,
                                     d: data,
@@ -409,14 +423,15 @@ impl Peer {
                                             peer_short, e
                                         );
                                     } else {
-                                        debug!(
-                                            "[Peer {}] Sent response for {}",
-                                            peer_short, hash_short
+                                        info!(
+                                            "[Peer {}] Sent response for {} ({} bytes)",
+                                            peer_short, hash_short, data_len
                                         );
                                     }
                                 }
+                            } else {
+                                info!("[Peer {}] Content not found for {}", peer_short, hash_short);
                             }
-                            // If not found, stay silent - requester will timeout
                         }
                         DataMessage::Response(res) => {
                             let hash_hex = hash_to_hex(&res.h);
@@ -432,6 +447,12 @@ impl Peer {
                                 let _ = req.response_tx.send(Some(res.d));
                             }
                         }
+                    },
+                    Err(e) => {
+                        warn!("[Peer {}] Failed to parse message: {:?}", peer_short, e);
+                        // Log hex dump of first 50 bytes for debugging
+                        let hex_dump: String = msg_data.iter().take(50).map(|b| format!("{:02x}", b)).collect();
+                        warn!("[Peer {}] Message hex: {}", peer_short, hex_dump);
                     }
                 }
             })

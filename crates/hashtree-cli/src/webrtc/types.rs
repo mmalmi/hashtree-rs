@@ -442,8 +442,9 @@ fn is_max_htl(htl: &u8) -> bool {
 }
 
 /// Encode a request to wire format: [0x00][msgpack body]
+/// Uses named fields for cross-language compatibility with TypeScript
 pub fn encode_request(req: &DataRequest) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let body = rmp_serde::to_vec(req)?;
+    let body = rmp_serde::to_vec_named(req)?;
     let mut result = Vec::with_capacity(1 + body.len());
     result.push(MSG_TYPE_REQUEST);
     result.extend(body);
@@ -451,8 +452,9 @@ pub fn encode_request(req: &DataRequest) -> Result<Vec<u8>, rmp_serde::encode::E
 }
 
 /// Encode a response to wire format: [0x01][msgpack body]
+/// Uses named fields for cross-language compatibility with TypeScript
 pub fn encode_response(res: &DataResponse) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let body = rmp_serde::to_vec(res)?;
+    let body = rmp_serde::to_vec_named(res)?;
     let mut result = Vec::with_capacity(1 + body.len());
     result.push(MSG_TYPE_RESPONSE);
     result.extend(body);
