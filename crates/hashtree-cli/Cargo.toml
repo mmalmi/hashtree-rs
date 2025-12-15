@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core hashtree crates
-hashtree = { workspace = true, features = ["encryption"] }
+hashtree.workspace = true
 hashtree-lmdb.workspace = true
 hashtree-relay.workspace = true
 hashtree-git.workspace = true

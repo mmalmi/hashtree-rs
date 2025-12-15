@@ -13,7 +13,6 @@ use crate::hash::sha256;
 use crate::store::Store;
 use crate::types::{Cid, DirEntry, Hash, Link, LinkType, TreeNode};
 
-#[cfg(feature = "encryption")]
 use crate::crypto::{encrypt_chk, EncryptionKey};
 
 /// Default chunk size: 2MB (optimized for blossom uploads, matches hashtree-ts)
@@ -41,10 +40,7 @@ impl<S: Store> BuilderConfig<S> {
             store,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_links: DEFAULT_MAX_LINKS,
-            #[cfg(feature = "encryption")]
             encrypted: true,
-            #[cfg(not(feature = "encryption"))]
-            encrypted: false,
         }
     }
 
@@ -65,7 +61,6 @@ impl<S: Store> BuilderConfig<S> {
     }
 
     /// Enable encryption (CHK - Content Hash Key)
-    #[cfg(feature = "encryption")]
     pub fn encrypted(mut self) -> Self {
         self.encrypted = true;
         self
@@ -108,7 +103,6 @@ impl<S: Store> TreeBuilder<S> {
 
     /// Store a chunk with optional encryption
     /// Returns (hash, optional_key) where hash is of stored data
-    #[cfg(feature = "encryption")]
     async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<EncryptionKey>), BuilderError> {
         if self.encrypted {
             let (encrypted, key) = encrypt_chk(data)
@@ -123,12 +117,6 @@ impl<S: Store> TreeBuilder<S> {
             let hash = self.put_blob(data).await?;
             Ok((hash, None))
         }
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<[u8; 32]>), BuilderError> {
-        let hash = self.put_blob(data).await?;
-        Ok((hash, None))
     }
 
     /// Store a file, chunking if necessary
@@ -194,7 +182,6 @@ impl<S: Store> TreeBuilder<S> {
             };
             let (data, _) = encode_and_hash(&node)?;
 
-            #[cfg(feature = "encryption")]
             if self.encrypted {
                 let (encrypted, key) = encrypt_chk(&data)
                     .map_err(|e| BuilderError::Encryption(e.to_string()))?;
@@ -893,7 +880,6 @@ mod tests {
         assert!(store.has(&cid.hash).await.unwrap());
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_unified_put_encrypted() {
         use crate::reader::TreeReader;
@@ -915,7 +901,6 @@ mod tests {
         assert_eq!(retrieved, data);
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_unified_put_encrypted_chunked() {
         use crate::reader::TreeReader;
@@ -937,7 +922,6 @@ mod tests {
         assert_eq!(retrieved, data);
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_cid_deterministic() {
         let store = make_store();

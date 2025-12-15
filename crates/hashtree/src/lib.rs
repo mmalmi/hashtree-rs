@@ -49,7 +49,6 @@ pub mod reader;
 pub mod store;
 pub mod types;
 
-#[cfg(feature = "encryption")]
 pub mod crypto;
 
 // Re-exports for convenience
@@ -77,7 +76,6 @@ pub use nhash::{
     nhash_encode_full, nref_decode, nref_encode, DecodeResult, NHashData, NHashError, NRefData,
 };
 
-#[cfg(feature = "encryption")]
 pub use crypto::{
     content_hash, could_be_encrypted, decrypt, decrypt_chk, encrypt, encrypt_chk, encrypted_size,
     encrypted_size_chk, generate_key, key_from_hex, key_to_hex, plaintext_size, CryptoError,

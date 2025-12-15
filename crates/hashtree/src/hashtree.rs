@@ -17,7 +17,6 @@ use crate::reader::{ReaderError, TreeEntry, WalkEntry};
 use crate::store::Store;
 use crate::types::{to_hex, Cid, DirEntry, Hash, Link, LinkType, TreeNode};
 
-#[cfg(feature = "encryption")]
 use crate::crypto::{decrypt_chk, encrypt_chk, EncryptionKey};
 
 /// HashTree configuration
@@ -36,10 +35,7 @@ impl<S: Store> HashTreeConfig<S> {
             store,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_links: DEFAULT_MAX_LINKS,
-            #[cfg(feature = "encryption")]
             encrypted: true,
-            #[cfg(not(feature = "encryption"))]
-            encrypted: false,
         }
     }
 
@@ -261,7 +257,6 @@ impl<S: Store> HashTree<S> {
     }
 
     /// Read encrypted file as stream (internal)
-    #[cfg(feature = "encryption")]
     fn read_file_stream_encrypted(
         &self,
         hash: Hash,
@@ -311,7 +306,6 @@ impl<S: Store> HashTree<S> {
         )
     }
 
-    #[cfg(feature = "encryption")]
     async fn process_encrypted_stream_stack<'a>(
         &'a self,
         stack: &mut Vec<EncryptedStackItem>,
@@ -373,18 +367,7 @@ impl<S: Store> HashTree<S> {
         None
     }
 
-    #[cfg(not(feature = "encryption"))]
-    fn read_file_stream_encrypted(
-        &self,
-        hash: Hash,
-        _key: [u8; 32],
-    ) -> impl Stream<Item = Result<Vec<u8>, HashTreeError>> + Send + '_ {
-        // Without encryption feature, just read normally
-        self.read_file_stream(hash)
-    }
-
     /// Store a chunk with optional encryption
-    #[cfg(feature = "encryption")]
     async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<EncryptionKey>), HashTreeError> {
         if self.encrypted {
             let (encrypted, key) = encrypt_chk(data)
@@ -399,12 +382,6 @@ impl<S: Store> HashTree<S> {
             let hash = self.put_blob(data).await?;
             Ok((hash, None))
         }
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    async fn put_chunk_internal(&self, data: &[u8]) -> Result<(Hash, Option<[u8; 32]>), HashTreeError> {
-        let hash = self.put_blob(data).await?;
-        Ok((hash, None))
     }
 
     /// Build tree and return (hash, optional_key)
@@ -429,7 +406,6 @@ impl<S: Store> HashTree<S> {
             };
             let (data, _) = encode_and_hash(&node)?;
 
-            #[cfg(feature = "encryption")]
             if self.encrypted {
                 let (encrypted, key) = encrypt_chk(&data)
                     .map_err(|e| HashTreeError::Encryption(e.to_string()))?;
@@ -469,7 +445,6 @@ impl<S: Store> HashTree<S> {
     }
 
     /// Get encrypted content by hash and key
-    #[cfg(feature = "encryption")]
     async fn get_encrypted(
         &self,
         hash: &Hash,
@@ -495,17 +470,7 @@ impl<S: Store> HashTree<S> {
         Ok(Some(decrypted))
     }
 
-    #[cfg(not(feature = "encryption"))]
-    async fn get_encrypted(
-        &self,
-        _hash: &Hash,
-        _key: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>, HashTreeError> {
-        Err(HashTreeError::Encryption("encryption feature not enabled".to_string()))
-    }
-
     /// Assemble encrypted chunks from tree
-    #[cfg(feature = "encryption")]
     async fn assemble_encrypted_chunks(&self, node: &TreeNode) -> Result<Vec<u8>, HashTreeError> {
         let mut parts: Vec<Vec<u8>> = Vec::new();
 
@@ -799,16 +764,8 @@ impl<S: Store> HashTree<S> {
 
         // Decrypt if key is present
         let decrypted = if let Some(key) = &cid.key {
-            #[cfg(feature = "encryption")]
-            {
-                decrypt_chk(&data, key)
-                    .map_err(|e| HashTreeError::Decryption(e.to_string()))?
-            }
-            #[cfg(not(feature = "encryption"))]
-            {
-                let _ = key;
-                return Err(HashTreeError::Decryption("encryption feature not enabled".to_string()));
-            }
+            decrypt_chk(&data, key)
+                .map_err(|e| HashTreeError::Decryption(e.to_string()))?
         } else {
             data
         };
@@ -1200,7 +1157,6 @@ impl<S: Store> HashTree<S> {
         };
 
         // Decrypt if key is present
-        #[cfg(feature = "encryption")]
         let data = if let Some(key) = &cid.key {
             decrypt_chk(&data, key).map_err(|e| HashTreeError::Decryption(e.to_string()))?
         } else {
@@ -1279,7 +1235,6 @@ impl<S: Store> HashTree<S> {
                         };
 
                         // Decrypt if key is present
-                        #[cfg(feature = "encryption")]
                         let data = if let Some(key) = &cid.key {
                             match decrypt_chk(&data, key) {
                                 Ok(d) => d,
@@ -1664,13 +1619,11 @@ enum WalkStreamState<'a, S: Store> {
 }
 
 // Encrypted stream state types
-#[cfg(feature = "encryption")]
 struct EncryptedStackItem {
     hash: Hash,
     key: Option<[u8; 32]>,
 }
 
-#[cfg(feature = "encryption")]
 enum EncryptedStreamState<'a, S: Store> {
     Init { hash: Hash, key: [u8; 32], tree: &'a HashTree<S> },
     Processing { stack: Vec<EncryptedStackItem>, tree: &'a HashTree<S> },
@@ -1828,7 +1781,6 @@ mod tests {
         assert_eq!(retrieved, data);
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_unified_put_get_encrypted() {
         let store = Arc::new(MemoryStore::new());
@@ -1845,7 +1797,6 @@ mod tests {
         assert_eq!(retrieved, data);
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_unified_put_get_encrypted_chunked() {
         let store = Arc::new(MemoryStore::new());
@@ -1862,7 +1813,6 @@ mod tests {
         assert_eq!(retrieved, data);
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_cid_deterministic() {
         let store = Arc::new(MemoryStore::new());
@@ -1892,7 +1842,6 @@ mod tests {
         assert!(!s.contains(':'));
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_cid_to_string_encrypted() {
         let store = Arc::new(MemoryStore::new());
