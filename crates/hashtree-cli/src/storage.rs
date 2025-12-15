@@ -7,11 +7,33 @@ use hashtree::{
     sha256, to_hex, from_hex, Hash, TreeNode, DirEntry as HashTreeDirEntry,
 };
 use hashtree::store::{Store, StoreError};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::collections::HashSet;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use futures::executor::block_on as sync_block_on;
+
+/// Priority levels for tree eviction
+pub const PRIORITY_OTHER: u8 = 64;
+pub const PRIORITY_FOLLOWED: u8 = 128;
+pub const PRIORITY_OWN: u8 = 255;
+
+/// Metadata for a synced tree (for eviction tracking)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeMeta {
+    /// Pubkey of tree owner
+    pub owner: String,
+    /// Tree name if known (from nostr key like "npub.../name")
+    pub name: Option<String>,
+    /// Unix timestamp when this tree was synced
+    pub synced_at: u64,
+    /// Total size of all blobs in this tree
+    pub total_size: u64,
+    /// Eviction priority: 255=own/pinned, 128=followed, 64=other
+    pub priority: u8,
+}
 
 #[cfg(feature = "s3")]
 use tokio::sync::mpsc;
@@ -265,26 +287,38 @@ pub struct HashtreeStore {
     blob_owners: Database<Str, Str>,
     /// Maps pubkey -> blob metadata JSON (for blossom list)
     pubkey_blobs: Database<Str, Bytes>,
+    /// Tree metadata for eviction: tree_root_hash (32 bytes) -> TreeMeta (msgpack)
+    tree_meta: Database<Bytes, Bytes>,
+    /// Blob-to-tree mapping: blob_hash ++ tree_hash (64 bytes) -> ()
+    blob_trees: Database<Bytes, Unit>,
+    /// Tree refs: "npub/path" -> tree_root_hash (32 bytes) - for replacing old versions
+    tree_refs: Database<Str, Bytes>,
     /// Storage router - handles LMDB + optional S3
     router: StorageRouter,
+    /// Maximum storage size in bytes (from config)
+    max_size_bytes: u64,
 }
 
 impl HashtreeStore {
-    /// Create a new store with local LMDB storage only
+    /// Create a new store with local LMDB storage only (10GB default limit)
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::with_s3(path, None)
+        Self::with_options(path, None, 10 * 1024 * 1024 * 1024)
     }
 
-    /// Create a new store with optional S3 backend
-    /// If s3_config is Some, blobs will be synced to S3 in the background
+    /// Create a new store with optional S3 backend (10GB default limit)
     pub fn with_s3<P: AsRef<Path>>(path: P, s3_config: Option<&S3Config>) -> Result<Self> {
+        Self::with_options(path, s3_config, 10 * 1024 * 1024 * 1024)
+    }
+
+    /// Create a new store with optional S3 backend and custom size limit
+    pub fn with_options<P: AsRef<Path>>(path: P, s3_config: Option<&S3Config>, max_size_bytes: u64) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(10 * 1024 * 1024 * 1024) // 10GB
-                .max_dbs(5)
+                .map_size(10 * 1024 * 1024 * 1024) // 10GB virtual address space
+                .max_dbs(8)  // pins, sha256_index, blob_owners, pubkey_blobs, tree_meta, blob_trees, tree_refs, blobs
                 .open(path)?
         };
 
@@ -293,6 +327,9 @@ impl HashtreeStore {
         let sha256_index = env.create_database(&mut wtxn, Some("sha256_index"))?;
         let blob_owners = env.create_database(&mut wtxn, Some("blob_owners"))?;
         let pubkey_blobs = env.create_database(&mut wtxn, Some("pubkey_blobs"))?;
+        let tree_meta = env.create_database(&mut wtxn, Some("tree_meta"))?;
+        let blob_trees = env.create_database(&mut wtxn, Some("blob_trees"))?;
+        let tree_refs = env.create_database(&mut wtxn, Some("tree_refs"))?;
         wtxn.commit()?;
 
         // Create local LMDB blob store
@@ -326,7 +363,11 @@ impl HashtreeStore {
             sha256_index,
             blob_owners,
             pubkey_blobs,
+            tree_meta,
+            blob_trees,
+            tree_refs,
             router,
+            max_size_bytes,
         })
     }
 
@@ -1042,6 +1083,412 @@ impl HashtreeStore {
         Ok(pins)
     }
 
+    // === Tree indexing for eviction ===
+
+    /// Index a tree after sync - tracks all blobs in the tree for eviction
+    ///
+    /// If `ref_key` is provided (e.g. "npub.../name"), it will replace any existing
+    /// tree with that ref, allowing old versions to be evicted.
+    pub fn index_tree(
+        &self,
+        root_hash: &Hash,
+        owner: &str,
+        name: Option<&str>,
+        priority: u8,
+        ref_key: Option<&str>,
+    ) -> Result<()> {
+        let root_hex = to_hex(root_hash);
+
+        // If ref_key provided, check for and unindex old version
+        if let Some(key) = ref_key {
+            let rtxn = self.env.read_txn()?;
+            if let Some(old_hash_bytes) = self.tree_refs.get(&rtxn, key)? {
+                if old_hash_bytes != root_hash.as_slice() {
+                    let old_hash: Hash = old_hash_bytes.try_into()
+                        .map_err(|_| anyhow::anyhow!("Invalid hash in tree_refs"))?;
+                    drop(rtxn);
+                    // Unindex old tree (will delete orphaned blobs)
+                    let _ = self.unindex_tree(&old_hash);
+                    tracing::debug!("Replaced old tree for ref {}", key);
+                }
+            }
+        }
+
+        let store = self.router.local_store();
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
+
+        // Walk tree and collect all blob hashes + compute total size
+        let (blob_hashes, total_size) = sync_block_on(async {
+            self.collect_tree_blobs(&tree, root_hash).await
+        })?;
+
+        let mut wtxn = self.env.write_txn()?;
+
+        // Store blob-tree relationships (64-byte key: blob_hash ++ tree_hash)
+        for blob_hash in &blob_hashes {
+            let mut key = [0u8; 64];
+            key[..32].copy_from_slice(blob_hash);
+            key[32..].copy_from_slice(root_hash);
+            self.blob_trees.put(&mut wtxn, &key[..], &())?;
+        }
+
+        // Store tree metadata
+        let meta = TreeMeta {
+            owner: owner.to_string(),
+            name: name.map(|s| s.to_string()),
+            synced_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            total_size,
+            priority,
+        };
+        let meta_bytes = rmp_serde::to_vec(&meta)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize TreeMeta: {}", e))?;
+        self.tree_meta.put(&mut wtxn, root_hash.as_slice(), &meta_bytes)?;
+
+        // Store ref -> hash mapping if ref_key provided
+        if let Some(key) = ref_key {
+            self.tree_refs.put(&mut wtxn, key, root_hash.as_slice())?;
+        }
+
+        wtxn.commit()?;
+
+        tracing::debug!(
+            "Indexed tree {} ({} blobs, {} bytes, priority {})",
+            &root_hex[..8],
+            blob_hashes.len(),
+            total_size,
+            priority
+        );
+
+        Ok(())
+    }
+
+    /// Collect all blob hashes in a tree and compute total size
+    async fn collect_tree_blobs<S: Store>(
+        &self,
+        tree: &HashTree<S>,
+        root: &Hash,
+    ) -> Result<(Vec<Hash>, u64)> {
+        let mut blobs = Vec::new();
+        let mut total_size = 0u64;
+        let mut stack = vec![*root];
+
+        while let Some(hash) = stack.pop() {
+            // Check if it's a tree node
+            let is_tree = tree.is_tree(&hash).await
+                .map_err(|e| anyhow::anyhow!("Failed to check tree: {}", e))?;
+
+            if is_tree {
+                // Get tree node and add children to stack
+                if let Some(node) = tree.get_tree_node(&hash).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get tree node: {}", e))?
+                {
+                    for link in &node.links {
+                        stack.push(link.hash);
+                    }
+                }
+            } else {
+                // It's a blob - get its size
+                if let Some(data) = self.router.get_sync(&hash)
+                    .map_err(|e| anyhow::anyhow!("Failed to get blob: {}", e))?
+                {
+                    total_size += data.len() as u64;
+                    blobs.push(hash);
+                }
+            }
+        }
+
+        Ok((blobs, total_size))
+    }
+
+    /// Unindex a tree - removes blob-tree mappings and deletes orphaned blobs
+    /// Returns the number of bytes freed
+    pub fn unindex_tree(&self, root_hash: &Hash) -> Result<u64> {
+        let root_hex = to_hex(root_hash);
+
+        let store = self.router.local_store();
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
+
+        // Walk tree and collect all blob hashes
+        let (blob_hashes, _) = sync_block_on(async {
+            self.collect_tree_blobs(&tree, root_hash).await
+        })?;
+
+        let mut wtxn = self.env.write_txn()?;
+        let mut freed = 0u64;
+
+        // For each blob, remove the blob-tree entry and check if orphaned
+        for blob_hash in &blob_hashes {
+            // Delete blob-tree entry (64-byte key: blob_hash ++ tree_hash)
+            let mut key = [0u8; 64];
+            key[..32].copy_from_slice(blob_hash);
+            key[32..].copy_from_slice(root_hash);
+            self.blob_trees.delete(&mut wtxn, &key[..])?;
+
+            // Check if blob is in any other tree (prefix scan on first 32 bytes)
+            let rtxn = self.env.read_txn()?;
+            let mut has_other_tree = false;
+
+            for item in self.blob_trees.prefix_iter(&rtxn, blob_hash.as_slice())? {
+                if item.is_ok() {
+                    has_other_tree = true;
+                    break;
+                }
+            }
+            drop(rtxn);
+
+            // If orphaned, delete the blob
+            if !has_other_tree {
+                if let Some(data) = self.router.get_sync(blob_hash)
+                    .map_err(|e| anyhow::anyhow!("Failed to get blob: {}", e))?
+                {
+                    freed += data.len() as u64;
+                    self.router.delete_sync(blob_hash)
+                        .map_err(|e| anyhow::anyhow!("Failed to delete blob: {}", e))?;
+                }
+            }
+        }
+
+        // Delete tree node itself if exists
+        if let Some(data) = self.router.get_sync(root_hash)
+            .map_err(|e| anyhow::anyhow!("Failed to get tree node: {}", e))?
+        {
+            freed += data.len() as u64;
+            self.router.delete_sync(root_hash)
+                .map_err(|e| anyhow::anyhow!("Failed to delete tree node: {}", e))?;
+        }
+
+        // Delete tree metadata
+        self.tree_meta.delete(&mut wtxn, root_hash.as_slice())?;
+
+        wtxn.commit()?;
+
+        tracing::debug!(
+            "Unindexed tree {} ({} bytes freed)",
+            &root_hex[..8],
+            freed
+        );
+
+        Ok(freed)
+    }
+
+    /// Get tree metadata
+    pub fn get_tree_meta(&self, root_hash: &Hash) -> Result<Option<TreeMeta>> {
+        let rtxn = self.env.read_txn()?;
+        if let Some(bytes) = self.tree_meta.get(&rtxn, root_hash.as_slice())? {
+            let meta: TreeMeta = rmp_serde::from_slice(bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize TreeMeta: {}", e))?;
+            Ok(Some(meta))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List all indexed trees
+    pub fn list_indexed_trees(&self) -> Result<Vec<(Hash, TreeMeta)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut trees = Vec::new();
+
+        for item in self.tree_meta.iter(&rtxn)? {
+            let (hash_bytes, meta_bytes) = item?;
+            let hash: Hash = hash_bytes.try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid hash in tree_meta"))?;
+            let meta: TreeMeta = rmp_serde::from_slice(meta_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize TreeMeta: {}", e))?;
+            trees.push((hash, meta));
+        }
+
+        Ok(trees)
+    }
+
+    /// Get total tracked storage size (sum of all tree_meta.total_size)
+    pub fn tracked_size(&self) -> Result<u64> {
+        let rtxn = self.env.read_txn()?;
+        let mut total = 0u64;
+
+        for item in self.tree_meta.iter(&rtxn)? {
+            let (_, bytes) = item?;
+            let meta: TreeMeta = rmp_serde::from_slice(bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize TreeMeta: {}", e))?;
+            total += meta.total_size;
+        }
+
+        Ok(total)
+    }
+
+    /// Get evictable trees sorted by (priority ASC, synced_at ASC)
+    fn get_evictable_trees(&self) -> Result<Vec<(Hash, TreeMeta)>> {
+        let mut trees = self.list_indexed_trees()?;
+
+        // Sort by priority (lower first), then by synced_at (older first)
+        trees.sort_by(|a, b| {
+            match a.1.priority.cmp(&b.1.priority) {
+                std::cmp::Ordering::Equal => a.1.synced_at.cmp(&b.1.synced_at),
+                other => other,
+            }
+        });
+
+        Ok(trees)
+    }
+
+    /// Run eviction if storage is over quota
+    /// Returns bytes freed
+    ///
+    /// Eviction order:
+    /// 1. Orphaned blobs (not in any indexed tree and not pinned)
+    /// 2. Trees by priority (lowest first) and age (oldest first)
+    pub fn evict_if_needed(&self) -> Result<u64> {
+        // Get actual storage used
+        let stats = self.router.stats()
+            .map_err(|e| anyhow::anyhow!("Failed to get stats: {}", e))?;
+        let current = stats.total_bytes;
+
+        if current <= self.max_size_bytes {
+            return Ok(0);
+        }
+
+        // Target 90% of max to avoid constant eviction
+        let target = self.max_size_bytes * 90 / 100;
+        let mut freed = 0u64;
+        let mut current_size = current;
+
+        // Phase 1: Evict orphaned blobs (not in any tree and not pinned)
+        let orphan_freed = self.evict_orphaned_blobs()?;
+        freed += orphan_freed;
+        current_size = current_size.saturating_sub(orphan_freed);
+
+        if orphan_freed > 0 {
+            tracing::info!("Evicted orphaned blobs: {} bytes freed", orphan_freed);
+        }
+
+        // Check if we're now under target
+        if current_size <= target {
+            if freed > 0 {
+                tracing::info!("Eviction complete: {} bytes freed", freed);
+            }
+            return Ok(freed);
+        }
+
+        // Phase 2: Evict trees by priority (lowest first) and age (oldest first)
+        // Own trees CAN be evicted (just last), but PINNED trees are never evicted
+        let evictable = self.get_evictable_trees()?;
+
+        for (root_hash, meta) in evictable {
+            if current_size <= target {
+                break;
+            }
+
+            let root_hex = to_hex(&root_hash);
+
+            // Never evict pinned trees
+            if self.is_pinned(&root_hex)? {
+                continue;
+            }
+
+            let tree_freed = self.unindex_tree(&root_hash)?;
+            freed += tree_freed;
+            current_size = current_size.saturating_sub(tree_freed);
+
+            tracing::info!(
+                "Evicted tree {} (owner={}, priority={}, {} bytes)",
+                &root_hex[..8],
+                &meta.owner[..8.min(meta.owner.len())],
+                meta.priority,
+                tree_freed
+            );
+        }
+
+        if freed > 0 {
+            tracing::info!("Eviction complete: {} bytes freed", freed);
+        }
+
+        Ok(freed)
+    }
+
+    /// Evict blobs that are not part of any indexed tree and not pinned
+    fn evict_orphaned_blobs(&self) -> Result<u64> {
+        let mut freed = 0u64;
+
+        // Get all blob hashes from store
+        let all_hashes = self.router.list()
+            .map_err(|e| anyhow::anyhow!("Failed to list hashes: {}", e))?;
+
+        // Get pinned hashes
+        let rtxn = self.env.read_txn()?;
+        let pinned: HashSet<String> = self.pins.iter(&rtxn)?
+            .filter_map(|item| item.ok())
+            .map(|(hash_hex, _)| hash_hex.to_string())
+            .collect();
+
+        // Collect all blob hashes that are in at least one tree
+        // Key format is blob_hash (32 bytes) ++ tree_hash (32 bytes)
+        let mut blobs_in_trees: HashSet<Hash> = HashSet::new();
+        for item in self.blob_trees.iter(&rtxn)? {
+            if let Ok((key_bytes, _)) = item {
+                if key_bytes.len() >= 32 {
+                    let blob_hash: Hash = key_bytes[..32].try_into().unwrap();
+                    blobs_in_trees.insert(blob_hash);
+                }
+            }
+        }
+        drop(rtxn);
+
+        // Find and delete orphaned blobs
+        for hash in all_hashes {
+            let hash_hex = to_hex(&hash);
+
+            // Skip if pinned
+            if pinned.contains(&hash_hex) {
+                continue;
+            }
+
+            // Skip if part of any tree
+            if blobs_in_trees.contains(&hash) {
+                continue;
+            }
+
+            // This blob is orphaned - delete it
+            if let Ok(Some(data)) = self.router.get_sync(&hash) {
+                freed += data.len() as u64;
+                let _ = self.router.delete_sync(&hash);
+                tracing::debug!("Deleted orphaned blob {} ({} bytes)", &hash_hex[..8], data.len());
+            }
+        }
+
+        Ok(freed)
+    }
+
+    /// Get the maximum storage size in bytes
+    pub fn max_size_bytes(&self) -> u64 {
+        self.max_size_bytes
+    }
+
+    /// Get storage usage by priority tier
+    pub fn storage_by_priority(&self) -> Result<StorageByPriority> {
+        let rtxn = self.env.read_txn()?;
+        let mut own = 0u64;
+        let mut followed = 0u64;
+        let mut other = 0u64;
+
+        for item in self.tree_meta.iter(&rtxn)? {
+            let (_, bytes) = item?;
+            let meta: TreeMeta = rmp_serde::from_slice(bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize TreeMeta: {}", e))?;
+
+            if meta.priority >= PRIORITY_OWN {
+                own += meta.total_size;
+            } else if meta.priority >= PRIORITY_FOLLOWED {
+                followed += meta.total_size;
+            } else {
+                other += meta.total_size;
+            }
+        }
+
+        Ok(StorageByPriority { own, followed, other })
+    }
+
     /// Get storage statistics
     pub fn get_storage_stats(&self) -> Result<StorageStats> {
         let rtxn = self.env.read_txn()?;
@@ -1100,6 +1547,17 @@ pub struct StorageStats {
     pub total_dags: usize,
     pub pinned_dags: usize,
     pub total_bytes: u64,
+}
+
+/// Storage usage broken down by priority tier
+#[derive(Debug, Clone)]
+pub struct StorageByPriority {
+    /// Own/pinned trees (priority 255)
+    pub own: u64,
+    /// Followed users' trees (priority 128)
+    pub followed: u64,
+    /// Other trees (priority 64)
+    pub other: u64,
 }
 
 #[derive(Debug, Clone)]

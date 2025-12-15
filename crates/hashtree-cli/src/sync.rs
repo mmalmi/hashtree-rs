@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::storage::HashtreeStore;
+use crate::storage::{HashtreeStore, PRIORITY_OWN, PRIORITY_FOLLOWED};
 use crate::webrtc::WebRTCState;
 
 /// Sync priority levels
@@ -236,12 +236,43 @@ impl BackgroundSync {
 
                                 match result {
                                     Ok(stats) => {
-                                        info!(
-                                            "Synced tree {} ({} chunks, {} bytes)",
-                                            &hash_hex[..12],
-                                            stats.chunks_fetched,
-                                            stats.bytes_fetched
-                                        );
+                                        if stats.chunks_fetched > 0 {
+                                            info!(
+                                                "Synced tree {} ({} chunks, {} bytes)",
+                                                &hash_hex[..12],
+                                                stats.chunks_fetched,
+                                                stats.bytes_fetched
+                                            );
+
+                                            // Index the tree for eviction tracking
+                                            // Extract owner from key (format: "npub.../treename" or "pubkey/treename")
+                                            let (owner, name) = task.key.split_once('/')
+                                                .map(|(o, n)| (o.to_string(), Some(n)))
+                                                .unwrap_or((task.key.clone(), None));
+
+                                            // Map SyncPriority to storage priority
+                                            let storage_priority = match task.priority {
+                                                SyncPriority::Own => PRIORITY_OWN,
+                                                SyncPriority::Followed => PRIORITY_FOLLOWED,
+                                            };
+
+                                            if let Err(e) = store_clone.index_tree(
+                                                &task.cid.hash,
+                                                &owner,
+                                                name,
+                                                storage_priority,
+                                                Some(&task.key), // ref_key for replacing old versions
+                                            ) {
+                                                warn!("Failed to index tree {}: {}", &hash_hex[..12], e);
+                                            }
+
+                                            // Check if eviction is needed
+                                            if let Err(e) = store_clone.evict_if_needed() {
+                                                warn!("Eviction check failed: {}", e);
+                                            }
+                                        } else {
+                                            debug!("Tree {} already synced", &hash_hex[..12]);
+                                        }
                                     }
                                     Err(e) => {
                                         warn!("Failed to sync tree {}: {}", &hash_hex[..12], e);

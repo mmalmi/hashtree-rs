@@ -131,6 +131,21 @@ enum Commands {
         #[arg(long, short)]
         server: Option<String>,
     },
+    /// Manage storage limits and eviction
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageCommands {
+    /// Show storage usage statistics by priority tier
+    Stats,
+    /// List all indexed trees
+    Trees,
+    /// Manually trigger eviction
+    Evict,
 }
 
 #[tokio::main]
@@ -155,7 +170,9 @@ async fn main() -> Result<()> {
                 cli.data_dir.clone()
             };
 
-            let store = Arc::new(HashtreeStore::with_s3(&data_dir, config.storage.s3.as_ref())?);
+            // Convert max_size_gb to bytes
+            let max_size_bytes = config.storage.max_size_gb * 1024 * 1024 * 1024;
+            let store = Arc::new(HashtreeStore::with_options(&data_dir, config.storage.s3.as_ref(), max_size_bytes)?);
 
             // Initialize nostrdb for event storage
             let nostrdb_path = data_dir.join("nostrdb");
@@ -317,6 +334,25 @@ async fn main() -> Result<()> {
                 None
             };
 
+            // Start background eviction task (runs every 5 minutes)
+            let eviction_store = Arc::clone(&store);
+            let eviction_handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
+                loop {
+                    interval.tick().await;
+                    match eviction_store.evict_if_needed() {
+                        Ok(freed) => {
+                            if freed > 0 {
+                                tracing::info!("Background eviction freed {} bytes", freed);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Background eviction error: {}", e);
+                        }
+                    }
+                }
+            });
+
             // Print startup info
             println!("Starting hashtree daemon on {}", addr);
             println!("Data directory: {}", data_dir.display());
@@ -344,6 +380,7 @@ async fn main() -> Result<()> {
             if config.server.enable_webrtc {
                 println!("WebRTC: enabled (P2P connections)");
             }
+            println!("Storage limit: {} GB", config.storage.max_size_gb);
             if config.sync.enabled {
                 let mut sync_features = Vec::new();
                 if config.sync.sync_own {
@@ -366,6 +403,9 @@ async fn main() -> Result<()> {
             }
 
             server.run().await?;
+
+            // Shutdown background eviction
+            eviction_handle.abort();
 
             // Shutdown background sync
             if let Some(handle) = sync_handle {
@@ -473,6 +513,32 @@ async fn main() -> Result<()> {
                     }
                     (hash_hex, key_hex)
                 };
+
+                // Index tree for eviction tracking (own content = highest priority)
+                // Get user's npub as owner
+                let (nsec_str, _) = ensure_nsec_string()?;
+                let keys = NostrKeys::parse(&nsec_str)
+                    .context("Failed to parse nsec")?;
+                let npub = NostrToBech32::to_bech32(&keys.public_key())
+                    .context("Failed to encode npub")?;
+
+                let tree_name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string());
+
+                // Build ref_key: "npub/filename"
+                let ref_key = tree_name.as_ref()
+                    .map(|name| format!("{}/{}", npub, name));
+
+                let hash_bytes = from_hex(&hash_hex).context("Invalid hash")?;
+                if let Err(e) = store.index_tree(
+                    &hash_bytes,
+                    &npub,
+                    tree_name.as_deref(),
+                    hashtree_cli::PRIORITY_OWN,
+                    ref_key.as_deref(),
+                ) {
+                    tracing::warn!("Failed to index tree: {}", e);
+                }
 
                 // Publish to Nostr if --publish was specified
                 if let Some(ref_name) = publish {
@@ -783,9 +849,113 @@ async fn main() -> Result<()> {
         Commands::Push { cid, server } => {
             push_to_blossom(&cli.data_dir, &cid, server).await?;
         }
+        Commands::Storage { command } => {
+            // Load config
+            let config = Config::load()?;
+
+            // Use data dir from config if not overridden by CLI
+            let data_dir = if cli.data_dir.to_str() == Some("./hashtree-data") {
+                PathBuf::from(&config.storage.data_dir)
+            } else {
+                cli.data_dir.clone()
+            };
+
+            let max_size_bytes = config.storage.max_size_gb * 1024 * 1024 * 1024;
+            let store = HashtreeStore::with_options(&data_dir, config.storage.s3.as_ref(), max_size_bytes)?;
+
+            match command {
+                StorageCommands::Stats => {
+                    let stats = store.get_storage_stats()?;
+                    let by_priority = store.storage_by_priority()?;
+                    let tracked = store.tracked_size()?;
+                    let trees = store.list_indexed_trees()?;
+
+                    println!("Storage Statistics:");
+                    println!("  Max size:     {} GB ({} bytes)", config.storage.max_size_gb, max_size_bytes);
+                    println!("  Total bytes:  {} ({:.2} GB)", stats.total_bytes, stats.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+                    println!("  Tracked:      {} ({:.2} GB)", tracked, tracked as f64 / 1024.0 / 1024.0 / 1024.0);
+                    println!("  Total DAGs:   {}", stats.total_dags);
+                    println!("  Pinned DAGs:  {}", stats.pinned_dags);
+                    println!("  Indexed trees: {}", trees.len());
+                    println!();
+                    println!("Usage by priority:");
+                    println!("  Own (255):      {} ({:.2} MB)", by_priority.own, by_priority.own as f64 / 1024.0 / 1024.0);
+                    println!("  Followed (128): {} ({:.2} MB)", by_priority.followed, by_priority.followed as f64 / 1024.0 / 1024.0);
+                    println!("  Other (64):     {} ({:.2} MB)", by_priority.other, by_priority.other as f64 / 1024.0 / 1024.0);
+
+                    let utilization = if max_size_bytes > 0 {
+                        (tracked as f64 / max_size_bytes as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!();
+                    println!("Utilization: {:.1}%", utilization);
+                }
+                StorageCommands::Trees => {
+                    use hashtree::to_hex;
+                    let trees = store.list_indexed_trees()?;
+
+                    if trees.is_empty() {
+                        println!("No indexed trees");
+                    } else {
+                        println!("Indexed trees ({}):", trees.len());
+                        for (root_hash, meta) in trees {
+                            let root_hex = to_hex(&root_hash);
+                            let priority_str = match meta.priority {
+                                255 => "own",
+                                128 => "followed",
+                                _ => "other",
+                            };
+                            let name = meta.name.as_deref().unwrap_or("<unnamed>");
+                            let synced = chrono_humanize_timestamp(meta.synced_at);
+                            println!(
+                                "  {}... {} ({}) - {} - {} bytes - {}",
+                                &root_hex[..12],
+                                name,
+                                priority_str,
+                                &meta.owner[..12.min(meta.owner.len())],
+                                meta.total_size,
+                                synced
+                            );
+                        }
+                    }
+                }
+                StorageCommands::Evict => {
+                    println!("Running eviction...");
+                    let freed = store.evict_if_needed()?;
+                    if freed > 0 {
+                        println!("Evicted {} bytes ({:.2} MB)", freed, freed as f64 / 1024.0 / 1024.0);
+                    } else {
+                        println!("No eviction needed (storage under limit)");
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Convert unix timestamp to human-readable string
+fn chrono_humanize_timestamp(ts: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH, Duration};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+
+    let diff = now.saturating_sub(ts);
+
+    if diff < 60 {
+        format!("{}s ago", diff)
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
 }
 
 /// Follow or unfollow a user by publishing an updated kind 3 contact list
