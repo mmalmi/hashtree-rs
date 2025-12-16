@@ -551,10 +551,17 @@ pub async fn upload_blob(
         true
     };
 
-    if requires_social_graph {
-        if let Err(response) = check_write_access(&state, &auth.pubkey) {
-            return response;
-        }
+    // Check if user is in social graph (for ownership tracking, even if upload is allowed)
+    let is_in_social_graph = check_write_access(&state, &auth.pubkey).is_ok();
+
+    if requires_social_graph && !is_in_social_graph {
+        // Must be in social graph for media uploads
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"error":"Media uploads require social graph membership"}"#))
+            .unwrap();
     }
 
     // Compute SHA256 of uploaded data
@@ -576,8 +583,8 @@ pub async fn upload_blob(
 
     let size = body.len() as u64;
 
-    // Store the blob
-    let store_result = store_blossom_blob(&state, &body, &sha256_hex, &auth.pubkey);
+    // Store the blob (only track ownership if user is in social graph)
+    let store_result = store_blossom_blob(&state, &body, &sha256_hex, &auth.pubkey, is_in_social_graph);
 
     match store_result {
         Ok(()) => {
@@ -615,6 +622,7 @@ pub async fn upload_blob(
 }
 
 /// DELETE /<sha256> - Delete a blob (BUD-02)
+/// Note: Blob is only fully deleted when ALL owners have removed it
 pub async fn delete_blob(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -646,25 +654,38 @@ pub async fn delete_blob(
         }
     };
 
-    // Check ownership - only the uploader can delete
-    match state.store.get_blob_owner(&sha256_hex) {
-        Ok(Some(owner)) => {
-            if owner != auth.pubkey {
-                return Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .header("X-Reason", "Not the blob owner")
-                    .body(Body::empty())
-                    .unwrap();
-            }
+    // Check ownership - user must be one of the owners (O(1) lookup with composite key)
+    match state.store.is_blob_owner(&sha256_hex, &auth.pubkey) {
+        Ok(true) => {
+            // User is an owner, proceed with delete
         }
-        Ok(None) => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header("X-Reason", "Blob not found")
-                .body(Body::empty())
-                .unwrap();
+        Ok(false) => {
+            // Check if blob exists at all (for proper error message)
+            match state.store.blob_has_owners(&sha256_hex) {
+                Ok(true) => {
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header("X-Reason", "Not a blob owner")
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                Ok(false) => {
+                    return Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header("X-Reason", "Blob not found")
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(Body::empty())
+                        .unwrap();
+                }
+            }
         }
         Err(_) => {
             return Response::builder()
@@ -675,19 +696,18 @@ pub async fn delete_blob(
         }
     }
 
-    // Delete the blob
-    match state.store.delete_blossom_blob(&sha256_hex) {
-        Ok(true) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(Body::empty())
-            .unwrap(),
-        Ok(false) => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .header("X-Reason", "Blob not found")
-            .body(Body::empty())
-            .unwrap(),
+    // Remove this user's ownership (blob only deleted when no owners remain)
+    match state.store.delete_blossom_blob(&sha256_hex, &auth.pubkey) {
+        Ok(fully_deleted) => {
+            // Return 200 OK whether blob was fully deleted or just removed from user's list
+            // The client doesn't need to know if other owners still exist
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header("X-Blob-Deleted", if fully_deleted { "true" } else { "false" })
+                .body(Body::empty())
+                .unwrap()
+        }
         Err(_) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
@@ -801,6 +821,7 @@ fn store_blossom_blob(
     data: &[u8],
     sha256_hex: &str,
     pubkey: &str,
+    track_ownership: bool,
 ) -> anyhow::Result<()> {
     // Store as raw blob
     state.store.put_blob(data)?;
@@ -813,8 +834,11 @@ fn store_blossom_blob(
     // Don't auto-pin blossom uploads - they can be evicted like other synced content
     let _cid = state.store.upload_file_no_pin(&temp_file)?;
 
-    // Track ownership
-    state.store.set_blob_owner(sha256_hex, pubkey)?;
+    // Only track ownership for social graph members
+    // Non-members can upload (if public_writes=true) but can't delete
+    if track_ownership {
+        state.store.set_blob_owner(sha256_hex, pubkey)?;
+    }
 
     Ok(())
 }

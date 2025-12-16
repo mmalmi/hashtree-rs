@@ -289,8 +289,8 @@ pub struct HashtreeStore {
     pins: Database<Str, Unit>,
     /// Maps SHA256 hex -> root hash hex (for blossom compatibility)
     sha256_index: Database<Str, Str>,
-    /// Maps SHA256 hex -> pubkey (blob ownership for blossom)
-    blob_owners: Database<Str, Str>,
+    /// Blob ownership: sha256 (32 bytes) ++ pubkey (32 bytes) -> () (composite key for multi-owner)
+    blob_owners: Database<Bytes, Unit>,
     /// Maps pubkey -> blob metadata JSON (for blossom list)
     pubkey_blobs: Database<Str, Bytes>,
     /// Tree metadata for eviction: tree_root_hash (32 bytes) -> TreeMeta (msgpack)
@@ -702,17 +702,33 @@ impl HashtreeStore {
     }
 
     // === Blossom ownership tracking ===
+    // Uses composite key: sha256 (32 bytes) ++ pubkey (32 bytes) -> ()
+    // This allows efficient multi-owner tracking with O(1) lookups
 
-    /// Set the owner (pubkey) of a blob for Blossom protocol
+    /// Build composite key for blob_owners: sha256 ++ pubkey (64 bytes total)
+    fn blob_owner_key(sha256_hex: &str, pubkey_hex: &str) -> Result<[u8; 64]> {
+        let sha256_bytes = from_hex(sha256_hex)
+            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
+        let pubkey_bytes = from_hex(pubkey_hex)
+            .map_err(|e| anyhow::anyhow!("invalid pubkey hex: {}", e))?;
+        let mut key = [0u8; 64];
+        key[..32].copy_from_slice(&sha256_bytes);
+        key[32..].copy_from_slice(&pubkey_bytes);
+        Ok(key)
+    }
+
+    /// Add an owner (pubkey) to a blob for Blossom protocol
+    /// Multiple users can own the same blob - it's only deleted when all owners remove it
     pub fn set_blob_owner(&self, sha256_hex: &str, pubkey: &str) -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        let key = Self::blob_owner_key(sha256_hex, pubkey)?;
         let mut wtxn = self.env.write_txn()?;
 
-        // Store sha256 -> pubkey mapping
-        self.blob_owners.put(&mut wtxn, sha256_hex, pubkey)?;
+        // Add ownership entry (idempotent - put overwrites)
+        self.blob_owners.put(&mut wtxn, &key[..], &())?;
 
-        // Get existing blobs for this pubkey
+        // Get existing blobs for this pubkey (for /list endpoint)
         let mut blobs: Vec<BlobMetadata> = self
             .pubkey_blobs
             .get(&wtxn, pubkey)?
@@ -748,18 +764,96 @@ impl HashtreeStore {
         Ok(())
     }
 
-    /// Get the owner (pubkey) of a blob
-    pub fn get_blob_owner(&self, sha256_hex: &str) -> Result<Option<String>> {
+    /// Check if a pubkey owns a blob
+    pub fn is_blob_owner(&self, sha256_hex: &str, pubkey: &str) -> Result<bool> {
+        let key = Self::blob_owner_key(sha256_hex, pubkey)?;
         let rtxn = self.env.read_txn()?;
-        Ok(self.blob_owners.get(&rtxn, sha256_hex)?.map(|s| s.to_string()))
+        Ok(self.blob_owners.get(&rtxn, &key[..])?.is_some())
     }
 
-    /// Delete a blossom blob and remove ownership tracking
-    pub fn delete_blossom_blob(&self, sha256_hex: &str) -> Result<bool> {
+    /// Get all owners (pubkeys) of a blob via prefix scan
+    pub fn get_blob_owners(&self, sha256_hex: &str) -> Result<Vec<String>> {
+        let sha256_bytes = from_hex(sha256_hex)
+            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
+        let rtxn = self.env.read_txn()?;
+
+        let mut owners = Vec::new();
+        for item in self.blob_owners.prefix_iter(&rtxn, &sha256_bytes[..])? {
+            let (key, _) = item?;
+            if key.len() == 64 {
+                // Extract pubkey from composite key (bytes 32-64)
+                let pubkey_hex = to_hex(&key[32..64].try_into().unwrap());
+                owners.push(pubkey_hex);
+            }
+        }
+        Ok(owners)
+    }
+
+    /// Check if blob has any owners
+    pub fn blob_has_owners(&self, sha256_hex: &str) -> Result<bool> {
+        let sha256_bytes = from_hex(sha256_hex)
+            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
+        let rtxn = self.env.read_txn()?;
+
+        // Just check if any entry exists with this prefix
+        for item in self.blob_owners.prefix_iter(&rtxn, &sha256_bytes[..])? {
+            if item.is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Get the first owner (pubkey) of a blob (for backwards compatibility)
+    pub fn get_blob_owner(&self, sha256_hex: &str) -> Result<Option<String>> {
+        Ok(self.get_blob_owners(sha256_hex)?.into_iter().next())
+    }
+
+    /// Remove a user's ownership of a blossom blob
+    /// Only deletes the actual blob when no owners remain
+    /// Returns true if the blob was actually deleted (no owners left)
+    pub fn delete_blossom_blob(&self, sha256_hex: &str, pubkey: &str) -> Result<bool> {
+        let key = Self::blob_owner_key(sha256_hex, pubkey)?;
         let mut wtxn = self.env.write_txn()?;
 
-        // Get owner first
-        let owner = self.blob_owners.get(&wtxn, sha256_hex)?.map(|s| s.to_string());
+        // Remove this pubkey's ownership entry
+        self.blob_owners.delete(&mut wtxn, &key[..])?;
+
+        // Remove from pubkey's blob list
+        if let Some(blobs_bytes) = self.pubkey_blobs.get(&wtxn, pubkey)? {
+            if let Ok(mut blobs) = serde_json::from_slice::<Vec<BlobMetadata>>(blobs_bytes) {
+                blobs.retain(|b| b.sha256 != sha256_hex);
+                let blobs_json = serde_json::to_vec(&blobs)?;
+                self.pubkey_blobs.put(&mut wtxn, pubkey, &blobs_json)?;
+            }
+        }
+
+        // Check if any other owners remain (prefix scan)
+        let sha256_bytes = from_hex(sha256_hex)
+            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
+        let mut has_other_owners = false;
+        for item in self.blob_owners.prefix_iter(&wtxn, &sha256_bytes[..])? {
+            if item.is_ok() {
+                has_other_owners = true;
+                break;
+            }
+        }
+
+        if has_other_owners {
+            wtxn.commit()?;
+            tracing::debug!(
+                "Removed {} from blob {} owners, other owners remain",
+                &pubkey[..8.min(pubkey.len())],
+                &sha256_hex[..8.min(sha256_hex.len())]
+            );
+            return Ok(false);
+        }
+
+        // No owners left - delete the blob completely
+        tracing::info!(
+            "All owners removed from blob {}, deleting",
+            &sha256_hex[..8.min(sha256_hex.len())]
+        );
 
         // Delete from sha256_index
         let root_hex = self.sha256_index.get(&wtxn, sha256_hex)?.map(|s| s.to_string());
@@ -769,27 +863,13 @@ impl HashtreeStore {
         }
         self.sha256_index.delete(&mut wtxn, sha256_hex)?;
 
-        // Delete ownership
-        self.blob_owners.delete(&mut wtxn, sha256_hex)?;
-
-        // Remove from pubkey's blob list
-        if let Some(ref pubkey) = owner {
-            if let Some(blobs_bytes) = self.pubkey_blobs.get(&wtxn, pubkey)? {
-                if let Ok(mut blobs) = serde_json::from_slice::<Vec<BlobMetadata>>(blobs_bytes) {
-                    blobs.retain(|b| b.sha256 != sha256_hex);
-                    let blobs_json = serde_json::to_vec(&blobs)?;
-                    self.pubkey_blobs.put(&mut wtxn, pubkey, &blobs_json)?;
-                }
-            }
-        }
-
-        // Delete raw blob (by content hash)
+        // Delete raw blob (by content hash) - this deletes from S3 too
         let hash = from_hex(sha256_hex)
             .map_err(|e| anyhow::anyhow!("invalid hex: {}", e))?;
         let _ = self.router.delete_sync(&hash);
 
         wtxn.commit()?;
-        Ok(root_hex.is_some())
+        Ok(true)
     }
 
     /// List all blobs owned by a pubkey (for Blossom /list endpoint)
