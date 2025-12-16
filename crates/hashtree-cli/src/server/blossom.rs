@@ -540,9 +540,18 @@ pub async fn upload_blob(
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    // Check social graph access control only for browser-viewable media (image/video/audio)
-    // Non-media types (application/octet-stream, etc.) are open to everyone with valid Nostr auth
-    if is_browser_viewable_media(&content_type) {
+    // Check social graph access control based on public_writes setting and content type
+    // When public_writes=true (default): only browser-viewable media requires social graph
+    // When public_writes=false: all uploads require social graph
+    let requires_social_graph = if state.public_writes {
+        // Only media files require social graph check when public writes enabled
+        is_browser_viewable_media(&content_type)
+    } else {
+        // All uploads require social graph when public writes disabled
+        true
+    };
+
+    if requires_social_graph {
         if let Err(response) = check_write_access(&state, &auth.pubkey) {
             return response;
         }

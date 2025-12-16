@@ -31,6 +31,14 @@ pub struct ServerConfig {
     /// Enable WebRTC P2P connections
     #[serde(default = "default_enable_webrtc")]
     pub enable_webrtc: bool,
+    /// Allow anyone with valid Nostr auth to write (default: true)
+    /// When false, only social graph members can write
+    #[serde(default = "default_public_writes")]
+    pub public_writes: bool,
+}
+
+fn default_public_writes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +218,7 @@ impl Default for ServerConfig {
             enable_auth: default_enable_auth(),
             stun_port: default_stun_port(),
             enable_webrtc: default_enable_webrtc(),
+            public_writes: default_public_writes(),
         }
     }
 }

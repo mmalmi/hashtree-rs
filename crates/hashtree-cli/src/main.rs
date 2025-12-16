@@ -303,6 +303,7 @@ async fn main() -> Result<()> {
                 .with_ndb_query(relay_handle.query.clone())
                 .with_max_write_distance(config.nostr.max_write_distance)
                 .with_max_upload_bytes((config.blossom.max_upload_mb as usize) * 1024 * 1024)
+                .with_public_writes(config.server.public_writes)
                 .with_git(git_storage, hex::encode(pk_bytes));
 
             // Add WebRTC peer state for P2P queries from HTTP handler

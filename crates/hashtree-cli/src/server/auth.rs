@@ -18,6 +18,9 @@ pub struct AppState {
     pub webrtc_peers: Option<Arc<WebRTCState>>,
     /// Maximum upload size in bytes for Blossom uploads (default: 5 MB)
     pub max_upload_bytes: usize,
+    /// Allow anyone with valid Nostr auth to write (default: true)
+    /// When false, only social graph members can write
+    pub public_writes: bool,
 }
 
 #[derive(Clone)]
