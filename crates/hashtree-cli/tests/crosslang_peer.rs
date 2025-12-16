@@ -35,18 +35,26 @@ impl CrosslangServer {
         let config_dir = home_dir.join(".hashtree");
         std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
 
-        // Create config with reliable relays
-        let config_content = r#"
+        // Use local test relay (started by playwright) for reliable testing
+        // Falls back to public relays if LOCAL_RELAY env var not set
+        let relay_url = std::env::var("LOCAL_RELAY")
+            .unwrap_or_else(|_| "wss://temp.iris.to".to_string());
+        println!("CROSSLANG_RELAY:{}", relay_url);
+        println!("CROSSLANG_CONFIG_DIR:{}", config_dir.display());
+        let config_content = format!(r#"
 [server]
 enable_auth = false
 stun_port = 0
 
 [nostr]
-relays = ["wss://temp.iris.to", "wss://relay.damus.io", "wss://nos.lol"]
+relays = ["{}"]
 crawl_depth = 0
-"#;
-        std::fs::write(config_dir.join("config.toml"), config_content)
+"#, relay_url);
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, &config_content)
             .expect("Failed to write config");
+        println!("CROSSLANG_CONFIG_WRITTEN:{}", config_path.display());
+        println!("CROSSLANG_CONFIG_CONTENT:{}", config_content.replace('\n', " "));
 
         // Write pre-generated nsec key
         let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
@@ -75,10 +83,12 @@ crawl_depth = 0
             .arg("start")
             .arg("--addr")
             .arg(format!("127.0.0.1:{}", port))
+            .arg("--relays")
+            .arg(&relay_url)
             .env("HOME", home_dir)
             .env("RUST_LOG", "warn,hashtree_cli::webrtc=info")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())  // Capture stderr to log with stdout
+            .stdout(Stdio::inherit())  // Forward stdout to test output
+            .stderr(Stdio::inherit())  // Forward stderr to test output
             .spawn()
             .expect("Failed to start htree server");
 

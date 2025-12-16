@@ -44,6 +44,9 @@ enum Commands {
     Start {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+        /// Override Nostr relays (comma-separated)
+        #[arg(long)]
+        relays: Option<String>,
     },
     /// Add file or directory to hashtree (like ipfs add)
     Add {
@@ -159,9 +162,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { addr } => {
+        Commands::Start { addr, relays: relays_override } => {
             // Load or create config
-            let config = Config::load()?;
+            let mut config = Config::load()?;
+
+            // Override relays if specified on command line
+            if let Some(relays_str) = relays_override {
+                config.nostr.relays = relays_str.split(',').map(|s| s.trim().to_string()).collect();
+                println!("Using relays from CLI: {:?}", config.nostr.relays);
+            }
 
             // Use data dir from config if not overridden by CLI
             let data_dir = if cli.data_dir.to_str() == Some("./hashtree-data") {

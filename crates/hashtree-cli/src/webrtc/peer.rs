@@ -80,7 +80,7 @@ impl Peer {
         stun_servers: Vec<String>,
         store: Option<Arc<dyn ContentStore>>,
     ) -> Result<Self> {
-        // Create WebRTC API (matches hashtree-webrtc for cross-platform compatibility)
+        // Create WebRTC API
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
 
