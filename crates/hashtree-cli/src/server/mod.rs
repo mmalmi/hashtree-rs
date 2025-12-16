@@ -38,12 +38,19 @@ impl HashtreeServer {
                 auth: None,
                 ndb_query: None,
                 webrtc_peers: None,
+                max_upload_bytes: 5 * 1024 * 1024, // 5 MB default
             },
             relay_state: None,
             git_storage: None,
             local_pubkey: None,
             addr,
         }
+    }
+
+    /// Set maximum upload size for Blossom uploads
+    pub fn with_max_upload_bytes(mut self, bytes: usize) -> Self {
+        self.state.max_upload_bytes = bytes;
+        self
     }
 
     /// Set WebRTC state for P2P peer queries

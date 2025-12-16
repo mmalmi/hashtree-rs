@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 
 # Utilities
 anyhow.workspace = true

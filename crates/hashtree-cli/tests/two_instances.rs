@@ -399,9 +399,9 @@ fn test_local_add_and_get() {
     let test_data = create_test_directory();
     let instance = TestInstance::new_without_server();
 
-    // Add directory
+    // Add directory (--local to skip file server push in tests)
     let add_output = instance.run_command(htree_bin_str, &[
-        "add", test_data.path().to_str().unwrap(), "--public"
+        "add", test_data.path().to_str().unwrap(), "--public", "--local"
     ]);
 
     let add_stdout = String::from_utf8_lossy(&add_output.stdout);

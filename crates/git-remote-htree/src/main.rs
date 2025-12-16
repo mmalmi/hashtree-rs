@@ -18,9 +18,11 @@ use anyhow::{bail, Context, Result};
 use std::io::{BufRead, Write};
 use tracing::{debug, info, warn};
 
+mod config;
 mod helper;
 mod nostr_client;
 
+use config::load_config;
 use helper::RemoteHelper;
 use nostr_client::resolve_identity;
 
@@ -61,8 +63,14 @@ fn main() -> Result<()> {
         warn!("No signing key for {} - push will fail", identifier);
     }
 
+    // Load config
+    let config = load_config();
+    debug!("Loaded config with {} read servers, {} write servers",
+           config.blossom.read_servers.len(),
+           config.blossom.write_servers.len());
+
     // Create helper and run protocol
-    let mut helper = RemoteHelper::new(&pubkey, &repo_name, secret_key)?;
+    let mut helper = RemoteHelper::new(&pubkey, &repo_name, secret_key, config)?;
 
     // Read commands from stdin, write responses to stdout
     let stdin = std::io::stdin();

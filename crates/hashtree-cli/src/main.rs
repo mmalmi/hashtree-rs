@@ -64,6 +64,9 @@ enum Commands {
         /// Publish to Nostr under this ref name (e.g., "mydata" -> npub.../mydata)
         #[arg(long)]
         publish: Option<String>,
+        /// Don't push to file servers (local only)
+        #[arg(long)]
+        local: bool,
     },
     /// Get/download content by CID
     Get {
@@ -126,11 +129,11 @@ enum Commands {
     },
     /// List users you follow
     Following,
-    /// Push content to Blossom servers
+    /// Push content to file servers (Blossom)
     Push {
         /// CID (hash or hash:key) to push
         cid: String,
-        /// Blossom server URL (overrides config)
+        /// File server URL (overrides config)
         #[arg(long, short)]
         server: Option<String>,
     },
@@ -299,6 +302,7 @@ async fn main() -> Result<()> {
                 .with_ndb(ndb)
                 .with_ndb_query(relay_handle.query.clone())
                 .with_max_write_distance(config.nostr.max_write_distance)
+                .with_max_upload_bytes((config.blossom.max_upload_mb as usize) * 1024 * 1024)
                 .with_git(git_storage, hex::encode(pk_bytes));
 
             // Add WebRTC peer state for P2P queries from HTTP handler
@@ -308,10 +312,13 @@ async fn main() -> Result<()> {
 
             // Start background sync service if enabled
             let sync_handle = if config.sync.enabled {
+                // Combine legacy servers with read_servers for sync (reading)
+                let mut blossom_read_servers = config.blossom.servers.clone();
+                blossom_read_servers.extend(config.blossom.read_servers.clone());
                 let sync_config = hashtree_cli::sync::SyncConfig {
                     sync_own: config.sync.sync_own,
                     sync_followed: config.sync.sync_followed,
-                    blossom_servers: config.blossom.servers.clone(),
+                    blossom_servers: blossom_read_servers,
                     relays: config.nostr.relays.clone(),
                     max_concurrent: config.sync.max_concurrent,
                     webrtc_timeout_ms: config.sync.webrtc_timeout_ms,
@@ -434,7 +441,7 @@ async fn main() -> Result<()> {
             // Shutdown relay thread
             relay_handle.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        Commands::Add { path, only_hash, public, no_ignore, publish } => {
+        Commands::Add { path, only_hash, public, no_ignore, publish, local } => {
             let is_dir = path.is_dir();
 
             if only_hash {
@@ -600,10 +607,32 @@ async fn main() -> Result<()> {
                     // Clean up
                     let _ = resolver.stop().await;
                 }
+
+                // Background push to Blossom (unless --local)
+                if !local {
+                    let config = Config::load()?;
+                    // Combine legacy servers with write_servers for pushing
+                    let mut write_servers = config.blossom.servers.clone();
+                    write_servers.extend(config.blossom.write_servers.clone());
+                    if !write_servers.is_empty() {
+                        let data_dir = cli.data_dir.clone();
+                        let hash_for_push = hash_hex.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = background_blossom_push(&data_dir, &hash_for_push, &write_servers).await {
+                                eprintln!("  file server push failed: {}", e);
+                            }
+                        });
+                    }
+                }
             }
         }
         Commands::Get { cid, output } => {
             let store = HashtreeStore::new(&cli.data_dir)?;
+
+            // Load config for blossom fallback
+            let config = Config::load()?;
+            let mut read_servers = config.blossom.servers.clone();
+            read_servers.extend(config.blossom.read_servers.clone());
 
             // Check if it's a directory
             if let Ok(Some(_)) = store.get_directory_listing(&cid) {
@@ -611,14 +640,32 @@ async fn main() -> Result<()> {
                 let out_dir = output.unwrap_or_else(|| PathBuf::from(&cid));
                 std::fs::create_dir_all(&out_dir)?;
 
-                fn download_dir(store: &HashtreeStore, cid: &str, dir: &std::path::Path) -> Result<()> {
+                // Helper to download with blossom fallback
+                async fn download_dir_with_fallback(
+                    store: &HashtreeStore,
+                    cid: &str,
+                    dir: &std::path::Path,
+                    read_servers: &[String],
+                ) -> Result<()> {
                     if let Some(listing) = store.get_directory_listing(cid)? {
                         for entry in listing.entries {
                             let entry_path = dir.join(&entry.name);
                             if entry.is_directory {
                                 std::fs::create_dir_all(&entry_path)?;
-                                download_dir(store, &entry.cid, &entry_path)?;
-                            } else if let Some(content) = store.get_file(&entry.cid)? {
+                                Box::pin(download_dir_with_fallback(store, &entry.cid, &entry_path, read_servers)).await?;
+                            } else {
+                                // Try local first, then blossom fallback
+                                let content = if let Some(c) = store.get_file(&entry.cid)? {
+                                    c
+                                } else if let Some(c) = fetch_from_blossom(&entry.cid, read_servers).await {
+                                    // Store locally for future use
+                                    let _ = store.put_blob(&c);
+                                    println!("  {} (fetched from file server)", &entry.cid[..12]);
+                                    c
+                                } else {
+                                    eprintln!("  Warning: could not fetch {}", entry.cid);
+                                    continue;
+                                };
                                 std::fs::write(&entry_path, content)?;
                                 println!("  {} -> {}", entry.cid, entry_path.display());
                             }
@@ -628,13 +675,24 @@ async fn main() -> Result<()> {
                 }
 
                 println!("Downloading directory to {}", out_dir.display());
-                download_dir(&store, &cid, &out_dir)?;
+                download_dir_with_fallback(&store, &cid, &out_dir, &read_servers).await?;
                 println!("Done.");
             } else if let Some(content) = store.get_file(&cid)? {
-                // It's a file
+                // It's a file - found locally
                 let out_path = output.unwrap_or_else(|| PathBuf::from(&cid));
                 std::fs::write(&out_path, content)?;
                 println!("{} -> {}", cid, out_path.display());
+            } else if !read_servers.is_empty() {
+                // Try blossom fallback
+                if let Some(content) = fetch_from_blossom(&cid, &read_servers).await {
+                    // File not local, but found on file server
+                    let _ = store.put_blob(&content);
+                    let out_path = output.unwrap_or_else(|| PathBuf::from(&cid));
+                    std::fs::write(&out_path, &content)?;
+                    println!("{} -> {} (fetched from file server)", cid, out_path.display());
+                } else {
+                    anyhow::bail!("CID not found locally or on file servers: {}", cid);
+                }
             } else {
                 anyhow::bail!("CID not found: {}", cid);
             }
@@ -642,9 +700,22 @@ async fn main() -> Result<()> {
         Commands::Cat { cid } => {
             let store = HashtreeStore::new(&cli.data_dir)?;
 
+            // Load config for blossom fallback
+            let config = Config::load()?;
+            let mut read_servers = config.blossom.servers.clone();
+            read_servers.extend(config.blossom.read_servers.clone());
+
             if let Some(content) = store.get_file(&cid)? {
                 use std::io::Write;
                 std::io::stdout().write_all(&content)?;
+            } else if !read_servers.is_empty() {
+                if let Some(content) = fetch_from_blossom(&cid, &read_servers).await {
+                    let _ = store.put_blob(&content);
+                    use std::io::Write;
+                    std::io::stdout().write_all(&content)?;
+                } else {
+                    anyhow::bail!("CID not found locally or on file servers: {}", cid);
+                }
             } else {
                 anyhow::bail!("CID not found: {}", cid);
             }
@@ -1092,15 +1163,18 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
     // Load config
     let config = Config::load()?;
 
-    // Get servers (override or from config)
+    // Get servers (override or from config - use write_servers for push)
     let servers = if let Some(s) = server_override {
         vec![s]
     } else {
-        config.blossom.servers.clone()
+        // Combine legacy servers with write_servers
+        let mut write_servers = config.blossom.servers.clone();
+        write_servers.extend(config.blossom.write_servers.clone());
+        write_servers
     };
 
     if servers.is_empty() {
-        anyhow::bail!("No Blossom servers configured. Use --server or add servers to config.toml");
+        anyhow::bail!("No file servers configured. Use --server or add write_servers to config.toml");
     }
 
     // Ensure nsec exists for signing
@@ -1251,6 +1325,231 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
     }
 
     println!("\nDone!");
+    Ok(())
+}
+
+/// Fetch a blob from blossom read servers (fallback when not available locally)
+/// Returns None if not found on any server
+async fn fetch_from_blossom(hash_hex: &str, servers: &[String]) -> Option<Vec<u8>> {
+    use sha2::{Sha256, Digest};
+
+    if servers.is_empty() {
+        return None;
+    }
+
+    let client = reqwest::Client::new();
+
+    for server in servers {
+        let url = format!("{}/{}", server.trim_end_matches('/'), hash_hex);
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    // Verify hash
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    let computed = hex::encode(hasher.finalize());
+                    if computed == hash_hex {
+                        return Some(bytes.to_vec());
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    None
+}
+
+/// Background push to Blossom - fire and forget with server-level backoff
+/// Tries up to MAX_ATTEMPTS total, gives up and drops if still failing
+async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[String]) -> Result<()> {
+    use hashtree::to_hex;
+    use sha2::{Sha256, Digest};
+    use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    const MAX_ATTEMPTS: u32 = 3;
+    const BASE_BACKOFF_MS: u64 = 1000;
+    const MAX_BACKOFF_MS: u64 = 30000;
+
+    // Track server health for backoff
+    struct ServerHealth {
+        last_error: Instant,
+        consecutive_errors: u32,
+    }
+    let mut server_health: HashMap<String, ServerHealth> = HashMap::new();
+
+    // Check if server is in backoff
+    let is_in_backoff = |health: &HashMap<String, ServerHealth>, server: &str| -> bool {
+        if let Some(h) = health.get(server) {
+            if h.consecutive_errors == 0 {
+                return false;
+            }
+            let backoff_ms = std::cmp::min(
+                BASE_BACKOFF_MS * 2_u64.pow(h.consecutive_errors - 1),
+                MAX_BACKOFF_MS,
+            );
+            h.last_error.elapsed().as_millis() < backoff_ms as u128
+        } else {
+            false
+        }
+    };
+
+    // Ensure nsec exists for signing
+    let (nsec_str, _) = ensure_nsec_string()?;
+    let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
+
+    // Open local store
+    let store = HashtreeStore::new(data_dir)?;
+
+    // Parse CID (hash or hash:key)
+    let (hash_hex, _key_hex) = if let Some((h, k)) = cid_str.split_once(':') {
+        (h.to_string(), Some(k.to_string()))
+    } else {
+        (cid_str.to_string(), None)
+    };
+
+    // Collect all blocks to push (walk the DAG)
+    let mut blocks_to_push: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = vec![hash_hex.clone()];
+
+    while let Some(hash) = queue.pop() {
+        if visited.contains(&hash) {
+            continue;
+        }
+        visited.insert(hash.clone());
+
+        // Try to get as tree node first (for directories/internal nodes)
+        if let Ok(Some(node)) = store.get_tree_node(&hash) {
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash.clone(), data));
+            }
+            for link in &node.links {
+                let child_hash = to_hex(&link.hash);
+                if !visited.contains(&child_hash) {
+                    queue.push(child_hash);
+                }
+            }
+        } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
+            if metadata.is_chunked {
+                for chunk_cid in &metadata.chunk_cids {
+                    if !visited.contains(chunk_cid) {
+                        if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
+                            blocks_to_push.push((chunk_cid.clone(), chunk_data));
+                            visited.insert(chunk_cid.clone());
+                        }
+                    }
+                }
+            }
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash.clone(), data));
+            }
+        } else if let Ok(Some(data)) = store.get_blob(&hash) {
+            blocks_to_push.push((hash.clone(), data));
+        }
+    }
+
+    if blocks_to_push.is_empty() {
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+    let mut total_uploaded = 0;
+    let mut total_skipped = 0;
+
+    // Try each block with limited retries
+    for (hash, data) in &blocks_to_push {
+        let mut attempts = 0;
+        let mut uploaded = false;
+
+        while attempts < MAX_ATTEMPTS && !uploaded {
+            attempts += 1;
+
+            // Find a server not in backoff
+            let available_server = servers.iter().find(|s| !is_in_backoff(&server_health, s));
+            let server = match available_server {
+                Some(s) => s,
+                None => {
+                    // All servers in backoff, wait a bit and retry
+                    tokio::time::sleep(tokio::time::Duration::from_millis(BASE_BACKOFF_MS)).await;
+                    continue;
+                }
+            };
+
+            // Check if already exists (HEAD request)
+            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
+            if let Ok(resp) = client.head(&url).send().await {
+                if resp.status().is_success() {
+                    total_skipped += 1;
+                    uploaded = true;
+                    continue;
+                }
+            }
+
+            // Create Blossom auth event
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let expiration = now + 300;
+
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let computed_hash = hex::encode(hasher.finalize());
+
+            let auth_event = match EventBuilder::new(Kind::Custom(24242), "Upload")
+                .tags(vec![
+                    Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
+                    Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
+                    Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
+                ])
+                .sign(&keys)
+                .await
+            {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let auth_json = auth_event.as_json();
+            let auth_header = format!("Nostr {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth_json));
+
+            let upload_url = format!("{}/upload", server.trim_end_matches('/'));
+            let resp = client.put(&upload_url)
+                .header("Authorization", auth_header)
+                .header("Content-Type", "application/octet-stream")
+                .header("X-SHA-256", &computed_hash)
+                .body(data.clone())
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
+                    // Success - reset server health
+                    server_health.remove(server);
+                    total_uploaded += 1;
+                    uploaded = true;
+                }
+                Ok(_) | Err(_) => {
+                    // Error - record backoff
+                    let health = server_health.entry(server.clone()).or_insert(ServerHealth {
+                        last_error: Instant::now(),
+                        consecutive_errors: 0,
+                    });
+                    health.last_error = Instant::now();
+                    health.consecutive_errors += 1;
+                }
+            }
+        }
+
+        // If still not uploaded after MAX_ATTEMPTS, just drop it (no memory accumulation)
+    }
+
+    if total_uploaded > 0 || total_skipped > 0 {
+        println!("  file servers: {} uploaded, {} already exist", total_uploaded, total_skipped);
+    }
+
     Ok(())
 }
 

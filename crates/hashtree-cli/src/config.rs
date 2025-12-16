@@ -90,9 +90,30 @@ pub struct NostrConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlossomConfig {
-    /// Blossom servers for push/pull
-    #[serde(default = "default_blossom_servers")]
+    /// File servers for push/pull (legacy, both read and write)
+    #[serde(default)]
     pub servers: Vec<String>,
+    /// Read-only file servers (fallback for fetching content)
+    #[serde(default = "default_read_servers")]
+    pub read_servers: Vec<String>,
+    /// Write-enabled file servers (for uploading)
+    #[serde(default = "default_write_servers")]
+    pub write_servers: Vec<String>,
+    /// Maximum upload size in MB (default: 5)
+    #[serde(default = "default_max_upload_mb")]
+    pub max_upload_mb: u64,
+}
+
+fn default_read_servers() -> Vec<String> {
+    vec!["https://files.iris.to".to_string()]
+}
+
+fn default_write_servers() -> Vec<String> {
+    vec!["https://hashtree.iris.to".to_string()]
+}
+
+fn default_max_upload_mb() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,11 +138,6 @@ pub struct SyncConfig {
     pub blossom_timeout_ms: u64,
 }
 
-fn default_blossom_servers() -> Vec<String> {
-    vec![
-        "https://blossom.iris.to".to_string(),
-    ]
-}
 
 fn default_sync_enabled() -> bool {
     true
@@ -222,7 +238,10 @@ impl Default for NostrConfig {
 impl Default for BlossomConfig {
     fn default() -> Self {
         Self {
-            servers: default_blossom_servers(),
+            servers: Vec::new(),
+            read_servers: default_read_servers(),
+            write_servers: default_write_servers(),
+            max_upload_mb: default_max_upload_mb(),
         }
     }
 }

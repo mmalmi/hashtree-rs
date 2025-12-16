@@ -51,6 +51,9 @@ pub static HARDCODED_SUBSCRIBERS: LazyLock<HashSet<&'static str>> = LazyLock::ne
 /// Blossom authorization event kind (NIP-98 style)
 const BLOSSOM_AUTH_KIND: u16 = 24242;
 
+/// Default maximum upload size in bytes (5 MB)
+pub const DEFAULT_MAX_UPLOAD_SIZE: usize = 5 * 1024 * 1024;
+
 /// Check if a user is "overmuted" based on their muter/follower ratio
 /// Returns true if the mute ratio exceeds the threshold
 pub fn is_overmuted(muter_count: usize, followers_count: usize) -> bool {
@@ -500,6 +503,22 @@ pub async fn upload_blob(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    // Check size limit first (before auth to save resources)
+    let max_size = state.max_upload_bytes;
+    if body.len() > max_size {
+        return Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"error":"Upload size {} bytes exceeds maximum {} bytes ({} MB)"}}"#,
+                body.len(),
+                max_size,
+                max_size / 1024 / 1024
+            )))
+            .unwrap();
+    }
+
     // Verify authorization
     let auth = match verify_blossom_auth(&headers, "upload", None) {
         Ok(a) => a,
