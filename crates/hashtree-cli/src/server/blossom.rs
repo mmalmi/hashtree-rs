@@ -416,17 +416,23 @@ fn escape_json_string(s: &str) -> String {
 /// CORS preflight handler for all Blossom endpoints
 /// Echoes back Access-Control-Request-Headers to allow any headers
 pub async fn cors_preflight(headers: HeaderMap) -> impl IntoResponse {
-    // Echo back requested headers, or use sensible defaults
+    // Echo back requested headers, or use sensible defaults that cover common Blossom headers
     let allowed_headers = headers
         .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("Authorization, Content-Type, X-SHA-256");
+        .unwrap_or("Authorization, Content-Type, X-SHA-256, x-sha-256");
+
+    // Always include common headers in addition to what was requested
+    let full_allowed = format!(
+        "{}, Authorization, Content-Type, X-SHA-256, x-sha-256, Accept, Cache-Control",
+        allowed_headers
+    );
 
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, PUT, DELETE, OPTIONS")
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, allowed_headers)
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, full_allowed)
         .header(header::ACCESS_CONTROL_MAX_AGE, "86400")
         .body(Body::empty())
         .unwrap()
@@ -479,6 +485,15 @@ pub async fn head_blob(
     }
 }
 
+/// Check if a MIME type is browser-viewable media (image/video/audio)
+/// These require social graph access, while application/* types are open to everyone
+fn is_browser_viewable_media(content_type: &str) -> bool {
+    let ct_lower = content_type.to_lowercase();
+    ct_lower.starts_with("image/")
+        || ct_lower.starts_with("video/")
+        || ct_lower.starts_with("audio/")
+}
+
 /// PUT /upload - Upload a new blob (BUD-02)
 pub async fn upload_blob(
     State(state): State<AppState>,
@@ -499,9 +514,19 @@ pub async fn upload_blob(
         }
     };
 
-    // Check social graph access control
-    if let Err(response) = check_write_access(&state, &auth.pubkey) {
-        return response;
+    // Get content type from header
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    // Check social graph access control only for browser-viewable media (image/video/audio)
+    // Non-media types (application/octet-stream, etc.) are open to everyone with valid Nostr auth
+    if is_browser_viewable_media(&content_type) {
+        if let Err(response) = check_write_access(&state, &auth.pubkey) {
+            return response;
+        }
     }
 
     // Compute SHA256 of uploaded data
@@ -522,13 +547,6 @@ pub async fn upload_blob(
     }
 
     let size = body.len() as u64;
-
-    // Get content type from header or default
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
 
     // Store the blob
     let store_result = store_blossom_blob(&state, &body, &sha256_hex, &auth.pubkey);
@@ -886,5 +904,33 @@ mod tests {
         // Verify threshold constants are reasonable
         assert_eq!(OVERMUTED_RATIO, 0.1); // 10%
         assert_eq!(OVERMUTED_MIN_MUTERS, 5);
+    }
+
+    #[test]
+    fn test_is_browser_viewable_media() {
+        // Browser-viewable media - require social graph
+        assert!(is_browser_viewable_media("image/png"));
+        assert!(is_browser_viewable_media("image/jpeg"));
+        assert!(is_browser_viewable_media("image/gif"));
+        assert!(is_browser_viewable_media("image/webp"));
+        assert!(is_browser_viewable_media("image/svg+xml"));
+        assert!(is_browser_viewable_media("video/mp4"));
+        assert!(is_browser_viewable_media("video/webm"));
+        assert!(is_browser_viewable_media("audio/mpeg"));
+        assert!(is_browser_viewable_media("audio/ogg"));
+        assert!(is_browser_viewable_media("audio/wav"));
+
+        // Case insensitive
+        assert!(is_browser_viewable_media("Image/PNG"));
+        assert!(is_browser_viewable_media("VIDEO/MP4"));
+
+        // Non-media - open to everyone
+        assert!(!is_browser_viewable_media("application/octet-stream"));
+        assert!(!is_browser_viewable_media("application/json"));
+        assert!(!is_browser_viewable_media("application/zip"));
+        assert!(!is_browser_viewable_media("application/pdf"));
+        assert!(!is_browser_viewable_media("text/plain"));
+        assert!(!is_browser_viewable_media("text/html"));
+        assert!(!is_browser_viewable_media(""));
     }
 }
