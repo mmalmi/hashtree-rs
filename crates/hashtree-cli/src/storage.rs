@@ -248,7 +248,7 @@ impl StorageRouter {
         Ok(false)
     }
 
-    /// Delete data from both stores
+    /// Delete data from both local and S3 stores
     pub fn delete_sync(&self, hash: &Hash) -> Result<bool, StoreError> {
         let deleted = self.local.delete_sync(hash)?;
 
@@ -259,6 +259,12 @@ impl StorageRouter {
         }
 
         Ok(deleted)
+    }
+
+    /// Delete data from local store only (don't propagate to S3)
+    /// Used for eviction where we want to keep S3 as archive
+    pub fn delete_local_only(&self, hash: &Hash) -> Result<bool, StoreError> {
+        self.local.delete_sync(hash)
     }
 
     /// Get stats from local store
@@ -381,8 +387,17 @@ impl HashtreeStore {
         self.router.local_store()
     }
 
-    /// Upload a file and return its CID (public/unencrypted)
+    /// Upload a file and return its CID (public/unencrypted), with auto-pin
     pub fn upload_file<P: AsRef<Path>>(&self, file_path: P) -> Result<String> {
+        self.upload_file_internal(file_path, true)
+    }
+
+    /// Upload a file without pinning (for blossom uploads that can be evicted)
+    pub fn upload_file_no_pin<P: AsRef<Path>>(&self, file_path: P) -> Result<String> {
+        self.upload_file_internal(file_path, false)
+    }
+
+    fn upload_file_internal<P: AsRef<Path>>(&self, file_path: P, pin: bool) -> Result<String> {
         let file_path = file_path.as_ref();
         let file_content = std::fs::read(file_path)?;
 
@@ -405,8 +420,10 @@ impl HashtreeStore {
         // Store SHA256 -> root hash mapping for blossom compatibility
         self.sha256_index.put(&mut wtxn, &sha256_hex, &root_hex)?;
 
-        // Auto-pin on upload
-        self.pins.put(&mut wtxn, &root_hex, &())?;
+        // Only pin if requested (htree add = pin, blossom upload = no pin)
+        if pin {
+            self.pins.put(&mut wtxn, &root_hex, &())?;
+        }
 
         wtxn.commit()?;
 
@@ -1245,7 +1262,8 @@ impl HashtreeStore {
                     .map_err(|e| anyhow::anyhow!("Failed to get blob: {}", e))?
                 {
                     freed += data.len() as u64;
-                    self.router.delete_sync(blob_hash)
+                    // Delete locally only - keep S3 as archive
+                    self.router.delete_local_only(blob_hash)
                         .map_err(|e| anyhow::anyhow!("Failed to delete blob: {}", e))?;
                 }
             }
@@ -1256,7 +1274,8 @@ impl HashtreeStore {
             .map_err(|e| anyhow::anyhow!("Failed to get tree node: {}", e))?
         {
             freed += data.len() as u64;
-            self.router.delete_sync(root_hash)
+            // Delete locally only - keep S3 as archive
+            self.router.delete_local_only(root_hash)
                 .map_err(|e| anyhow::anyhow!("Failed to delete tree node: {}", e))?;
         }
 
@@ -1449,10 +1468,10 @@ impl HashtreeStore {
                 continue;
             }
 
-            // This blob is orphaned - delete it
+            // This blob is orphaned - delete locally (keep S3 as archive)
             if let Ok(Some(data)) = self.router.get_sync(&hash) {
                 freed += data.len() as u64;
-                let _ = self.router.delete_sync(&hash);
+                let _ = self.router.delete_local_only(&hash);
                 tracing::debug!("Deleted orphaned blob {} ({} bytes)", &hash_hex[..8], data.len());
             }
         }
@@ -1529,7 +1548,8 @@ impl HashtreeStore {
             if !pinned.contains(&hash_hex) {
                 if let Ok(Some(data)) = self.router.get_sync(&hash) {
                     freed_bytes += data.len() as u64;
-                    let _ = self.router.delete_sync(&hash);
+                    // Delete locally only - keep S3 as archive
+                    let _ = self.router.delete_local_only(&hash);
                     deleted += 1;
                 }
             }

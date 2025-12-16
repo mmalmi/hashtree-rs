@@ -810,7 +810,8 @@ fn store_blossom_blob(
     let temp_file = temp_dir.path().join(format!("{}.bin", sha256_hex));
     std::fs::write(&temp_file, data)?;
 
-    let _cid = state.store.upload_file(&temp_file)?;
+    // Don't auto-pin blossom uploads - they can be evicted like other synced content
+    let _cid = state.store.upload_file_no_pin(&temp_file)?;
 
     // Track ownership
     state.store.set_blob_owner(sha256_hex, pubkey)?;
