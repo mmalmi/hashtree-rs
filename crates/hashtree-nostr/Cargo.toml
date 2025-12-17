@@ -9,7 +9,7 @@ description = "Social graph and relay connections using nostrdb"
 
 [dependencies]
 # Core
-nostrdb = { package = "hashtree-nostrdb", path = "../hashtree-nostrdb" }
+nostrdb = { package = "hashtree-nostrdb", path = "../hashtree-nostrdb", version = "0.1.0" }
 nostr-sdk = "0.35"
 
 # Async
