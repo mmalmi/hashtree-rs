@@ -30,7 +30,6 @@ bench-ingest-many
 configurator
 libsecp256k1.a
 .direnv/
-deps/secp256k1
 testdata/db/*.mdb
 deps/*.tar.gz
 deps/.dir
