@@ -412,7 +412,8 @@ impl WebRTCManager {
 
         // Process incoming events and outgoing signaling messages
         let mut shutdown_rx = self.shutdown_rx.clone();
-        let mut state_sync_interval = tokio::time::interval(Duration::from_millis(500));
+        // Cleanup interval - run every 30 seconds as a fallback (not for real-time sync)
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -434,9 +435,9 @@ impl WebRTCManager {
                     // Handle peer state events (connected, failed, disconnected)
                     self.handle_peer_state_event(event).await;
                 }
-                _ = state_sync_interval.tick() => {
-                    // Sync peer connection states
-                    self.sync_connection_states().await;
+                _ = cleanup_interval.tick() => {
+                    // Periodic cleanup of stale peers and state sync (fallback)
+                    self.cleanup_stale_peers().await;
                 }
             }
         }
@@ -989,7 +990,23 @@ impl WebRTCManager {
 
         let mut peers = self.state.peers.write().await;
         if let Some(entry) = peers.get_mut(&peer_key) {
+            // Skip if already connected - duplicate answers from multiple relays
+            if entry.state == ConnectionState::Connected {
+                debug!("Ignoring duplicate answer from {} - already connected", full_peer_id.short());
+                return Ok(());
+            }
             if let Some(ref mut peer) = entry.peer {
+                // Check WebRTC signaling state before applying answer
+                use webrtc::peer_connection::signaling_state::RTCSignalingState;
+                let signaling_state = peer.signaling_state();
+                if signaling_state != RTCSignalingState::HaveLocalOffer {
+                    debug!(
+                        "Ignoring answer from {} - signaling state is {:?}, not HaveLocalOffer",
+                        full_peer_id.short(),
+                        signaling_state
+                    );
+                    return Ok(());
+                }
                 peer.handle_answer(answer).await?;
                 info!("Applied answer from {}", full_peer_id.short());
             }
@@ -1060,6 +1077,8 @@ impl WebRTCManager {
                     if entry.state != ConnectionState::Connected {
                         info!("Peer {} connected (via state event)", peer_id.short());
                         entry.state = ConnectionState::Connected;
+                        // Update connected count
+                        self.state.connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -1068,6 +1087,10 @@ impl WebRTCManager {
                 info!("Peer {} connection failed - removing from pool", peer_id.short());
                 let mut peers = self.state.peers.write().await;
                 if let Some(entry) = peers.remove(&peer_key) {
+                    // Decrement connected count if was connected
+                    if entry.state == ConnectionState::Connected {
+                        self.state.connected_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // Close the peer connection if it exists
                     if let Some(peer) = entry.peer {
                         let _ = peer.close().await;
@@ -1079,6 +1102,10 @@ impl WebRTCManager {
                 info!("Peer {} disconnected - removing from pool", peer_id.short());
                 let mut peers = self.state.peers.write().await;
                 if let Some(entry) = peers.remove(&peer_key) {
+                    // Decrement connected count if was connected
+                    if entry.state == ConnectionState::Connected {
+                        self.state.connected_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // Close the peer connection if it exists
                     if let Some(peer) = entry.peer {
                         let _ = peer.close().await;
@@ -1088,24 +1115,39 @@ impl WebRTCManager {
         }
     }
 
-    /// Sync connection states from peer objects
-    async fn sync_connection_states(&self) {
+    /// Cleanup stale peers and sync connection states (fallback, runs every 30s)
+    async fn cleanup_stale_peers(&self) {
         let mut peers = self.state.peers.write().await;
         let mut connected_count = 0;
+        let mut to_remove = Vec::new();
+        let stale_timeout = Duration::from_secs(60); // Remove peers stuck in Discovered/Connecting for 60s
 
-        for entry in peers.values_mut() {
+        for (key, entry) in peers.iter_mut() {
             if let Some(ref peer) = entry.peer {
-                let actual_state = peer.state();
-                // Log actual state for debugging
-                debug!("Peer {} actual WebRTC state: {:?}", entry.peer_id.short(), actual_state);
-
-                // Check if peer is now connected
+                // Sync connected state as fallback (in case event was missed)
                 if peer.is_connected() {
                     if entry.state != ConnectionState::Connected {
-                        info!("Peer {} is now connected!", entry.peer_id.short());
+                        info!("Peer {} is now connected (sync fallback)", entry.peer_id.short());
                         entry.state = ConnectionState::Connected;
                     }
                     connected_count += 1;
+                } else if entry.state == ConnectionState::Connecting && entry.last_seen.elapsed() > stale_timeout {
+                    // Peer stuck in Connecting for too long - mark for removal
+                    info!("Removing stale peer {} (stuck in Connecting for {:?})", entry.peer_id.short(), entry.last_seen.elapsed());
+                    to_remove.push(key.clone());
+                }
+            } else if entry.state == ConnectionState::Discovered && entry.last_seen.elapsed() > stale_timeout {
+                // Discovered peer with no actual connection - remove
+                debug!("Removing stale discovered peer {}", entry.peer_id.short());
+                to_remove.push(key.clone());
+            }
+        }
+
+        // Remove stale peers
+        for key in to_remove {
+            if let Some(entry) = peers.remove(&key) {
+                if let Some(peer) = entry.peer {
+                    let _ = peer.close().await;
                 }
             }
         }

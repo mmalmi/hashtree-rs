@@ -153,6 +153,11 @@ impl Peer {
         self.pc.connection_state()
     }
 
+    /// Get signaling state
+    pub fn signaling_state(&self) -> webrtc::peer_connection::signaling_state::RTCSignalingState {
+        self.pc.signaling_state()
+    }
+
     /// Check if connected
     pub fn is_connected(&self) -> bool {
         self.pc.connection_state() == RTCPeerConnectionState::Connected
