@@ -5,8 +5,8 @@
 
 use crate::peer::{Peer, PeerError};
 use crate::types::{
-    ClassifyRequest, PeerId, PeerPool, PeerState, SignalingMessage, WebRTCStats,
-    WebRTCStoreConfig, NOSTR_KIND_HASHTREE,
+    ClassifyRequest, ForwardRx, ForwardTx, PeerId, PeerPool, PeerState, SignalingMessage,
+    WebRTCStats, WebRTCStoreConfig, NOSTR_KIND_HASHTREE,
 };
 use async_trait::async_trait;
 use hashtree_core::{to_hex, Hash, Store, StoreError};
@@ -56,6 +56,10 @@ pub struct WebRTCStore<S: Store> {
     signaling_tx: mpsc::Sender<SignalingMessage>,
     /// Signaling message receiver
     signaling_rx: Arc<RwLock<Option<mpsc::Receiver<SignalingMessage>>>>,
+    /// Forward request sender (for peers to request forwarding)
+    forward_tx: ForwardTx,
+    /// Forward request receiver
+    forward_rx: Arc<RwLock<Option<ForwardRx>>>,
     /// Running flag
     running: Arc<RwLock<bool>>,
     /// Statistics
@@ -66,6 +70,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
     /// Create a new WebRTC store
     pub fn new(local_store: Arc<S>, config: WebRTCStoreConfig) -> Self {
         let (signaling_tx, signaling_rx) = mpsc::channel(100);
+        let (forward_tx, forward_rx) = mpsc::channel(100);
 
         let peer_id = PeerId::new(String::new(), Uuid::new_v4().to_string());
 
@@ -78,9 +83,16 @@ impl<S: Store + 'static> WebRTCStore<S> {
             peer_roots: Arc::new(RwLock::new(HashMap::new())),
             signaling_tx,
             signaling_rx: Arc::new(RwLock::new(Some(signaling_rx))),
+            forward_tx,
+            forward_rx: Arc::new(RwLock::new(Some(forward_rx))),
             running: Arc::new(RwLock::new(false)),
             stats: Arc::new(RwLock::new(WebRTCStats::default())),
         }
+    }
+
+    /// Get the forward request sender (for passing to peers)
+    pub fn forward_tx(&self) -> ForwardTx {
+        self.forward_tx.clone()
     }
 
     /// Start the WebRTC store (connect to relays, begin peer discovery)
@@ -127,8 +139,83 @@ impl<S: Store + 'static> WebRTCStore<S> {
         self.start_event_handler(client.clone()).await;
         self.start_signaling_sender(client).await;
         self.start_hello_timer().await;
+        self.start_forward_handler().await;
 
         Ok(())
+    }
+
+    /// Start handler for forward requests from peers
+    async fn start_forward_handler(&self) {
+        let mut rx = self.forward_rx.write().await.take().unwrap();
+        let peers = self.peers.clone();
+        let local_store = self.local_store.clone();
+        let running = self.running.clone();
+        let debug = self.config.debug;
+
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                if !*running.read().await {
+                    break;
+                }
+
+                if debug {
+                    println!(
+                        "[Store] Forward request: hash={}..., htl={}, exclude={}",
+                        &to_hex(&req.hash)[..16],
+                        req.htl,
+                        &req.exclude_peer_id[..req.exclude_peer_id.len().min(16)]
+                    );
+                }
+
+                // Get other peers (excluding the requester), prioritize follows
+                let peers_read = peers.read().await;
+                let mut follows_peers = Vec::new();
+                let mut other_peers = Vec::new();
+
+                for (peer_id, entry) in peers_read.iter() {
+                    if *peer_id != req.exclude_peer_id && entry.peer.state().await == PeerState::Ready {
+                        match entry.pool {
+                            PeerPool::Follows => follows_peers.push(entry.peer.clone()),
+                            PeerPool::Other => other_peers.push(entry.peer.clone()),
+                        }
+                    }
+                }
+                drop(peers_read);
+
+                // Query peers sequentially (follows first, then others)
+                let mut result = None;
+                for peer in follows_peers.into_iter().chain(other_peers.into_iter()) {
+                    // Use request_with_htl to forward with the given HTL
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(500), // Short timeout per peer
+                        peer.request_with_htl(&req.hash, req.htl),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(data))) => {
+                            // Verify hash
+                            if hashtree_core::sha256(&data) == req.hash {
+                                // Store locally for future requests
+                                let _ = local_store.put(req.hash, data.clone()).await;
+                                result = Some(data);
+                                break;
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+
+                if debug {
+                    println!(
+                        "[Store] Forward result: hash={}..., found={}",
+                        &to_hex(&req.hash)[..16],
+                        result.is_some()
+                    );
+                }
+
+                let _ = req.response.send(result);
+            }
+        });
     }
 
     /// Send hello message to discover peers
@@ -154,6 +241,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
         let peer_roots = self.peer_roots.clone();
         let local_peer_id = self.peer_id.to_peer_string();
         let signaling_tx = self.signaling_tx.clone();
+        let forward_tx = self.forward_tx.clone();
         let local_store = self.local_store.clone();
         let running = self.running.clone();
         let config = self.config.clone();
@@ -197,6 +285,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
                                         peers.clone(),
                                         peer_roots.clone(),
                                         signaling_tx.clone(),
+                                        forward_tx.clone(),
                                         local_store.clone(),
                                         &config,
                                         stats.clone(),
@@ -282,6 +371,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
         peers: Arc<RwLock<HashMap<String, PeerEntry<S>>>>,
         peer_roots: Arc<RwLock<HashMap<String, Vec<String>>>>,
         signaling_tx: mpsc::Sender<SignalingMessage>,
+        forward_tx: ForwardTx,
         local_store: Arc<S>,
         config: &WebRTCStoreConfig,
         stats: Arc<RwLock<WebRTCStats>>,
@@ -328,12 +418,13 @@ impl<S: Store + 'static> WebRTCStore<S> {
                                 println!("[Store] Initiating connection to {} (pool: {:?})", peer_id, pool);
                             }
                             // Create peer and add to map BEFORE connecting to avoid race with incoming answer
-                            if let Ok(peer) = Peer::new(
+                            if let Ok(peer) = Peer::with_forward_channel(
                                 remote_id,
                                 local_peer_id.to_string(),
                                 signaling_tx.clone(),
                                 local_store.clone(),
                                 config.debug,
+                                Some(forward_tx.clone()),
                             )
                             .await
                             {
@@ -402,12 +493,13 @@ impl<S: Store + 'static> WebRTCStore<S> {
                     Some(p) => p,
                     None => {
                         if let Some(remote_id) = PeerId::from_peer_string(peer_id) {
-                            if let Ok(p) = Peer::new(
+                            if let Ok(p) = Peer::with_forward_channel(
                                 remote_id,
                                 local_peer_id.to_string(),
                                 signaling_tx.clone(),
                                 local_store.clone(),
                                 config.debug,
+                                Some(forward_tx.clone()),
                             )
                             .await
                             {

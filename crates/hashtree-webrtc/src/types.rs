@@ -110,7 +110,14 @@ pub struct IceCandidate {
 pub enum DataMessage {
     /// Request data by hash
     #[serde(rename = "req")]
-    Request { id: u32, hash: String },
+    Request {
+        id: u32,
+        hash: String,
+        /// Hops To Live - decremented on each forward hop
+        /// When htl reaches 0, request is not forwarded further
+        #[serde(skip_serializing_if = "Option::is_none")]
+        htl: Option<u8>,
+    },
 
     /// Response with data (binary payload follows)
     #[serde(rename = "res")]
@@ -144,7 +151,85 @@ pub enum DataMessage {
     },
 }
 
+/// HTL (Hops To Live) constants - Freenet-style probabilistic decrement
+pub const MAX_HTL: u8 = 10;
+/// Probability to decrement at max HTL (50%)
+pub const DECREMENT_AT_MAX_PROB: f64 = 0.5;
+/// Probability to decrement at min HTL=1 (25%)
+pub const DECREMENT_AT_MIN_PROB: f64 = 0.25;
+
+/// Per-peer HTL configuration (Freenet-style probabilistic decrement)
+/// Generated once per peer connection, stays fixed for connection lifetime
+#[derive(Debug, Clone, Copy)]
+pub struct PeerHTLConfig {
+    /// Whether to decrement at MAX_HTL
+    pub decrement_at_max: bool,
+    /// Whether to decrement at HTL=1
+    pub decrement_at_min: bool,
+}
+
+impl PeerHTLConfig {
+    /// Generate random HTL config for a new peer connection
+    pub fn random() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        Self {
+            decrement_at_max: rng.gen::<f64>() < DECREMENT_AT_MAX_PROB,
+            decrement_at_min: rng.gen::<f64>() < DECREMENT_AT_MIN_PROB,
+        }
+    }
+
+    /// Decrement HTL using this peer's config (Freenet-style probabilistic)
+    /// Called when SENDING to a peer, not on receive
+    pub fn decrement(&self, htl: u8) -> u8 {
+        if htl == 0 {
+            return 0;
+        }
+
+        if htl == MAX_HTL {
+            // At max: only decrement if this peer's config says so
+            if self.decrement_at_max {
+                htl - 1
+            } else {
+                htl
+            }
+        } else if htl == 1 {
+            // At min: only decrement if this peer's config says so
+            if self.decrement_at_min {
+                0
+            } else {
+                htl
+            }
+        } else {
+            // Middle values: always decrement
+            htl - 1
+        }
+    }
+}
+
+/// Check if a request should be forwarded based on HTL
+pub fn should_forward(htl: u8) -> bool {
+    htl > 0
+}
+
 use tokio::sync::{mpsc, oneshot};
+
+/// Request to forward a data request to other peers
+pub struct ForwardRequest {
+    /// Hash being requested
+    pub hash: Hash,
+    /// Peer ID to exclude (the one who sent the request)
+    pub exclude_peer_id: String,
+    /// HTL for forwarded request
+    pub htl: u8,
+    /// Channel to send result back
+    pub response: oneshot::Sender<Option<Vec<u8>>>,
+}
+
+/// Sender for forward requests
+pub type ForwardTx = mpsc::Sender<ForwardRequest>;
+/// Receiver for forward requests
+pub type ForwardRx = mpsc::Receiver<ForwardRequest>;
 
 /// Peer pool classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

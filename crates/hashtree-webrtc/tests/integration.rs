@@ -172,6 +172,155 @@ async fn test_peer_discovery() {
     assert!(found_peer, "Peers should discover and connect to each other");
 }
 
+/// Test HTL-based forwarding across 3 nodes.
+/// Topology: A <-> B <-> C (A and C are not directly connected)
+/// A has data, C requests it, B forwards the request to A
+#[tokio::test]
+async fn test_three_node_forwarding() {
+    use hashtree_core::{sha256, Store};
+
+    // Start local relay
+    let mut relay = WsRelay::new();
+    let _addr = relay.start().await.expect("Failed to start relay");
+    let relay_url = relay.url().expect("Relay URL should be available");
+
+    // Three stores: A has data, B is relay node, C is requester
+    let store_a_local = Arc::new(MemoryStore::new());
+    let store_b_local = Arc::new(MemoryStore::new());
+    let store_c_local = Arc::new(MemoryStore::new());
+
+    // Put test data in store A only
+    let test_data = b"Data from A, forwarded via B to C!";
+    let hash = sha256(test_data);
+    store_a_local.put(hash, test_data.to_vec()).await.unwrap();
+
+    // Generate keys
+    let keys_a = Keys::generate();
+    let keys_b = Keys::generate();
+    let keys_c = Keys::generate();
+    let pubkey_a = keys_a.public_key().to_hex();
+    let pubkey_b = keys_b.public_key().to_hex();
+    let pubkey_c = keys_c.public_key().to_hex();
+    println!("Store A pubkey: {}", pubkey_a);
+    println!("Store B pubkey: {}", pubkey_b);
+    println!("Store C pubkey: {}", pubkey_c);
+
+    // Set up classifiers:
+    // A connects to B only
+    // B connects to both A and C
+    // C connects to B only
+    let (classifier_tx_a, classifier_rx_a) = classifier_channel(10);
+    let (classifier_tx_b, classifier_rx_b) = classifier_channel(10);
+    let (classifier_tx_c, classifier_rx_c) = classifier_channel(10);
+
+    let follows_a: Arc<RwLock<HashSet<String>>> =
+        Arc::new(RwLock::new(HashSet::from([pubkey_b.clone()])));
+    let follows_b: Arc<RwLock<HashSet<String>>> =
+        Arc::new(RwLock::new(HashSet::from([pubkey_a.clone(), pubkey_c.clone()])));
+    let follows_c: Arc<RwLock<HashSet<String>>> =
+        Arc::new(RwLock::new(HashSet::from([pubkey_b.clone()])));
+
+    tokio::spawn(run_classifier(classifier_rx_a, follows_a));
+    tokio::spawn(run_classifier(classifier_rx_b, follows_b));
+    tokio::spawn(run_classifier(classifier_rx_c, follows_c));
+
+    // Configure pools: only connect to follows
+    let pools = PoolSettings {
+        follows: PoolConfig {
+            max_connections: 10,
+            satisfied_connections: 2,
+        },
+        other: PoolConfig {
+            max_connections: 0,
+            satisfied_connections: 0,
+        },
+    };
+
+    let config_a = WebRTCStoreConfig {
+        relays: vec![relay_url.clone()],
+        debug: true,
+        hello_interval_ms: 500,
+        pools: pools.clone(),
+        classifier_tx: Some(classifier_tx_a),
+        ..Default::default()
+    };
+
+    let config_b = WebRTCStoreConfig {
+        relays: vec![relay_url.clone()],
+        debug: true,
+        hello_interval_ms: 500,
+        pools: pools.clone(),
+        classifier_tx: Some(classifier_tx_b),
+        ..Default::default()
+    };
+
+    let config_c = WebRTCStoreConfig {
+        relays: vec![relay_url.clone()],
+        debug: true,
+        hello_interval_ms: 500,
+        pools: pools.clone(),
+        classifier_tx: Some(classifier_tx_c),
+        ..Default::default()
+    };
+
+    let mut store_a = WebRTCStore::new(store_a_local.clone(), config_a);
+    let mut store_b = WebRTCStore::new(store_b_local.clone(), config_b);
+    let mut store_c = WebRTCStore::new(store_c_local.clone(), config_c);
+
+    // Start all stores with delays
+    store_a.start(keys_a).await.expect("Store A failed to start");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    store_b.start(keys_b).await.expect("Store B failed to start");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    store_c.start(keys_c).await.expect("Store C failed to start");
+
+    // Wait for all connections to establish
+    // A-B and B-C should connect
+    let mut connected = false;
+    for i in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let count_a = store_a.peer_count().await;
+        let count_b = store_b.peer_count().await;
+        let count_c = store_c.peer_count().await;
+        println!(
+            "Connection attempt {}/30: A={}, B={}, C={}",
+            i + 1, count_a, count_b, count_c
+        );
+        // B should have 2 peers (A and C), A and C should have 1 each (B)
+        if count_a >= 1 && count_b >= 2 && count_c >= 1 {
+            connected = true;
+            break;
+        }
+    }
+
+    if !connected {
+        println!("Warning: Not all peers connected as expected, attempting forwarding anyway");
+    }
+    println!("Attempting data transfer via forwarding...");
+
+    // Store C should be able to fetch data from store A via B
+    // C doesn't have the data, B doesn't have it either, so B should forward to A
+    let result = store_c.get(&hash).await;
+
+    store_a.stop().await;
+    store_b.stop().await;
+    store_c.stop().await;
+    relay.stop().await;
+
+    match result {
+        Ok(Some(data)) => {
+            assert_eq!(data, test_data.to_vec());
+            println!("Three-node forwarding successful! Data received at C from A via B");
+        }
+        Ok(None) => {
+            panic!("Data not found - forwarding may have failed");
+        }
+        Err(e) => {
+            panic!("Error fetching data: {:?}", e);
+        }
+    }
+}
+
 /// Test that data can be transferred between peers via WebRTC.
 #[tokio::test]
 async fn test_data_transfer_between_peers() {

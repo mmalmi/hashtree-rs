@@ -3,7 +3,10 @@
 //! Handles WebRTC connection establishment, data channel communication,
 //! and the request/response protocol for hash-based data exchange.
 
-use crate::types::{DataMessage, PeerId, PeerState, SignalingMessage, DATA_CHANNEL_LABEL};
+use crate::types::{
+    should_forward, DataMessage, ForwardRequest, ForwardTx, PeerId, PeerHTLConfig, PeerState,
+    SignalingMessage, DATA_CHANNEL_LABEL, MAX_HTL,
+};
 use bytes::Bytes;
 use hashtree_core::{from_hex, to_hex, Hash, Store};
 use lru::LruCache;
@@ -63,6 +66,35 @@ struct TheirRequest {
     requested_at: std::time::Instant,
 }
 
+/// Callback type for forwarding requests to other peers (deprecated, use ForwardTx channel)
+/// Parameters: (hash, exclude_peer_id, htl)
+/// Returns: data if found, None otherwise
+pub type ForwardRequestCallback = Arc<
+    dyn Fn(Hash, String, u8) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync,
+>;
+
+/// Forward via channel (preferred over callback)
+async fn forward_via_channel(
+    forward_tx: &ForwardTx,
+    hash: Hash,
+    exclude_peer_id: String,
+    htl: u8,
+) -> Option<Vec<u8>> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let req = ForwardRequest {
+        hash,
+        exclude_peer_id,
+        htl,
+        response: response_tx,
+    };
+
+    if forward_tx.send(req).await.is_err() {
+        return None;
+    }
+
+    response_rx.await.ok().flatten()
+}
+
 /// WebRTC peer connection wrapper
 ///
 /// Each Peer is an independent agent that tracks:
@@ -98,8 +130,12 @@ pub struct Peer<S: Store> {
     local_peer_id: String,
     /// Debug logging enabled
     debug: bool,
-    /// Callback to forward request to other peers when we don't have data locally
-    on_forward_request: Option<Arc<dyn Fn(Hash, PeerId) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync>>,
+    /// Per-peer HTL configuration (Freenet-style probabilistic decrement)
+    htl_config: PeerHTLConfig,
+    /// Channel to forward request to other peers when we don't have data locally
+    forward_tx: Option<ForwardTx>,
+    /// Callback to forward request to other peers (deprecated, use forward_tx)
+    on_forward_request: Option<ForwardRequestCallback>,
 }
 
 impl<S: Store + 'static> Peer<S> {
@@ -110,6 +146,19 @@ impl<S: Store + 'static> Peer<S> {
         signaling_tx: mpsc::Sender<SignalingMessage>,
         local_store: Arc<S>,
         debug: bool,
+    ) -> Result<Self, PeerError> {
+        Self::with_forward_channel(remote_id, local_peer_id, signaling_tx, local_store, debug, None)
+            .await
+    }
+
+    /// Create a new peer connection with a forwarding channel
+    pub async fn with_forward_channel(
+        remote_id: PeerId,
+        local_peer_id: String,
+        signaling_tx: mpsc::Sender<SignalingMessage>,
+        local_store: Arc<S>,
+        debug: bool,
+        forward_tx: Option<ForwardTx>,
     ) -> Result<Self, PeerError> {
         // Create WebRTC API
         let mut media_engine = MediaEngine::default();
@@ -153,6 +202,8 @@ impl<S: Store + 'static> Peer<S> {
             local_store,
             local_peer_id,
             debug,
+            htl_config: PeerHTLConfig::random(),
+            forward_tx,
             on_forward_request: None,
         };
 
@@ -169,6 +220,10 @@ impl<S: Store + 'static> Peer<S> {
         let their_requests = self.their_requests.clone();
         let local_store = self.local_store.clone();
         let debug = self.debug;
+        let htl_config = self.htl_config;
+        let forward_tx = self.forward_tx.clone();
+        let on_forward_request = self.on_forward_request.clone();
+        let peer_id_str = self.remote_id.to_peer_string();
 
         // Handle connection state changes
         let state_clone = state.clone();
@@ -206,12 +261,18 @@ impl<S: Store + 'static> Peer<S> {
         let their_requests_clone = their_requests.clone();
         let local_store_clone = local_store.clone();
         let state_clone = state.clone();
+        let forward_tx_clone = forward_tx.clone();
+        let on_forward_clone = on_forward_request.clone();
+        let peer_id_clone = peer_id_str.clone();
         self.connection.on_data_channel(Box::new(move |dc| {
             let data_channel = data_channel_clone.clone();
             let pending_requests = pending_requests_clone.clone();
             let their_requests = their_requests_clone.clone();
             let local_store = local_store_clone.clone();
             let state = state_clone.clone();
+            let forward_tx = forward_tx_clone.clone();
+            let on_forward = on_forward_clone.clone();
+            let peer_id = peer_id_clone.clone();
 
             Box::pin(async move {
                 if dc.label() == DATA_CHANNEL_LABEL {
@@ -221,6 +282,10 @@ impl<S: Store + 'static> Peer<S> {
                         their_requests,
                         local_store,
                         debug,
+                        htl_config,
+                        forward_tx,
+                        on_forward,
+                        peer_id,
                     )
                     .await;
                     *data_channel.write().await = Some(dc);
@@ -287,17 +352,27 @@ impl<S: Store + 'static> Peer<S> {
         their_requests: Arc<RwLock<LruCache<String, TheirRequest>>>,
         local_store: Arc<S>,
         debug: bool,
+        htl_config: PeerHTLConfig,
+        forward_tx: Option<ForwardTx>,
+        on_forward_request: Option<ForwardRequestCallback>,
+        peer_id: String,
     ) {
         let pending_requests_clone = pending_requests.clone();
         let their_requests_clone = their_requests.clone();
         let local_store_clone = local_store.clone();
         let dc_clone = dc.clone();
+        let forward_tx_clone = forward_tx.clone();
+        let on_forward_clone = on_forward_request.clone();
+        let peer_id_clone = peer_id.clone();
 
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let pending_requests = pending_requests_clone.clone();
             let their_requests = their_requests_clone.clone();
             let local_store = local_store_clone.clone();
             let dc = dc_clone.clone();
+            let forward_tx = forward_tx_clone.clone();
+            let on_forward = on_forward_clone.clone();
+            let peer_id = peer_id_clone.clone();
 
             Box::pin(async move {
                 let data = msg.data.to_vec();
@@ -333,36 +408,38 @@ impl<S: Store + 'static> Peer<S> {
                                 );
                             }
                         }
-                        DataMessage::Request { id, hash } => {
+                        DataMessage::Request { id, hash, htl } => {
+                            let htl = htl.unwrap_or(MAX_HTL);
                             if debug {
-                                println!("[Peer] Request: id={}, hash={}", id, hash);
+                                println!("[Peer] Request: id={}, hash={}, htl={}", id, hash, htl);
                             }
-                            // Look up data in local store and respond
+                            // Look up data in local store first
                             if let Ok(hash_bytes) = from_hex(&hash) {
-                                let response = match local_store.get(&hash_bytes).await {
-                                    Ok(Some(payload)) => {
-                                        // Send JSON response header
-                                        let res_msg = DataMessage::Response {
-                                            id,
-                                            hash: hash.clone(),
-                                            found: true,
-                                            size: Some(payload.len() as u64),
-                                        };
-                                        let json = serde_json::to_string(&res_msg).unwrap();
-                                        let _ = dc.send(&Bytes::from(json)).await;
+                                let local_result = local_store.get(&hash_bytes).await;
 
-                                        // Send binary data: [4 bytes requestId LE][data]
-                                        let mut binary = Vec::with_capacity(4 + payload.len());
-                                        binary.extend_from_slice(&id.to_le_bytes());
-                                        binary.extend_from_slice(&payload);
-                                        let _ = dc.send(&Bytes::from(binary)).await;
-                                        true
-                                    }
-                                    _ => false,
-                                };
-                                if !response {
-                                    // Track this request so we can push data later
-                                    // (like hashtree-ts theirRequests)
+                                if let Ok(Some(payload)) = local_result {
+                                    // Found locally - send response
+                                    let res_msg = DataMessage::Response {
+                                        id,
+                                        hash: hash.clone(),
+                                        found: true,
+                                        size: Some(payload.len() as u64),
+                                    };
+                                    let json = serde_json::to_string(&res_msg).unwrap();
+                                    let _ = dc.send(&Bytes::from(json)).await;
+
+                                    // Send binary data: [4 bytes requestId LE][data]
+                                    let mut binary = Vec::with_capacity(4 + payload.len());
+                                    binary.extend_from_slice(&id.to_le_bytes());
+                                    binary.extend_from_slice(&payload);
+                                    let _ = dc.send(&Bytes::from(binary)).await;
+                                    return;
+                                }
+
+                                // Not found locally - try forwarding if HTL allows
+                                let can_forward = forward_tx.is_some() || on_forward.is_some();
+                                if can_forward && should_forward(htl) {
+                                    // Track this request for later push
                                     {
                                         let mut their_reqs = their_requests.write().await;
                                         their_reqs.put(
@@ -374,16 +451,76 @@ impl<S: Store + 'static> Peer<S> {
                                         );
                                     }
 
-                                    // Send not found response
-                                    let res_msg = DataMessage::Response {
-                                        id,
-                                        hash,
-                                        found: false,
-                                        size: None,
+                                    // Decrement HTL before forwarding (Freenet-style per-peer config)
+                                    let forward_htl = htl_config.decrement(htl);
+
+                                    if debug {
+                                        println!(
+                                            "[Peer] Forwarding request htl={}->{}, hash={}...",
+                                            htl, forward_htl, &hash[..16.min(hash.len())]
+                                        );
+                                    }
+
+                                    // Forward to other peers (excluding this one)
+                                    // Prefer channel over callback
+                                    let forward_result = if let Some(ref tx) = forward_tx {
+                                        forward_via_channel(tx, hash_bytes, peer_id.clone(), forward_htl).await
+                                    } else if let Some(ref forward_cb) = on_forward {
+                                        forward_cb(hash_bytes, peer_id.clone(), forward_htl).await
+                                    } else {
+                                        None
                                     };
-                                    let json = serde_json::to_string(&res_msg).unwrap();
-                                    let _ = dc.send(&Bytes::from(json)).await;
+
+                                    if let Some(payload) = forward_result {
+                                        // Got it from another peer - send response
+                                        their_requests.write().await.pop(&hash);
+
+                                        let res_msg = DataMessage::Response {
+                                            id,
+                                            hash: hash.clone(),
+                                            found: true,
+                                            size: Some(payload.len() as u64),
+                                        };
+                                        let json = serde_json::to_string(&res_msg).unwrap();
+                                        let _ = dc.send(&Bytes::from(json)).await;
+
+                                        let mut binary = Vec::with_capacity(4 + payload.len());
+                                        binary.extend_from_slice(&id.to_le_bytes());
+                                        binary.extend_from_slice(&payload);
+                                        let _ = dc.send(&Bytes::from(binary)).await;
+
+                                        if debug {
+                                            println!(
+                                                "[Peer] Forward success, sent {} bytes for hash={}...",
+                                                payload.len(), &hash[..16.min(hash.len())]
+                                            );
+                                        }
+                                        return;
+                                    }
+                                    // Forward failed - fall through to not found
                                 }
+
+                                // Not found anywhere - send not found response
+                                // Keep in their_requests for potential later push
+                                {
+                                    let mut their_reqs = their_requests.write().await;
+                                    their_reqs.put(
+                                        hash.clone(),
+                                        TheirRequest {
+                                            id,
+                                            requested_at: std::time::Instant::now(),
+                                        },
+                                    );
+                                }
+
+                                let res_msg = DataMessage::Response {
+                                    id,
+                                    hash,
+                                    found: false,
+                                    size: None,
+                                };
+                                let json = serde_json::to_string(&res_msg).unwrap();
+                                let _ = dc.send(&Bytes::from(json)).await;
                             }
                         }
                         DataMessage::Push { hash } => {
@@ -434,6 +571,10 @@ impl<S: Store + 'static> Peer<S> {
             self.their_requests.clone(),
             self.local_store.clone(),
             self.debug,
+            self.htl_config,
+            self.forward_tx.clone(),
+            self.on_forward_request.clone(),
+            self.remote_id.to_peer_string(),
         )
         .await;
 
@@ -570,8 +711,13 @@ impl<S: Store + 'static> Peer<S> {
         Ok(())
     }
 
-    /// Request data by hash
+    /// Request data by hash with default HTL
     pub async fn request(&self, hash: &Hash) -> Result<Option<Vec<u8>>, PeerError> {
+        self.request_with_htl(hash, MAX_HTL).await
+    }
+
+    /// Request data by hash with specified HTL
+    pub async fn request_with_htl(&self, hash: &Hash, htl: u8) -> Result<Option<Vec<u8>>, PeerError> {
         let state = *self.state.read().await;
         if state != PeerState::Ready {
             return Err(PeerError::NotReady);
@@ -591,12 +737,19 @@ impl<S: Store + 'static> Peer<S> {
             .insert(id, PendingRequest { response_tx: tx });
 
         // Send request as JSON string (matches hashtree-ts)
+        // Decrement HTL using our per-peer config before sending
+        let send_htl = self.htl_config.decrement(htl);
         let msg = DataMessage::Request {
             id,
             hash: hash_hex.clone(),
+            htl: Some(send_htl),
         };
         let json = serde_json::to_string(&msg)?;
         dc.send(&Bytes::from(json)).await?;
+
+        if self.debug {
+            println!("[Peer] Sent request: id={}, htl={}, hash={}...", id, send_htl, &hash_hex[..16.min(hash_hex.len())]);
+        }
 
         // Wait for response with timeout
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
@@ -666,11 +819,17 @@ impl<S: Store + 'static> Peer<S> {
 
     /// Set the forward request callback
     /// Called when this peer requests data we don't have locally
+    /// Parameters: (hash, exclude_peer_id, htl)
     pub fn set_on_forward_request<F>(&mut self, callback: F)
     where
-        F: Fn(Hash, PeerId) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync + 'static,
+        F: Fn(Hash, String, u8) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync + 'static,
     {
         self.on_forward_request = Some(Arc::new(callback));
+    }
+
+    /// Get the peer's HTL config (for testing)
+    pub fn htl_config(&self) -> PeerHTLConfig {
+        self.htl_config
     }
 
     /// Send data to this peer for a hash they previously requested

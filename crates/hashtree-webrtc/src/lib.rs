@@ -40,10 +40,11 @@ pub mod peer;
 pub mod store;
 pub mod types;
 
-pub use peer::{Peer, PeerError};
+pub use peer::{ForwardRequestCallback, Peer, PeerError};
 pub use store::{WebRTCStore, WebRTCStoreError};
 pub use types::{
-    classifier_channel, ClassifierRx, ClassifierTx, ClassifyRequest,
-    DataMessage, IceCandidate, PeerId, PeerPool, PeerState, PoolConfig, PoolSettings,
-    SignalingMessage, WebRTCStats, WebRTCStoreConfig, DATA_CHANNEL_LABEL, NOSTR_KIND_HASHTREE,
+    classifier_channel, should_forward, ClassifierRx, ClassifierTx, ClassifyRequest,
+    DataMessage, ForwardRequest, ForwardRx, ForwardTx, IceCandidate, PeerId, PeerHTLConfig,
+    PeerPool, PeerState, PoolConfig, PoolSettings, SignalingMessage, WebRTCStats,
+    WebRTCStoreConfig, DATA_CHANNEL_LABEL, MAX_HTL, NOSTR_KIND_HASHTREE,
 };
