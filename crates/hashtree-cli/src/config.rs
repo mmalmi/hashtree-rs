@@ -280,12 +280,12 @@ pub fn get_nsec_path() -> PathBuf {
 }
 
 /// Initialize nostrdb with reasonable defaults (similar to notedeck)
-pub fn init_nostrdb() -> Result<nostrdb::Ndb> {
+pub fn init_nostrdb() -> Result<hashtree_nostrdb::Ndb> {
     init_nostrdb_at(get_nostrdb_dir())
 }
 
 /// Initialize nostrdb at a specific path
-pub fn init_nostrdb_at<P: AsRef<std::path::Path>>(path: P) -> Result<nostrdb::Ndb> {
+pub fn init_nostrdb_at<P: AsRef<std::path::Path>>(path: P) -> Result<hashtree_nostrdb::Ndb> {
     let db_path = path.as_ref();
 
     // Create directory if needed
@@ -298,12 +298,12 @@ pub fn init_nostrdb_at<P: AsRef<std::path::Path>>(path: P) -> Result<nostrdb::Nd
         1024 * 1024 * 1024 * 1024 // 1 TiB
     };
 
-    let config = nostrdb::Config::new()
+    let config = hashtree_nostrdb::Config::new()
         .set_ingester_threads(2)
         .set_mapsize(map_size);
 
     let db_path_str = db_path.to_string_lossy();
-    nostrdb::Ndb::new(&db_path_str, &config)
+    hashtree_nostrdb::Ndb::new(&db_path_str, &config)
         .context("Failed to initialize nostrdb")
 }
 

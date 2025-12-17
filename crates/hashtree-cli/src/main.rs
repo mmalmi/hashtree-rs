@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
             };
 
             // Set social graph root
-            nostrdb::socialgraph::set_root(&ndb, &root_pubkey);
+            hashtree_nostrdb::socialgraph::set_root(&ndb, &root_pubkey);
 
             // Start relay connections (outbound)
             // Crawl social graph starting from root user
@@ -232,8 +232,8 @@ async fn main() -> Result<()> {
                     if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
                         if pubkey_bytes.len() == 32 {
                             let pk: [u8; 32] = pubkey_bytes.try_into().unwrap();
-                            if let Ok(txn) = nostrdb::Transaction::new(&ndb_for_classifier) {
-                                let distance = nostrdb::socialgraph::get_follow_distance(&txn, &ndb_for_classifier, &pk);
+                            if let Ok(txn) = hashtree_nostrdb::Transaction::new(&ndb_for_classifier) {
+                                let distance = hashtree_nostrdb::socialgraph::get_follow_distance(&txn, &ndb_for_classifier, &pk);
                                 // Distance 0 = self (skip), 1 = direct follow/follower
                                 if distance == 1 {
                                     return PeerPool::Follows;

@@ -6,11 +6,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Social graph and relay connections using nostrdb"
-publish = false  # Uses git dependency (nostrdb fork)
 
 [dependencies]
 # Core
-nostrdb = { git = "https://github.com/mmalmi/nostrdb-rs" }
+nostrdb = { package = "hashtree-nostrdb", path = "../hashtree-nostrdb" }
 nostr-sdk = "0.35"
 
 # Async
