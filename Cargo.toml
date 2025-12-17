@@ -6,8 +6,8 @@ resolver = "2"
 version = "0.1.2"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/irislib/hashtree-rs"
-homepage = "https://github.com/irislib/hashtree-rs"
+repository = "https://github.com/mmalmi/hashtree-rs"
+homepage = "https://github.com/mmalmi/hashtree-rs"
 authors = ["Martti Malmi <mmalmi@gmail.com>"]
 
 [workspace.dependencies]
