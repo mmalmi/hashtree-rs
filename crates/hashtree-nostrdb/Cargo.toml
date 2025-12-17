@@ -8,6 +8,14 @@ authors = ["William Casarin <jb55@jb55.com>", "Martti Malmi <mmalmi@gmail.com>"]
 description = "Nostrdb with social graph support - fork for hashtree"
 readme = "README.md"
 build = "build.rs"
+include = [
+    "src/**/*",
+    "nostrdb/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "bindings.h",
+]
 
 [build-dependencies]
 cc = "1.0"
