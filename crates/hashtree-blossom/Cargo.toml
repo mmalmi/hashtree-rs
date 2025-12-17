@@ -27,7 +27,7 @@ tracing = "0.1"
 base64 = "0.22"
 
 # Core hashtree types (optional - for Store trait impl)
-hashtree-core = { path = "../hashtree", optional = true }
+hashtree-core = { workspace = true, optional = true }
 async-trait = { version = "0.1", optional = true }
 
 [features]

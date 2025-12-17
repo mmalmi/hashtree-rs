@@ -7,6 +7,7 @@ repository.workspace = true
 authors.workspace = true
 description = "BEP52 (BitTorrent v2) compatible merkle tree implementation"
 keywords = ["merkle", "bittorrent", "bep52", "hash", "torrent"]
+publish = false
 
 [dependencies]
 sha2.workspace = true

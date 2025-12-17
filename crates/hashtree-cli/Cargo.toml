@@ -17,7 +17,7 @@ path = "src/main.rs"
 hashtree-core.workspace = true
 hashtree-lmdb.workspace = true
 hashtree-git.workspace = true
-hashtree-resolver = { path = "../hashtree-resolver", features = ["nostr"] }
+hashtree-resolver = { workspace = true, features = ["nostr"] }
 
 # AWS S3 (optional)
 aws-sdk-s3 = { workspace = true, optional = true }

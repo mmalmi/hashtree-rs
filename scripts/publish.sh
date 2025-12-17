@@ -35,8 +35,7 @@ publish_crate() {
             sleep $WAIT_TIME
         fi
     else
-        echo "✗ Failed to publish $crate"
-        exit 1
+        echo "✗ Failed to publish $crate (continuing...)"
     fi
 }
 
