@@ -3,6 +3,8 @@ name = "hashtree-bep52"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "BEP52 (BitTorrent v2) compatible merkle tree implementation"
 keywords = ["merkle", "bittorrent", "bep52", "hash", "torrent"]
 

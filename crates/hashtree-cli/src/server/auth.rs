@@ -6,7 +6,7 @@ use axum::{
 };
 use crate::storage::HashtreeStore;
 use crate::webrtc::WebRTCState;
-use hashtree_relay::NdbQuerySender;
+use hashtree_nostr::NdbQuerySender;
 use std::sync::Arc;
 
 #[derive(Clone)]

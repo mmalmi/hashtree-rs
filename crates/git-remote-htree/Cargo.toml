@@ -3,6 +3,8 @@ name = "git-remote-htree"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Git remote helper for hashtree - push/pull git repos via nostr and hashtree"
 
 [[bin]]

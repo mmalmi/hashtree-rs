@@ -3,6 +3,8 @@ name = "hashtree-lmdb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "LMDB-backed content-addressed blob storage for hashtree"
 
 [dependencies]

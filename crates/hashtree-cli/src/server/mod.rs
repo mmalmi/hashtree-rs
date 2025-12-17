@@ -10,21 +10,18 @@ use anyhow::Result;
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
-    routing::{any, get, post, put},
+    routing::{get, post, put},
     Router,
 };
 use crate::storage::HashtreeStore;
 use crate::webrtc::WebRTCState;
 use hashtree_git::GitStorage;
-use nostrdb::Ndb;
-use hashtree_relay::{ws_handler, RelayState};
 use std::sync::Arc;
 
 pub use auth::{AppState, AuthCredentials};
 
 pub struct HashtreeServer {
     state: AppState,
-    relay_state: Option<RelayState>,
     git_storage: Option<Arc<GitStorage>>,
     local_pubkey: Option<String>,
     addr: String,
@@ -39,7 +36,6 @@ impl HashtreeServer {
                 ndb_query: None,
                 webrtc_peers: None,
             },
-            relay_state: None,
             git_storage: None,
             local_pubkey: None,
             addr,
@@ -64,25 +60,7 @@ impl HashtreeServer {
         self
     }
 
-    pub fn with_ndb(mut self, ndb: Ndb) -> Self {
-        self.relay_state = Some(RelayState {
-            ndb: Arc::new(ndb),
-            max_write_distance: None, // No restriction by default
-        });
-        self
-    }
-
-    /// Set maximum follow distance for write access to the relay
-    /// distance 0 = only root user, 1 = root + direct follows, etc.
-    /// None = no restriction (anyone can write)
-    pub fn with_max_write_distance(mut self, max_distance: Option<u32>) -> Self {
-        if let Some(ref mut state) = self.relay_state {
-            state.max_write_distance = max_distance;
-        }
-        self
-    }
-
-    pub fn with_ndb_query(mut self, query: hashtree_relay::NdbQuerySender) -> Self {
+    pub fn with_ndb_query(mut self, query: hashtree_nostr::NdbQuerySender) -> Self {
         self.state.ndb_query = Some(query);
         self
     }
@@ -116,14 +94,6 @@ impl HashtreeServer {
             .route("/api/resolve/:pubkey/:treename", get(handlers::resolve_to_hash))
             .route("/api/trees/:pubkey", get(handlers::list_trees))
             .with_state(self.state.clone());
-
-        // Add nostr relay WebSocket endpoint if ndb is configured
-        if let Some(relay_state) = self.relay_state {
-            let relay_routes = Router::new()
-                .route("/", any(ws_handler))
-                .with_state(relay_state);
-            public_routes = public_routes.merge(relay_routes);
-        }
 
         // Add git smart HTTP routes if git storage is configured
         if let Some(git_storage) = self.git_storage {

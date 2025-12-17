@@ -3,6 +3,8 @@ name = "hashtree-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Simple content-addressed merkle tree with KV storage"
 keywords = ["merkle", "content-addressed", "hash", "tree", "storage"]
 

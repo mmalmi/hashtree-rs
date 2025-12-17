@@ -3,6 +3,8 @@ name = "hashtree-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Hashtree daemon and CLI - content-addressed storage with P2P sync"
 default-run = "htree"
 
@@ -14,7 +16,7 @@ path = "src/main.rs"
 # Core hashtree crates
 hashtree-core = { workspace = true, features = ["encryption"] }
 hashtree-lmdb.workspace = true
-hashtree-relay.workspace = true
+hashtree-nostr.workspace = true
 hashtree-git.workspace = true
 hashtree-resolver = { path = "../hashtree-resolver", features = ["nostr"] }
 

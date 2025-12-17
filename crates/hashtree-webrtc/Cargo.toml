@@ -3,6 +3,8 @@ name = "hashtree-webrtc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "WebRTC P2P transport for hashtree using Nostr relay signaling"
 keywords = ["merkle", "webrtc", "p2p", "nostr", "hashtree"]
 

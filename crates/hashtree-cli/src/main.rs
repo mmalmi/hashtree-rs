@@ -265,11 +265,9 @@ async fn main() -> Result<()> {
                 (None, None)
             };
 
-            // Set up server with nostr relay (inbound) and query sender
+            // Set up server with ndb query sender for social graph
             let mut server = HashtreeServer::new(Arc::clone(&store), addr.clone())
-                .with_ndb(ndb)
                 .with_ndb_query(relay_handle.query.clone())
-                .with_max_write_distance(config.nostr.max_write_distance)
                 .with_git(git_storage, hex::encode(pk_bytes));
 
             // Add WebRTC peer state for P2P queries from HTTP handler

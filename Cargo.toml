@@ -6,6 +6,9 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/irislib/hashtree-rs"
+homepage = "https://github.com/irislib/hashtree-rs"
+authors = ["Martti Malmi <mmalmi@gmail.com>"]
 
 [workspace.dependencies]
 # Core
@@ -27,7 +30,7 @@ uuid = { version = "1.0", features = ["v4"] }
 # Internal
 hashtree-core = { path = "crates/hashtree" }
 hashtree-lmdb = { path = "crates/hashtree-lmdb" }
-hashtree-relay = { path = "crates/hashtree-relay" }
+hashtree-nostr = { path = "crates/hashtree-nostr" }
 hashtree-git = { path = "crates/hashtree-git" }
 
 # Storage
