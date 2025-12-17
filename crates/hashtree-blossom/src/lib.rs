@@ -211,7 +211,9 @@ impl BlossomClient {
     pub async fn exists(&self, hash: &str) -> bool {
         for server in &self.read_servers {
             let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
+            debug!("Checking exists: {}", url);
             if let Ok(resp) = self.http.head(&url).send().await {
+                debug!("  -> status: {}", resp.status());
                 if resp.status().is_success() {
                     // Verify content-type is binary, not HTML error page
                     if let Some(ct) = resp.headers().get("content-type") {

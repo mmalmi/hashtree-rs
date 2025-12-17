@@ -212,6 +212,22 @@ impl RemoteHelper {
             }
         }
 
+        // Update local refs to point to the fetched commits
+        // Use git update-ref since git sets GIT_DIR for the remote helper
+        for spec in &self.fetch_specs {
+            let output = Command::new("git")
+                .args(["update-ref", &spec.name, &spec.sha])
+                .output()
+                .context("Failed to run git update-ref")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("Failed to update ref {}: {}", spec.name, stderr);
+            } else {
+                debug!("Updated {} -> {}", spec.name, &spec.sha[..12]);
+            }
+        }
+
         self.fetch_specs.clear();
         Ok(())
     }
@@ -288,79 +304,62 @@ impl RemoteHelper {
         let objects_link = git_node.links.iter().find(|l| l.name.as_deref() == Some("objects"));
         let (objects_hash, objects_key) = match objects_link {
             Some(link) => (hex::encode(link.hash), link.key),
-            None => return Ok(objects),
+            None => {
+                debug!("No objects directory found in .git");
+                return Ok(objects);
+            }
         };
 
+        debug!("Downloading objects directory: {}", &objects_hash[..12]);
         let objects_data = match blossom.try_download(&objects_hash).await {
             Some(data) => data,
-            None => return Ok(objects),
+            None => {
+                warn!("Failed to download objects directory {}", &objects_hash[..12]);
+                return Ok(objects);
+            }
         };
 
         let objects_node = match decrypt_and_decode(&objects_data, objects_key.as_ref()) {
             Some(node) => node,
-            None => return Ok(objects),
+            None => {
+                warn!("Failed to decode objects directory");
+                return Ok(objects);
+            }
         };
 
-        // Git loose objects are stored as objects/XX/YYYYYYYY...
-        // where XX is first 2 hex chars (directory) and rest is the filename
-        for prefix_link in &objects_node.links {
-            let prefix = match &prefix_link.name {
+        debug!("Objects directory has {} entries", objects_node.links.len());
+
+        // Objects are stored flat in the objects directory with full SHA1 as filename
+        for obj_link in &objects_node.links {
+            let oid = match &obj_link.name {
                 Some(n) => n.clone(),
                 None => continue,
             };
 
-            // Skip pack files and info for now (we only support loose objects)
-            if prefix == "pack" || prefix == "info" {
+            // Skip pack files, info dirs, etc - we only want SHA1 hex names (40 chars)
+            if oid.len() != 40 || hex::decode(&oid).is_err() {
                 continue;
             }
 
-            // Skip non-hex directory names (must be 2 hex chars)
-            if prefix.len() != 2 || hex::decode(&prefix).is_err() {
-                continue;
-            }
-
-            // Download the prefix subdirectory
-            let prefix_hash = hex::encode(prefix_link.hash);
-            let prefix_data = match blossom.try_download(&prefix_hash).await {
+            // Download the object data
+            let obj_hash = hex::encode(obj_link.hash);
+            let obj_data = match blossom.try_download(&obj_hash).await {
                 Some(data) => data,
                 None => continue,
             };
 
-            let prefix_node = match decrypt_and_decode(&prefix_data, prefix_link.key.as_ref()) {
-                Some(node) => node,
-                None => continue,
+            // Decrypt if needed
+            let obj_content = if let Some(k) = obj_link.key.as_ref() {
+                match decrypt_chk(&obj_data, k) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                }
+            } else {
+                obj_data
             };
 
-            // Iterate over objects in this subdirectory
-            for obj_link in &prefix_node.links {
-                let suffix = match &obj_link.name {
-                    Some(n) => n.clone(),
-                    None => continue,
-                };
-
-                // Full git object id is prefix + suffix
-                let oid = format!("{}{}", prefix, suffix);
-
-                // Download the object data
-                let obj_hash = hex::encode(obj_link.hash);
-                let obj_data = match blossom.try_download(&obj_hash).await {
-                    Some(data) => data,
-                    None => continue,
-                };
-
-                // Decrypt if needed
-                let obj_content = if let Some(k) = obj_link.key.as_ref() {
-                    match decrypt_chk(&obj_data, k) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    }
-                } else {
-                    obj_data
-                };
-
-                // This is the zlib-compressed loose object
-                objects.push((oid, obj_content));
-            }
+            // This is the zlib-compressed loose object
+            objects.push((oid, obj_content));
         }
 
         debug!("Fetched {} git objects from hashtree", objects.len());
