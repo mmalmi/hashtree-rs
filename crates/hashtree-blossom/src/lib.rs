@@ -1,0 +1,287 @@
+//! Blossom protocol client for hashtree
+//!
+//! Provides upload/download of blobs to Blossom servers with NIP-98 authentication.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use hashtree_blossom::BlossomClient;
+//! use nostr::Keys;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let keys = Keys::generate();
+//!     let client = BlossomClient::new(keys)
+//!         .with_servers(vec!["https://blossom.example.com".to_string()]);
+//!
+//!     // Upload
+//!     let hash = client.upload(b"hello world").await?;
+//!     println!("Uploaded: {}", hash);
+//!
+//!     // Download
+//!     let data = client.download(&hash).await?;
+//!     assert_eq!(data, b"hello world");
+//!
+//!     Ok(())
+//! }
+//! ```
+
+use base64::Engine;
+use nostr::prelude::*;
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+use thiserror::Error;
+use tracing::{debug, warn};
+
+#[derive(Error, Debug)]
+pub enum BlossomError {
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("No servers configured")]
+    NoServers,
+
+    #[error("Upload failed: {0}")]
+    UploadFailed(String),
+
+    #[error("Download failed on all servers: {0}")]
+    DownloadFailed(String),
+
+    #[error("Hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+
+    #[error("Signing error: {0}")]
+    Signing(String),
+}
+
+/// Blossom protocol client
+pub struct BlossomClient {
+    keys: Keys,
+    servers: Vec<String>,
+    http: reqwest::Client,
+    timeout: Duration,
+}
+
+impl BlossomClient {
+    /// Create a new client with the given keys
+    pub fn new(keys: Keys) -> Self {
+        Self {
+            keys,
+            servers: vec![],
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Set the Blossom servers to use
+    pub fn with_servers(mut self, servers: Vec<String>) -> Self {
+        self.servers = servers;
+        self
+    }
+
+    /// Set request timeout
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self.http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap();
+        self
+    }
+
+    /// Get configured servers
+    pub fn servers(&self) -> &[String] {
+        &self.servers
+    }
+
+    /// Upload data to Blossom servers
+    /// Returns the SHA256 hash of the uploaded data
+    pub async fn upload(&self, data: &[u8]) -> Result<String, BlossomError> {
+        if self.servers.is_empty() {
+            return Err(BlossomError::NoServers);
+        }
+
+        let hash = compute_sha256(data);
+        let auth_header = self.create_upload_auth(&hash).await?;
+
+        for server in &self.servers {
+            match self.upload_to_server(server, data, &hash, &auth_header).await {
+                Ok(_) => {
+                    debug!("Uploaded {} to {}", &hash[..12], server);
+                    return Ok(hash);
+                }
+                Err(e) => {
+                    warn!("Upload to {} failed: {}", server, e);
+                    continue;
+                }
+            }
+        }
+
+        Err(BlossomError::UploadFailed("all servers failed".to_string()))
+    }
+
+    /// Upload data only if it doesn't already exist
+    /// Returns (hash, was_uploaded) tuple
+    pub async fn upload_if_missing(&self, data: &[u8]) -> Result<(String, bool), BlossomError> {
+        if self.servers.is_empty() {
+            return Err(BlossomError::NoServers);
+        }
+
+        let hash = compute_sha256(data);
+
+        // Check if exists on any server
+        if self.exists(&hash).await {
+            return Ok((hash, false));
+        }
+
+        // Upload
+        self.upload(data).await?;
+        Ok((hash, true))
+    }
+
+    /// Check if a blob exists on any server
+    pub async fn exists(&self, hash: &str) -> bool {
+        for server in &self.servers {
+            let url = format!("{}/{}", server.trim_end_matches('/'), hash);
+            if let Ok(resp) = self.http.head(&url).send().await {
+                if resp.status().is_success() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Download data from Blossom servers
+    /// Verifies the hash matches before returning
+    pub async fn download(&self, hash: &str) -> Result<Vec<u8>, BlossomError> {
+        if self.servers.is_empty() {
+            return Err(BlossomError::NoServers);
+        }
+
+        let mut last_error = String::new();
+
+        for server in &self.servers {
+            let url = format!("{}/{}", server.trim_end_matches('/'), hash);
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.bytes().await {
+                        Ok(bytes) => {
+                            let computed = compute_sha256(&bytes);
+                            if computed == hash {
+                                debug!("Downloaded {} from {}", &hash[..12.min(hash.len())], server);
+                                return Ok(bytes.to_vec());
+                            } else {
+                                last_error = format!("hash mismatch from {}", server);
+                                warn!("Hash mismatch downloading {} from {}", hash, server);
+                            }
+                        }
+                        Err(e) => {
+                            last_error = e.to_string();
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    last_error = format!("{} returned {}", server, resp.status());
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                }
+            }
+        }
+
+        Err(BlossomError::DownloadFailed(last_error))
+    }
+
+    /// Download if available, returns None if not found
+    pub async fn try_download(&self, hash: &str) -> Option<Vec<u8>> {
+        self.download(hash).await.ok()
+    }
+
+    async fn upload_to_server(
+        &self,
+        server: &str,
+        data: &[u8],
+        hash: &str,
+        auth_header: &str,
+    ) -> Result<(), BlossomError> {
+        let url = format!("{}/upload", server.trim_end_matches('/'));
+
+        let resp = self
+            .http
+            .put(&url)
+            .header("Authorization", auth_header)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-SHA-256", hash)
+            .body(data.to_vec())
+            .send()
+            .await?;
+
+        // 200 OK or 409 Conflict (already exists) are both success
+        if resp.status().is_success() || resp.status().as_u16() == 409 {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            Err(BlossomError::UploadFailed(format!("{}: {}", status, text)))
+        }
+    }
+
+    async fn create_upload_auth(&self, hash: &str) -> Result<String, BlossomError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expiration = now + 300; // 5 minutes
+
+        let tags = vec![
+            Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
+            Tag::custom(TagKind::custom("x"), vec![hash.to_string()]),
+            Tag::custom(
+                TagKind::custom("expiration"),
+                vec![expiration.to_string()],
+            ),
+        ];
+        let event = EventBuilder::new(Kind::Custom(24242), "Upload", tags)
+            .to_event(&self.keys)
+            .map_err(|e| BlossomError::Signing(e.to_string()))?;
+
+        let json = event.as_json();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+        Ok(format!("Nostr {}", encoded))
+    }
+}
+
+/// Compute SHA256 hash of data, returning hex string
+pub fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_sha256() {
+        let hash = compute_sha256(b"hello world");
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn test_client_builder() {
+        let keys = Keys::generate();
+        let client = BlossomClient::new(keys)
+            .with_servers(vec!["https://example.com".to_string()])
+            .with_timeout(Duration::from_secs(60));
+
+        assert_eq!(client.servers().len(), 1);
+    }
+}

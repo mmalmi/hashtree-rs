@@ -35,4 +35,4 @@ tokio-test = "0.4"
 axum.workspace = true
 tower.workspace = true
 hyper = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

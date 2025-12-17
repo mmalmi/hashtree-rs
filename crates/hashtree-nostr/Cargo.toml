@@ -10,7 +10,7 @@ description = "Social graph and relay connections using nostrdb"
 [dependencies]
 # Core
 nostrdb = { package = "hashtree-nostrdb", path = "../hashtree-nostrdb", version = "0.1.0" }
-nostr-sdk = "0.35"
+nostr-sdk = { version = "0.35", default-features = false, features = ["nip44"] }
 
 # Async
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread"] }

@@ -22,7 +22,11 @@ dirs = "5"
 
 # Nostr
 nostr.workspace = true
+nostr-sdk.workspace = true
 secp256k1 = { version = "0.29", features = ["global-context"] }
+
+# Blossom client
+hashtree-blossom.workspace = true
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -39,9 +43,6 @@ sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-# HTTP client for fetching blobs
-reqwest = { version = "0.12", features = ["rustls-tls"] }
 
 # CLI
 clap.workspace = true
