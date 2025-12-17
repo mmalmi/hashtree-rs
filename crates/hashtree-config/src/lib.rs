@@ -308,6 +308,16 @@ pub fn get_auth_cookie_path() -> PathBuf {
     get_hashtree_dir().join("auth.cookie")
 }
 
+/// Get the data directory from config (defaults to ~/.hashtree/data)
+/// Can be overridden with HTREE_DATA_DIR environment variable
+pub fn get_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("HTREE_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    let config = Config::load_or_default();
+    PathBuf::from(&config.storage.data_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
