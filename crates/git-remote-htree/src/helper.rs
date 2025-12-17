@@ -231,6 +231,7 @@ impl RemoteHelper {
     /// Fetch all git objects from hashtree's .git/objects/ directory
     fn fetch_all_git_objects(&self, root_hash: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let encryption_key = self.nostr.get_cached_encryption_key(&self.repo_name).cloned();
+        info!("fetch_all_git_objects: root={}, has encryption_key: {}", &root_hash[..12], encryption_key.is_some());
 
         // Create tokio runtime for async blossom downloads
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -241,124 +242,130 @@ impl RemoteHelper {
         rt.block_on(self.fetch_git_objects_async(root_hash, encryption_key.as_ref()))
     }
 
-    /// Async implementation of git object fetching
+    /// Async implementation of git object fetching using HashTree helpers
     async fn fetch_git_objects_async(
         &self,
         root_hash: &str,
         encryption_key: Option<&[u8; 32]>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        use hashtree_core::{decode_tree_node, decrypt_chk};
+        use hashtree_blossom::BlossomStore;
+        use hashtree_core::{Cid, HashTree, HashTreeConfig};
 
         let blossom = self.nostr.blossom();
         let mut objects = Vec::new();
 
-        // Helper to decrypt and decode a tree node
-        let decrypt_and_decode = |data: &[u8], key: Option<&[u8; 32]>| -> Option<hashtree_core::TreeNode> {
-            let decrypted = if let Some(k) = key {
-                match decrypt_chk(data, k) {
-                    Ok(d) => d,
-                    Err(_) => return None,
+        // Create a BlossomStore-backed HashTree for reading
+        // Use the same read servers from the existing blossom client
+        let store = BlossomStore::with_servers(
+            nostr::Keys::generate(), // Temporary keys for read-only ops
+            blossom.read_servers().to_vec(),
+        );
+        let tree = HashTree::new(HashTreeConfig::new(std::sync::Arc::new(store)));
+
+        // Parse root hash and create Cid with encryption key
+        let root_bytes = hex::decode(root_hash)
+            .context("Invalid root hash hex")?;
+        let root_arr: [u8; 32] = root_bytes.try_into()
+            .map_err(|_| anyhow::anyhow!("Root hash must be 32 bytes"))?;
+
+        let root_cid = Cid {
+            hash: root_arr,
+            key: encryption_key.copied(),
+            size: 0,
+        };
+
+        // Resolve .git/objects path
+        let objects_cid = match tree.resolve_path(&root_cid, ".git/objects").await {
+            Ok(Some(cid)) => cid,
+            Ok(None) => {
+                warn!("No .git/objects directory found");
+                return Ok(objects);
+            }
+            Err(e) => {
+                warn!("Failed to resolve .git/objects: {}", e);
+                return Ok(objects);
+            }
+        };
+
+        info!("Resolved .git/objects: {}", hex::encode(objects_cid.hash));
+
+        // List objects directory
+        let entries = match tree.list_directory(&objects_cid).await {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to list objects directory: {}", e);
+                return Ok(objects);
+            }
+        };
+
+        info!("Objects directory has {} entries", entries.len());
+
+        // Check if prefix-based or flat layout
+        let is_prefix_layout = entries.iter().any(|e| e.name.len() == 2);
+
+        if is_prefix_layout {
+            info!("Detected prefix-based object layout (objects/XX/...)");
+            for entry in &entries {
+                // Skip non-hex prefixes (pack, info, etc)
+                if entry.name.len() != 2 || hex::decode(&entry.name).is_err() {
+                    continue;
                 }
-            } else {
-                data.to_vec()
-            };
-            decode_tree_node(&decrypted).ok()
-        };
 
-        // Download root
-        let root_data = match blossom.try_download(root_hash).await {
-            Some(data) => data,
-            None => {
-                warn!("Could not download root hash {}", root_hash);
-                return Ok(objects);
-            }
-        };
+                let prefix = &entry.name;
+                let prefix_cid = Cid {
+                    hash: entry.hash,
+                    key: entry.key,
+                    size: entry.size,
+                };
 
-        let root_node = match decrypt_and_decode(&root_data, encryption_key) {
-            Some(node) => node,
-            None => return Ok(objects),
-        };
-
-        // Find .git directory
-        let git_link = root_node.links.iter().find(|l| l.name.as_deref() == Some(".git"));
-        let (git_hash, git_key) = match git_link {
-            Some(link) => (hex::encode(link.hash), link.key),
-            None => return Ok(objects),
-        };
-
-        let git_data = match blossom.try_download(&git_hash).await {
-            Some(data) => data,
-            None => return Ok(objects),
-        };
-
-        let git_node = match decrypt_and_decode(&git_data, git_key.as_ref()) {
-            Some(node) => node,
-            None => return Ok(objects),
-        };
-
-        // Find objects directory
-        let objects_link = git_node.links.iter().find(|l| l.name.as_deref() == Some("objects"));
-        let (objects_hash, objects_key) = match objects_link {
-            Some(link) => (hex::encode(link.hash), link.key),
-            None => {
-                debug!("No objects directory found in .git");
-                return Ok(objects);
-            }
-        };
-
-        debug!("Downloading objects directory: {}", &objects_hash[..12]);
-        let objects_data = match blossom.try_download(&objects_hash).await {
-            Some(data) => data,
-            None => {
-                warn!("Failed to download objects directory {}", &objects_hash[..12]);
-                return Ok(objects);
-            }
-        };
-
-        let objects_node = match decrypt_and_decode(&objects_data, objects_key.as_ref()) {
-            Some(node) => node,
-            None => {
-                warn!("Failed to decode objects directory");
-                return Ok(objects);
-            }
-        };
-
-        debug!("Objects directory has {} entries", objects_node.links.len());
-
-        // Objects are stored flat in the objects directory with full SHA1 as filename
-        for obj_link in &objects_node.links {
-            let oid = match &obj_link.name {
-                Some(n) => n.clone(),
-                None => continue,
-            };
-
-            // Skip pack files, info dirs, etc - we only want SHA1 hex names (40 chars)
-            if oid.len() != 40 || hex::decode(&oid).is_err() {
-                continue;
-            }
-
-            // Download the object data
-            let obj_hash = hex::encode(obj_link.hash);
-            let obj_data = match blossom.try_download(&obj_hash).await {
-                Some(data) => data,
-                None => continue,
-            };
-
-            // Decrypt if needed
-            let obj_content = if let Some(k) = obj_link.key.as_ref() {
-                match decrypt_chk(&obj_data, k) {
-                    Ok(d) => d,
+                // List objects in prefix directory
+                let sub_entries = match tree.list_directory(&prefix_cid).await {
+                    Ok(e) => e,
                     Err(_) => continue,
-                }
-            } else {
-                obj_data
-            };
+                };
 
-            // This is the zlib-compressed loose object
-            objects.push((oid, obj_content));
+                for obj_entry in sub_entries {
+                    // Object names should be 38 chars (remaining SHA1 after prefix)
+                    if obj_entry.name.len() != 38 || hex::decode(&obj_entry.name).is_err() {
+                        continue;
+                    }
+
+                    let oid = format!("{}{}", prefix, obj_entry.name);
+                    let obj_cid = Cid {
+                        hash: obj_entry.hash,
+                        key: obj_entry.key,
+                        size: obj_entry.size,
+                    };
+
+                    // Read the object content
+                    if let Ok(Some(content)) = tree.get(&obj_cid).await {
+                        objects.push((oid, content));
+                    }
+                }
+            }
+        } else {
+            info!("Detected flat object layout (objects/SHA1...)");
+            for entry in &entries {
+                // Skip non-SHA1 entries
+                if entry.name.len() != 40 || hex::decode(&entry.name).is_err() {
+                    continue;
+                }
+
+                let oid = entry.name.clone();
+                let obj_cid = Cid {
+                    hash: entry.hash,
+                    key: entry.key,
+                    size: entry.size,
+                };
+
+                // Read the object content
+                if let Ok(Some(content)) = tree.get(&obj_cid).await {
+                    objects.push((oid, content));
+                }
+            }
         }
 
-        debug!("Fetched {} git objects from hashtree", objects.len());
+        info!("Fetched {} git objects from hashtree", objects.len());
         Ok(objects)
     }
 
@@ -553,14 +560,15 @@ impl RemoteHelper {
         self.storage.write_ref(dst_ref, &Ref::Direct(oid))?;
 
         // Build the merkle tree
-        let root_hash = self.storage.get_root_hash()?;
+        let root_hash = self.storage.build_tree()?;
+        let root_hash_hex = hex::encode(root_hash);
 
         // Publish to nostr (kind 30078 with hashtree label)
-        self.nostr.publish_repo(&self.repo_name, &root_hash)?;
+        self.nostr.publish_repo(&self.repo_name, &root_hash_hex)?;
 
         // Push to file servers (blossom) in background
         // This makes content available even without P2P connection
-        self.push_to_file_servers(&root_hash);
+        self.push_to_file_servers(&root_hash_hex);
 
         Ok(())
     }

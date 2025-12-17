@@ -1,12 +1,11 @@
 //! Hashtree-backed git object and ref storage using LMDB persistence
 //!
-//! Stores git objects and refs in a hashtree merkle tree with working tree:
+//! Stores git objects and refs in a hashtree merkle tree:
 //!   root/
 //!     .git/
 //!       HEAD -> "ref: refs/heads/main"
 //!       refs/heads/main -> <commit-sha1>
 //!       objects/<sha1> -> zlib-compressed loose object
-//!     README.md -> actual file content (from HEAD)
 //!
 //! The root hash (SHA-256) is the content-addressed identifier for the entire repo state.
 
@@ -18,30 +17,13 @@ use hashtree_lmdb::LmdbBlobStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
+use tracing::{debug, info};
 
-use super::object::{parse_tree, GitObject, ObjectId, ObjectType};
+use super::object::{GitObject, ObjectId, ObjectType};
 use super::refs::{validate_ref_name, Ref};
 use super::{Error, Result};
-
-/// Represents a file in the working tree
-#[derive(Debug, Clone)]
-struct WorkingTreeEntry {
-    path: String,
-    mode: u32,
-    content: Vec<u8>,
-}
-
-/// Interior mutable state for GitStorage
-struct GitStorageState {
-    /// Git objects: SHA-1 hex -> zlib-compressed loose object
-    objects: HashMap<String, Vec<u8>>,
-    /// Refs: name -> value ("ref: <target>" for symbolic, or SHA-1 hex)
-    refs: HashMap<String, String>,
-    /// Cached root hash (invalidated on mutation)
-    root_hash: Option<[u8; 32]>,
-}
 
 /// Runtime executor - either owns a runtime or reuses an existing one
 enum RuntimeExecutor {
@@ -53,18 +35,20 @@ impl RuntimeExecutor {
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
         match self {
             RuntimeExecutor::Owned(rt) => rt.block_on(f),
-            RuntimeExecutor::Handle(handle) => {
-                tokio::task::block_in_place(|| handle.block_on(f))
-            }
+            RuntimeExecutor::Handle(handle) => tokio::task::block_in_place(|| handle.block_on(f)),
         }
     }
 }
 
-/// Git storage backed by hashtree with LMDB persistence
+/// Git storage backed by HashTree with LMDB persistence
 pub struct GitStorage {
     store: Arc<LmdbBlobStore>,
+    tree: HashTree<LmdbBlobStore>,
     runtime: RuntimeExecutor,
-    state: RwLock<GitStorageState>,
+    /// In-memory state for the current session
+    objects: std::sync::RwLock<HashMap<String, Vec<u8>>>,
+    refs: std::sync::RwLock<HashMap<String, String>>,
+    root_hash: std::sync::RwLock<Option<[u8; 32]>>,
 }
 
 impl GitStorage {
@@ -85,14 +69,15 @@ impl GitStorage {
                 .map_err(|e| Error::StorageError(format!("lmdb: {}", e)))?,
         );
 
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
+
         Ok(Self {
             store,
+            tree,
             runtime,
-            state: RwLock::new(GitStorageState {
-                objects: HashMap::new(),
-                refs: HashMap::new(),
-                root_hash: None,
-            }),
+            objects: std::sync::RwLock::new(HashMap::new()),
+            refs: std::sync::RwLock::new(HashMap::new()),
+            root_hash: std::sync::RwLock::new(None),
         })
     }
 
@@ -106,12 +91,14 @@ impl GitStorage {
         encoder.write_all(&loose)?;
         let compressed = encoder.finish()?;
 
-        let mut state = self
-            .state
-            .write()
+        let mut objects = self.objects.write()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-        state.objects.insert(key, compressed);
-        state.root_hash = None;
+        objects.insert(key, compressed);
+
+        // Invalidate cached root
+        if let Ok(mut root) = self.root_hash.write() {
+            *root = None;
+        }
 
         Ok(oid)
     }
@@ -122,15 +109,12 @@ impl GitStorage {
         self.write_object(&obj)
     }
 
-    /// Read an object by ID
+    /// Read an object by ID from in-memory cache
     fn read_object(&self, oid: &ObjectId) -> Result<GitObject> {
         let key = oid.to_hex();
-        let state = self
-            .state
-            .read()
+        let objects = self.objects.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-        let compressed = state
-            .objects
+        let compressed = objects
             .get(&key)
             .ok_or_else(|| Error::ObjectNotFound(key.clone()))?;
 
@@ -150,126 +134,222 @@ impl GitStorage {
             Ref::Symbolic(target) => format!("ref: {}", target),
         };
 
-        let mut state = self
-            .state
-            .write()
+        let mut refs = self.refs.write()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-        state.refs.insert(name.to_string(), value);
-        state.root_hash = None;
+        refs.insert(name.to_string(), value);
+
+        // Invalidate cached root
+        if let Ok(mut root) = self.root_hash.write() {
+            *root = None;
+        }
 
         Ok(())
     }
 
-    /// Delete a ref
-    pub fn delete_ref(&self, name: &str) -> Result<bool> {
-        let mut state = self
-            .state
-            .write()
+    /// Read a ref
+    pub fn read_ref(&self, name: &str) -> Result<Option<Ref>> {
+        let refs = self.refs.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-        let deleted = state.refs.remove(name).is_some();
-        state.root_hash = None;
-        Ok(deleted)
-    }
 
-    /// Resolve a ref to its final object ID (follows symbolic refs)
-    fn resolve_ref(&self, name: &str) -> Result<ObjectId> {
-        let mut current = name.to_string();
-        let mut depth = 0;
-        const MAX_DEPTH: usize = 10;
-
-        loop {
-            if depth >= MAX_DEPTH {
-                return Err(Error::RefNotFound(format!(
-                    "too many levels of symbolic refs: {}",
-                    name
-                )));
+        match refs.get(name) {
+            Some(value) => {
+                if let Some(target) = value.strip_prefix("ref: ") {
+                    Ok(Some(Ref::Symbolic(target.to_string())))
+                } else {
+                    let oid = ObjectId::from_hex(value)
+                        .ok_or_else(|| Error::StorageError(format!("invalid ref: {}", value)))?;
+                    Ok(Some(Ref::Direct(oid)))
+                }
             }
-            depth += 1;
-
-            let state = self
-                .state
-                .read()
-                .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-            let value = state
-                .refs
-                .get(&current)
-                .ok_or_else(|| Error::RefNotFound(current.clone()))?
-                .clone();
-            drop(state);
-
-            if let Some(target) = value.strip_prefix("ref: ") {
-                current = target.to_string();
-            } else {
-                return ObjectId::from_hex(&value)
-                    .ok_or_else(|| Error::InvalidObjectFormat("invalid oid in ref".into()));
-            }
+            None => Ok(None),
         }
     }
 
-    /// Build the merkle tree and return root hash (SHA-256)
-    fn build_tree(&mut self) -> Result<[u8; 32]> {
-        {
-            let state = self
-                .state
-                .read()
-                .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-            if let Some(hash) = state.root_hash {
+    /// List all refs
+    pub fn list_refs(&self) -> Result<HashMap<String, String>> {
+        let refs = self.refs.read()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        Ok(refs.clone())
+    }
+
+    /// Delete a ref
+    pub fn delete_ref(&self, name: &str) -> Result<bool> {
+        let mut refs = self.refs.write()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        let existed = refs.remove(name).is_some();
+
+        // Invalidate cached root
+        if let Ok(mut root) = self.root_hash.write() {
+            *root = None;
+        }
+
+        Ok(existed)
+    }
+
+    /// Get the cached root hash (returns None if tree hasn't been built)
+    pub fn get_root_hash(&self) -> Result<Option<[u8; 32]>> {
+        let root = self.root_hash.read()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        Ok(*root)
+    }
+
+    /// Get the default branch name
+    pub fn default_branch(&self) -> Result<Option<String>> {
+        let refs = self.refs.read()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+
+        if let Some(head) = refs.get("HEAD") {
+            if let Some(target) = head.strip_prefix("ref: ") {
+                return Ok(Some(target.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Build the hashtree and return the root hash
+    pub fn build_tree(&self) -> Result<[u8; 32]> {
+        // Check if we have a cached root
+        if let Ok(root) = self.root_hash.read() {
+            if let Some(hash) = *root {
                 return Ok(hash);
             }
         }
 
-        let default_branch = self.determine_default_branch();
-        let working_tree = if let Some(ref branch) = default_branch {
-            if let Ok(commit_oid) = self.resolve_ref(branch) {
-                self.extract_working_tree(&commit_oid).ok()
-            } else {
-                None
-            }
+        let objects = self.objects.read()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        let refs = self.refs.read()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+
+        let default_branch = if let Some(head) = refs.get("HEAD") {
+            head.strip_prefix("ref: ").map(String::from)
         } else {
             None
         };
 
-        let (objects, refs) = {
-            let state = self
-                .state
-                .read()
-                .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-            (state.objects.clone(), state.refs.clone())
-        };
-        let store = self.store.clone();
-
-        let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
-
         let root_hash = self.runtime.block_on(async {
-            let git_dir_hash =
-                build_git_dir(&tree, &store, &objects, &refs, &default_branch).await?;
+            // Build objects directory
+            let objects_hash = self.build_objects_dir(&objects).await?;
 
-            let mut root_entries = vec![DirEntry::new(".git", git_dir_hash)];
+            // Build refs directory
+            let refs_hash = self.build_refs_dir(&refs).await?;
 
-            if let Some(wt) = working_tree {
-                let wt_entries = build_working_tree(&tree, wt).await?;
-                root_entries.extend(wt_entries);
+            // Build HEAD file
+            let head_content = refs.get("HEAD")
+                .cloned()
+                .unwrap_or_else(|| "ref: refs/heads/main".to_string());
+            let head_hash = self.tree.put_blob(head_content.as_bytes()).await
+                .map_err(|e| Error::StorageError(format!("put HEAD: {}", e)))?;
+
+            // Build .git directory
+            let mut git_entries = vec![
+                DirEntry::new("HEAD", head_hash).with_size(head_content.len() as u64),
+                DirEntry::new("objects", objects_hash),
+                DirEntry::new("refs", refs_hash),
+            ];
+
+            // Add config if we have a default branch
+            if let Some(ref branch) = default_branch {
+                let config = format!(
+                    "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n[init]\n\tdefaultBranch = {}\n",
+                    branch.trim_start_matches("refs/heads/")
+                );
+                let config_hash = self.tree.put_blob(config.as_bytes()).await
+                    .map_err(|e| Error::StorageError(format!("put config: {}", e)))?;
+                git_entries.push(DirEntry::new("config", config_hash).with_size(config.len() as u64));
             }
 
-            let root_cid = tree
-                .put_directory(root_entries)
-                .await
-                .map_err(|e| Error::StorageError(format!("build tree: {}", e)))?;
+            let git_cid = self.tree.put_directory(git_entries).await
+                .map_err(|e| Error::StorageError(format!("put .git: {}", e)))?;
+
+            // Build root with just .git
+            let root_entries = vec![DirEntry::new(".git", git_cid.hash)];
+            let root_cid = self.tree.put_directory(root_entries).await
+                .map_err(|e| Error::StorageError(format!("put root: {}", e)))?;
 
             Ok::<[u8; 32], Error>(root_cid.hash)
         })?;
 
-        self.state
-            .write()
-            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?
-            .root_hash = Some(root_hash);
+        // Cache the root hash
+        if let Ok(mut root) = self.root_hash.write() {
+            *root = Some(root_hash);
+        }
+
         Ok(root_hash)
     }
 
-    /// Get root hash as hex string
-    pub fn get_root_hash(&mut self) -> Result<String> {
-        let hash = self.build_tree()?;
-        Ok(hex::encode(hash))
+    /// Build the objects directory using HashTree
+    async fn build_objects_dir(&self, objects: &HashMap<String, Vec<u8>>) -> Result<[u8; 32]> {
+        if objects.is_empty() {
+            let empty_hash = sha256(b"");
+            self.store.put(empty_hash, vec![]).await
+                .map_err(|e| Error::StorageError(format!("put empty objects: {}", e)))?;
+            return Ok(empty_hash);
+        }
+
+        // Store objects flat with full SHA1 as filename
+        let mut entries = Vec::with_capacity(objects.len());
+        for (oid, data) in objects {
+            let hash = self.tree.put_blob(data).await
+                .map_err(|e| Error::StorageError(format!("put object {}: {}", oid, e)))?;
+            entries.push(DirEntry::new(oid.clone(), hash).with_size(data.len() as u64));
+        }
+
+        // Sort for deterministic ordering
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let cid = self.tree.put_directory(entries).await
+            .map_err(|e| Error::StorageError(format!("put objects dir: {}", e)))?;
+
+        debug!("Built objects dir with {} entries: {}", objects.len(), hex::encode(cid.hash));
+        Ok(cid.hash)
+    }
+
+    /// Build the refs directory using HashTree
+    async fn build_refs_dir(&self, refs: &HashMap<String, String>) -> Result<[u8; 32]> {
+        // Group refs by category (heads, tags, etc.)
+        let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+        for (ref_name, value) in refs {
+            let parts: Vec<&str> = ref_name.split('/').collect();
+            if parts.len() >= 3 && parts[0] == "refs" {
+                let category = parts[1].to_string();
+                let name = parts[2..].join("/");
+                groups.entry(category).or_default().push((name, value.clone()));
+            }
+        }
+
+        let mut ref_entries = Vec::new();
+
+        for (category, refs_in_category) in groups {
+            let mut cat_entries = Vec::new();
+            for (name, value) in refs_in_category {
+                let hash = self.tree.put_blob(value.as_bytes()).await
+                    .map_err(|e| Error::StorageError(format!("put ref: {}", e)))?;
+                debug!("refs/{}/{} -> blob {}", category, name, hex::encode(hash));
+                cat_entries.push(DirEntry::new(name, hash).with_size(value.len() as u64));
+            }
+
+            cat_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+            let cat_cid = self.tree.put_directory(cat_entries).await
+                .map_err(|e| Error::StorageError(format!("put {} dir: {}", category, e)))?;
+            debug!("refs/{} dir -> {}", category, hex::encode(cat_cid.hash));
+            ref_entries.push(DirEntry::new(category, cat_cid.hash));
+        }
+
+        if ref_entries.is_empty() {
+            let empty_hash = sha256(b"");
+            self.store.put(empty_hash, vec![]).await
+                .map_err(|e| Error::StorageError(format!("put empty refs: {}", e)))?;
+            return Ok(empty_hash);
+        }
+
+        ref_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let refs_cid = self.tree.put_directory(ref_entries).await
+            .map_err(|e| Error::StorageError(format!("put refs dir: {}", e)))?;
+        debug!("refs dir -> {}", hex::encode(refs_cid.hash));
+        Ok(refs_cid.hash)
     }
 
     /// Get the underlying store
@@ -277,363 +357,63 @@ impl GitStorage {
         &self.store
     }
 
-    /// Determine the default branch for HEAD
-    fn determine_default_branch(&self) -> Option<String> {
-        let state = self.state.read().ok()?;
-
-        let branches: Vec<&String> = state
-            .refs
-            .keys()
-            .filter(|k| k.starts_with("refs/heads/"))
-            .collect();
-
-        if branches.is_empty() {
-            return None;
-        }
-
-        if branches.iter().any(|b| *b == "refs/heads/master") {
-            return Some("refs/heads/master".to_string());
-        }
-
-        if branches.iter().any(|b| *b == "refs/heads/main") {
-            return Some("refs/heads/main".to_string());
-        }
-
-        let mut sorted: Vec<_> = branches.into_iter().collect();
-        sorted.sort();
-        sorted.first().map(|s| (*s).clone())
+    /// Get the HashTree for direct access
+    pub fn hashtree(&self) -> &HashTree<LmdbBlobStore> {
+        &self.tree
     }
 
-    /// Extract the working tree from a commit
-    fn extract_working_tree(&self, commit_oid: &ObjectId) -> Result<Vec<WorkingTreeEntry>> {
-        let commit_obj = self.read_object(commit_oid)?;
-        if commit_obj.obj_type != ObjectType::Commit {
-            return Err(Error::InvalidObjectFormat("expected commit".into()));
-        }
-
-        let commit_content = String::from_utf8_lossy(&commit_obj.content);
-        let tree_line = commit_content
-            .lines()
-            .find(|l| l.starts_with("tree "))
-            .ok_or_else(|| Error::InvalidObjectFormat("commit missing tree".into()))?;
-
-        let tree_hex = tree_line.strip_prefix("tree ").unwrap().trim();
-        let tree_oid = ObjectId::from_hex(tree_hex)
-            .ok_or_else(|| Error::InvalidObjectFormat("invalid tree oid".into()))?;
-
-        let mut entries = Vec::new();
-        self.extract_tree_recursive(&tree_oid, "", &mut entries)?;
-        Ok(entries)
-    }
-
-    fn extract_tree_recursive(
+    /// Push all blobs to file servers
+    pub fn push_to_file_servers(
         &self,
-        tree_oid: &ObjectId,
-        prefix: &str,
-        entries: &mut Vec<WorkingTreeEntry>,
-    ) -> Result<()> {
-        let tree_obj = self.read_object(tree_oid)?;
-        if tree_obj.obj_type != ObjectType::Tree {
-            return Err(Error::InvalidObjectFormat("expected tree".into()));
-        }
+        blossom: &hashtree_blossom::BlossomClient,
+    ) -> Result<(usize, usize)> {
+        let hashes = self.store.list()
+            .map_err(|e| Error::StorageError(format!("list hashes: {}", e)))?;
 
-        let tree_entries = parse_tree(&tree_obj.content)?;
+        info!("Pushing {} blobs to file servers", hashes.len());
 
-        for entry in tree_entries {
-            let path = if prefix.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{}/{}", prefix, entry.name)
-            };
+        let mut uploaded = 0;
+        let mut existed = 0;
 
-            if entry.is_tree() {
-                self.extract_tree_recursive(&entry.oid, &path, entries)?;
-            } else {
-                let blob_obj = self.read_object(&entry.oid)?;
-                entries.push(WorkingTreeEntry {
-                    path,
-                    mode: entry.mode,
-                    content: blob_obj.content,
-                });
+        self.runtime.block_on(async {
+            for hash in &hashes {
+                let hex_hash = hex::encode(hash);
+                let data = match self.store.get_sync(hash) {
+                    Ok(Some(d)) => d,
+                    _ => continue,
+                };
+
+                match blossom.upload_if_missing(&data).await {
+                    Ok((_, true)) => {
+                        debug!("Uploaded {}", &hex_hash[..12]);
+                        uploaded += 1;
+                    }
+                    Ok((_, false)) => {
+                        existed += 1;
+                    }
+                    Err(e) => {
+                        debug!("Failed to upload {}: {}", &hex_hash[..12], e);
+                    }
+                }
             }
-        }
+        });
 
+        info!("Upload complete: {} new, {} already existed", uploaded, existed);
+        Ok((uploaded, existed))
+    }
+
+    /// Clear all state (for testing or re-initialization)
+    pub fn clear(&self) -> Result<()> {
+        let mut objects = self.objects.write()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        let mut refs = self.refs.write()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        let mut root = self.root_hash.write()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+
+        objects.clear();
+        refs.clear();
+        *root = None;
         Ok(())
-    }
-}
-
-// === Helper functions for building hashtree ===
-
-async fn build_objects_dir<S: Store>(
-    tree: &HashTree<S>,
-    store: &Arc<S>,
-    objects: &HashMap<String, Vec<u8>>,
-) -> Result<[u8; 32]> {
-    let mut entries = Vec::new();
-
-    for (sha1, compressed) in objects {
-        let hash = tree
-            .put_blob(compressed)
-            .await
-            .map_err(|e| Error::StorageError(format!("put blob: {}", e)))?;
-        entries.push(DirEntry::new(sha1.clone(), hash).with_size(compressed.len() as u64));
-    }
-
-    if entries.is_empty() {
-        let hash = sha256(b"");
-        store
-            .put(hash, vec![])
-            .await
-            .map_err(|e| Error::StorageError(format!("put empty: {}", e)))?;
-        return Ok(hash);
-    }
-
-    tree.put_directory(entries)
-        .await
-        .map(|cid| cid.hash)
-        .map_err(|e| Error::StorageError(format!("put objects dir: {}", e)))
-}
-
-async fn build_refs_dir<S: Store>(
-    tree: &HashTree<S>,
-    store: &Arc<S>,
-    refs: &HashMap<String, String>,
-) -> Result<[u8; 32]> {
-    let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
-
-    for (ref_name, value) in refs {
-        let parts: Vec<&str> = ref_name.split('/').collect();
-        if parts.len() >= 3 && parts[0] == "refs" {
-            let category = parts[1].to_string();
-            let name = parts[2..].join("/");
-            groups
-                .entry(category)
-                .or_default()
-                .push((name, value.clone()));
-        }
-    }
-
-    let mut ref_entries = Vec::new();
-
-    for (category, refs_in_category) in groups {
-        let mut cat_entries = Vec::new();
-        for (name, value) in refs_in_category {
-            let hash = tree
-                .put_blob(value.as_bytes())
-                .await
-                .map_err(|e| Error::StorageError(format!("put ref: {}", e)))?;
-            cat_entries.push(DirEntry::new(name, hash).with_size(value.len() as u64));
-        }
-        let cat_cid = tree
-            .put_directory(cat_entries)
-            .await
-            .map_err(|e| Error::StorageError(format!("put {} dir: {}", category, e)))?;
-        ref_entries.push(DirEntry::new(category, cat_cid.hash));
-    }
-
-    if ref_entries.is_empty() {
-        let hash = sha256(b"");
-        store
-            .put(hash, vec![])
-            .await
-            .map_err(|e| Error::StorageError(format!("put empty refs: {}", e)))?;
-        return Ok(hash);
-    }
-
-    tree.put_directory(ref_entries)
-        .await
-        .map(|cid| cid.hash)
-        .map_err(|e| Error::StorageError(format!("put refs dir: {}", e)))
-}
-
-async fn build_git_dir<S: Store>(
-    tree: &HashTree<S>,
-    store: &Arc<S>,
-    objects: &HashMap<String, Vec<u8>>,
-    refs: &HashMap<String, String>,
-    default_branch: &Option<String>,
-) -> Result<[u8; 32]> {
-    let objects_hash = build_objects_dir(tree, store, objects).await?;
-    let refs_hash = build_refs_dir(tree, store, refs).await?;
-
-    let mut git_entries = vec![
-        DirEntry::new("objects", objects_hash),
-        DirEntry::new("refs", refs_hash),
-    ];
-
-    if let Some(branch) = default_branch {
-        let head_content = format!("ref: {}", branch);
-        let head_hash = tree
-            .put_blob(head_content.as_bytes())
-            .await
-            .map_err(|e| Error::StorageError(format!("put HEAD: {}", e)))?;
-        git_entries.push(DirEntry::new("HEAD", head_hash).with_size(head_content.len() as u64));
-    }
-
-    tree.put_directory(git_entries)
-        .await
-        .map(|cid| cid.hash)
-        .map_err(|e| Error::StorageError(format!("put .git dir: {}", e)))
-}
-
-async fn build_working_tree<S: Store>(
-    tree: &HashTree<S>,
-    entries: Vec<WorkingTreeEntry>,
-) -> Result<Vec<DirEntry>> {
-    let mut dirs: HashMap<String, Vec<WorkingTreeEntry>> = HashMap::new();
-    let mut root_files: Vec<WorkingTreeEntry> = Vec::new();
-
-    for entry in entries {
-        if let Some(slash_pos) = entry.path.find('/') {
-            let top_dir = entry.path[..slash_pos].to_string();
-            let rest = entry.path[slash_pos + 1..].to_string();
-            dirs.entry(top_dir).or_default().push(WorkingTreeEntry {
-                path: rest,
-                mode: entry.mode,
-                content: entry.content,
-            });
-        } else {
-            root_files.push(entry);
-        }
-    }
-
-    let mut result = Vec::new();
-
-    for file in root_files {
-        let hash = tree
-            .put_blob(&file.content)
-            .await
-            .map_err(|e| Error::StorageError(format!("put file {}: {}", file.path, e)))?;
-        result.push(DirEntry::new(file.path, hash).with_size(file.content.len() as u64));
-    }
-
-    for (dir_name, sub_entries) in dirs {
-        let sub_dir_entries = build_working_tree_recursive(tree, sub_entries).await?;
-        let dir_cid = tree
-            .put_directory(sub_dir_entries)
-            .await
-            .map_err(|e| Error::StorageError(format!("put dir {}: {}", dir_name, e)))?;
-        result.push(DirEntry::new(dir_name, dir_cid.hash));
-    }
-
-    Ok(result)
-}
-
-async fn build_working_tree_recursive<S: Store>(
-    tree: &HashTree<S>,
-    entries: Vec<WorkingTreeEntry>,
-) -> Result<Vec<DirEntry>> {
-    let mut dirs: HashMap<String, Vec<WorkingTreeEntry>> = HashMap::new();
-    let mut files: Vec<WorkingTreeEntry> = Vec::new();
-
-    for entry in entries {
-        if let Some(slash_pos) = entry.path.find('/') {
-            let top_dir = entry.path[..slash_pos].to_string();
-            let rest = entry.path[slash_pos + 1..].to_string();
-            dirs.entry(top_dir).or_default().push(WorkingTreeEntry {
-                path: rest,
-                mode: entry.mode,
-                content: entry.content,
-            });
-        } else {
-            files.push(entry);
-        }
-    }
-
-    let mut result = Vec::new();
-
-    for file in files {
-        let hash = tree
-            .put_blob(&file.content)
-            .await
-            .map_err(|e| Error::StorageError(format!("put file {}: {}", file.path, e)))?;
-        result.push(DirEntry::new(file.path, hash).with_size(file.content.len() as u64));
-    }
-
-    for (dir_name, sub_entries) in dirs {
-        let sub_dir_entries = Box::pin(build_working_tree_recursive(tree, sub_entries)).await?;
-        let dir_cid = tree
-            .put_directory(sub_dir_entries)
-            .await
-            .map_err(|e| Error::StorageError(format!("put dir {}: {}", dir_name, e)))?;
-        result.push(DirEntry::new(dir_name, dir_cid.hash));
-    }
-
-    Ok(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::git::object::{serialize_tree, TreeEntry};
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_object_roundtrip() {
-        let dir = tempdir().unwrap();
-        let storage = GitStorage::open(dir.path().join("git")).unwrap();
-
-        let content = b"Hello, World!";
-        let obj = GitObject::new(ObjectType::Blob, content.to_vec());
-        let oid = storage.write_object(&obj).unwrap();
-
-        let read_obj = storage.read_object(&oid).unwrap();
-        assert_eq!(read_obj.obj_type, ObjectType::Blob);
-        assert_eq!(read_obj.content, content);
-    }
-
-    #[test]
-    fn test_ref_operations() {
-        let dir = tempdir().unwrap();
-        let storage = GitStorage::open(dir.path().join("git")).unwrap();
-
-        let obj = GitObject::new(ObjectType::Blob, b"test".to_vec());
-        let oid = storage.write_object(&obj).unwrap();
-
-        storage
-            .write_ref("refs/heads/main", &Ref::Direct(oid.clone()))
-            .unwrap();
-
-        let resolved = storage.resolve_ref("refs/heads/main").unwrap();
-        assert_eq!(resolved.to_hex(), oid.to_hex());
-
-        let deleted = storage.delete_ref("refs/heads/main").unwrap();
-        assert!(deleted);
-    }
-
-    #[test]
-    fn test_build_tree() {
-        let dir = tempdir().unwrap();
-        let mut storage = GitStorage::open(dir.path().join("git")).unwrap();
-
-        // Create a simple blob
-        let blob = GitObject::new(ObjectType::Blob, b"# README\n".to_vec());
-        let blob_oid = storage.write_object(&blob).unwrap();
-
-        // Create tree with blob
-        let tree_content = serialize_tree(&[TreeEntry::new(
-            0o100644,
-            "README.md".to_string(),
-            blob_oid.clone(),
-        )]);
-        let tree = GitObject::new(ObjectType::Tree, tree_content);
-        let tree_oid = storage.write_object(&tree).unwrap();
-
-        // Create commit
-        let commit_content = format!(
-            "tree {}\nauthor Test <test@test.com> 1234567890 +0000\ncommitter Test <test@test.com> 1234567890 +0000\n\nInitial commit\n",
-            tree_oid.to_hex()
-        );
-        let commit = GitObject::new(ObjectType::Commit, commit_content.into_bytes());
-        let commit_oid = storage.write_object(&commit).unwrap();
-
-        // Create ref
-        storage
-            .write_ref("refs/heads/main", &Ref::Direct(commit_oid))
-            .unwrap();
-
-        // Build tree and get root hash
-        let root_hash = storage.get_root_hash().unwrap();
-        assert_eq!(root_hash.len(), 64); // SHA-256 hex
     }
 }
