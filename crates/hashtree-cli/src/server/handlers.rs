@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use super::auth::AppState;
-use super::ui::{root_page, serve_directory_html, serve_directory_json};
+use super::ui::root_page;
 use crate::webrtc::{ConnectionState, WebRTCState};
 
 pub async fn serve_root() -> impl IntoResponse {
@@ -28,24 +28,8 @@ async fn serve_content_internal(
 ) -> Response<Body> {
     let store = &state.store;
 
-    // Check if it's a directory (with actual entries)
-    if let Ok(Some(listing)) = store.get_directory_listing(cid) {
-        // Only serve as directory if it has entries (not an empty file DAG)
-        if !listing.entries.is_empty() {
-            // Check if browser (wants HTML)
-            let wants_html = headers
-                .get(header::ACCEPT)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.contains("text/html"))
-                .unwrap_or(false);
-
-            if wants_html {
-                return serve_directory_html(cid, &listing.dir_name, listing.entries).into_response();
-            } else {
-                return serve_directory_json(&listing.dir_name, listing.entries).into_response();
-            }
-        }
-    }
+    // Always return raw bytes - no conversion to JSON/HTML
+    // This is required for Blossom protocol compatibility
 
     // Try as file
     // Check for Range header

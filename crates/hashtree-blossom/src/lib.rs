@@ -191,12 +191,18 @@ impl BlossomClient {
 
         let hash = compute_sha256(data);
 
+        // Warn if uploading empty data
+        if data.is_empty() {
+            warn!("Attempting to upload empty blob with hash {}", hash);
+        }
+
         // Check if exists on any read server
         if self.exists(&hash).await {
             return Ok((hash, false));
         }
 
         // Upload
+        debug!("Uploading {} bytes with hash {}", data.len(), &hash[..12]);
         self.upload(data).await?;
         Ok((hash, true))
     }
@@ -204,7 +210,7 @@ impl BlossomClient {
     /// Check if a blob exists on any read server
     pub async fn exists(&self, hash: &str) -> bool {
         for server in &self.read_servers {
-            let url = format!("{}/{}", server.trim_end_matches('/'), hash);
+            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
             if let Ok(resp) = self.http.head(&url).send().await {
                 if resp.status().is_success() {
                     // Verify content-type is binary, not HTML error page
@@ -241,18 +247,20 @@ impl BlossomClient {
         let mut last_error = String::new();
 
         for server in &self.read_servers {
-            let url = format!("{}/{}", server.trim_end_matches('/'), hash);
+            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
             match self.http.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.bytes().await {
                         Ok(bytes) => {
                             let computed = compute_sha256(&bytes);
                             if computed == hash {
-                                debug!("Downloaded {} from {}", &hash[..12.min(hash.len())], server);
+                                debug!("Downloaded {} ({} bytes) from {}", &hash[..12.min(hash.len())], bytes.len(), server);
                                 return Ok(bytes.to_vec());
                             } else {
-                                last_error = format!("hash mismatch from {}", server);
-                                warn!("Hash mismatch downloading {} from {}", hash, server);
+                                last_error = format!("hash mismatch from {}: expected {}, got {} ({} bytes received)",
+                                    server, hash, computed, bytes.len());
+                                warn!("Hash mismatch downloading {} from {}: got {} ({} bytes)",
+                                    hash, server, &computed[..12.min(computed.len())], bytes.len());
                             }
                         }
                         Err(e) => {
@@ -262,6 +270,7 @@ impl BlossomClient {
                 }
                 Ok(resp) => {
                     last_error = format!("{} returned {}", server, resp.status());
+                    debug!("Download {} from {} returned status {}", hash, server, resp.status());
                 }
                 Err(e) => {
                     last_error = e.to_string();
