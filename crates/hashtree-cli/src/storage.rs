@@ -119,10 +119,10 @@ impl StorageRouter {
             while let Some(msg) = sync_rx.recv().await {
                 match msg {
                     S3SyncMessage::Upload { hash, data } => {
-                        let key = format!("{}{}", sync_prefix, to_hex(&hash));
-                        tracing::debug!("S3 uploading {} ({} bytes)", &key[..16.min(key.len())], data.len());
+                        let key = format!("{}{}.bin", sync_prefix, to_hex(&hash));
+                        tracing::info!("S3 uploading {} ({} bytes)", &key, data.len());
 
-                        if let Err(e) = sync_client
+                        match sync_client
                             .put_object()
                             .bucket(&sync_bucket)
                             .key(&key)
@@ -130,12 +130,13 @@ impl StorageRouter {
                             .send()
                             .await
                         {
-                            tracing::error!("S3 upload failed for {}: {}", &key[..16.min(key.len())], e);
+                            Ok(_) => tracing::info!("S3 upload succeeded for {}", &key),
+                            Err(e) => tracing::error!("S3 upload failed for {}: {}", &key, e),
                         }
                     }
                     S3SyncMessage::Delete { hash } => {
-                        let key = format!("{}{}", sync_prefix, to_hex(&hash));
-                        tracing::debug!("S3 deleting {}", &key[..16.min(key.len())]);
+                        let key = format!("{}{}.bin", sync_prefix, to_hex(&hash));
+                        tracing::debug!("S3 deleting {}", &key);
 
                         if let Err(e) = sync_client
                             .delete_object()
@@ -168,10 +169,13 @@ impl StorageRouter {
         let is_new = self.local.put_sync(hash, data)?;
 
         // Queue S3 upload if configured (non-blocking)
+        // Always upload to S3 (even if not new locally) to ensure S3 has all blobs
         #[cfg(feature = "s3")]
-        if is_new {
-            if let Some(ref tx) = self.sync_tx {
-                let _ = tx.send(S3SyncMessage::Upload { hash, data: data.to_vec() });
+        if let Some(ref tx) = self.sync_tx {
+            tracing::info!("Queueing S3 upload for {} ({} bytes, is_new={})",
+                crate::storage::to_hex(&hash)[..16].to_string(), data.len(), is_new);
+            if let Err(e) = tx.send(S3SyncMessage::Upload { hash, data: data.to_vec() }) {
+                tracing::error!("Failed to queue S3 upload: {}", e);
             }
         }
 
@@ -188,7 +192,7 @@ impl StorageRouter {
         // Fall back to S3 if configured
         #[cfg(feature = "s3")]
         if let (Some(ref client), Some(ref bucket)) = (&self.s3_client, &self.s3_bucket) {
-            let key = format!("{}{}", self.s3_prefix, to_hex(hash));
+            let key = format!("{}{}.bin", self.s3_prefix, to_hex(hash));
 
             match sync_block_on(async {
                 client.get_object()
@@ -227,7 +231,7 @@ impl StorageRouter {
         // Check S3 if configured
         #[cfg(feature = "s3")]
         if let (Some(ref client), Some(ref bucket)) = (&self.s3_client, &self.s3_bucket) {
-            let key = format!("{}{}", self.s3_prefix, to_hex(hash));
+            let key = format!("{}{}.bin", self.s3_prefix, to_hex(hash));
 
             match sync_block_on(async {
                 client.head_object()
