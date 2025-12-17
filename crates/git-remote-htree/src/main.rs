@@ -27,6 +27,16 @@ use helper::RemoteHelper;
 use nostr_client::resolve_identity;
 
 fn main() -> Result<()> {
+    // Suppress broken pipe panics - git may close the pipe early
+    // This is the standard solution for CLI tools that write to stdout
+    #[cfg(unix)]
+    {
+        // Reset SIGPIPE to default (terminate) instead of panic
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+
     // Initialize logging - default to error, override with RUST_LOG=git_remote_htree=debug
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -78,7 +88,10 @@ fn main() -> Result<()> {
     let mut stdout = stdout.lock();
 
     for line in stdin.lock().lines() {
-        let line = line?;
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break, // EOF or pipe closed
+        };
         let line = line.trim();
 
         debug!("Received command: '{}'", line);
@@ -87,9 +100,12 @@ fn main() -> Result<()> {
         if let Some(resp) = response {
             debug!("Sending response: {:?}", resp);
             for line in resp {
-                writeln!(stdout, "{}", line)?;
+                // Ignore broken pipe errors - git may close the pipe early
+                if writeln!(stdout, "{}", line).is_err() {
+                    return Ok(());
+                }
             }
-            stdout.flush()?;
+            let _ = stdout.flush();
         }
 
         if helper.should_exit() {

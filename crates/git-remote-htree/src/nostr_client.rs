@@ -345,14 +345,23 @@ impl NostrClient {
 
         debug!("Querying relays for repo {} events", repo_name);
 
-        // Query with timeout
-        let events = tokio::time::timeout(
+        // Query with timeout - treat timeout as "no events found" for new repos
+        let events = match tokio::time::timeout(
             Duration::from_secs(10),
             client.get_events_of(vec![filter], EventSource::relays(None)),
         )
         .await
-        .context("Relay query timed out")?
-        .map_err(|e| anyhow::anyhow!("Failed to fetch events: {}", e))?;
+        {
+            Ok(Ok(events)) => events,
+            Ok(Err(e)) => {
+                warn!("Failed to fetch events: {}", e);
+                vec![]
+            }
+            Err(_) => {
+                debug!("Relay query timed out - treating as empty repo");
+                vec![]
+            }
+        };
 
         // Disconnect
         let _ = client.disconnect().await;
@@ -653,14 +662,11 @@ impl NostrClient {
 
         info!("Publishing repo {} with root hash {}", repo_name, root_hash);
 
-        let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .handle()
-                .clone()
-        });
+        // Create a new multi-threaded runtime for nostr-sdk which spawns background tasks
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create tokio runtime")?;
 
         rt.block_on(self.publish_repo_async(keys, repo_name, root_hash))
     }
