@@ -90,12 +90,8 @@ impl StoredKey {
 pub fn load_keys() -> Vec<StoredKey> {
     let mut keys = Vec::new();
 
-    let Some(home) = dirs::home_dir() else {
-        return keys;
-    };
-
     // Primary: ~/.hashtree/keys (multi-key format)
-    let keys_path = home.join(".hashtree/keys");
+    let keys_path = hashtree_config::get_keys_path();
     if let Ok(content) = std::fs::read_to_string(&keys_path) {
         for line in content.lines() {
             let line = line.trim();
@@ -127,8 +123,9 @@ pub fn load_keys() -> Vec<StoredKey> {
 
     // Legacy: single-key files
     if keys.is_empty() {
+        let home = dirs::home_dir().unwrap_or_default();
         let legacy_paths = [
-            home.join(".hashtree/nsec"),
+            hashtree_config::get_nsec_path(),
             home.join(".config/nostr/secret"),
             home.join(".nostr/secret"),
             home.join(".config/git-remote-htree/secret"),
@@ -204,7 +201,7 @@ pub fn resolve_identity(identifier: &str) -> Result<(String, Option<String>)> {
     )
 }
 
-use crate::config::Config;
+use hashtree_config::Config;
 
 /// Nostr client for git operations
 pub struct NostrClient {

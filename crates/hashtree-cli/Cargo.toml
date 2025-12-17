@@ -12,11 +12,17 @@ default-run = "htree"
 name = "htree"
 path = "src/main.rs"
 
+[[bin]]
+name = "git-remote-htree"
+path = "src/git_remote.rs"
+
 [dependencies]
+# Git remote helper
+git-remote-htree = { path = "../git-remote-htree" }
+
 # Core hashtree crates
 hashtree-core.workspace = true
 hashtree-lmdb.workspace = true
-hashtree-git.workspace = true
 hashtree-resolver = { workspace = true, features = ["nostr"] }
 
 # AWS S3 (optional)

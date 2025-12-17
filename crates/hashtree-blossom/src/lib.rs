@@ -148,6 +148,14 @@ impl BlossomClient {
             let url = format!("{}/{}", server.trim_end_matches('/'), hash);
             if let Ok(resp) = self.http.head(&url).send().await {
                 if resp.status().is_success() {
+                    // Verify content-type is binary, not HTML error page
+                    if let Some(ct) = resp.headers().get("content-type") {
+                        if let Ok(ct_str) = ct.to_str() {
+                            if ct_str.starts_with("text/html") {
+                                continue; // Server returned HTML, blob doesn't exist
+                            }
+                        }
+                    }
                     return true;
                 }
             }

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use hashtree_config::Config;
 use crate::nostr_client::NostrClient;
 
 /// Get the shared hashtree data directory
@@ -21,10 +21,7 @@ fn get_hashtree_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("HTREE_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".hashtree")
-        .join("data")
+    hashtree_config::get_hashtree_dir().join("data")
 }
 
 /// Git remote helper state machine

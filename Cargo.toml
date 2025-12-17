@@ -35,6 +35,7 @@ hashtree-s3 = { path = "crates/hashtree-s3", version = "0.1.2" }
 hashtree-blossom = { path = "crates/hashtree-blossom", version = "0.1.2" }
 hashtree-sim = { path = "crates/hashtree-sim", version = "0.1.2" }
 hashtree-resolver = { path = "crates/hashtree-resolver", version = "0.1.2" }
+hashtree-config = { path = "crates/hashtree-config", version = "0.1.2" }
 
 # AWS S3
 aws-sdk-s3 = "1"
@@ -54,6 +55,7 @@ nostr = { version = "0.37", features = ["nip44"] }
 
 # Utilities
 anyhow = "1"
+dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive", "env"] }

@@ -1,6 +1,5 @@
 mod auth;
 pub mod blossom;
-mod git;
 mod handlers;
 mod mime;
 pub mod stun;
@@ -15,7 +14,6 @@ use axum::{
 };
 use crate::storage::HashtreeStore;
 use crate::webrtc::WebRTCState;
-use hashtree_git::GitStorage;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -23,8 +21,6 @@ pub use auth::{AppState, AuthCredentials};
 
 pub struct HashtreeServer {
     state: AppState,
-    git_storage: Option<Arc<GitStorage>>,
-    local_pubkey: Option<String>,
     addr: String,
 }
 
@@ -39,8 +35,6 @@ impl HashtreeServer {
                 public_writes: true, // Allow anyone with valid Nostr auth by default
                 allowed_pubkeys: HashSet::new(), // No pubkeys allowed by default (use public_writes)
             },
-            git_storage: None,
-            local_pubkey: None,
             addr,
         }
     }
@@ -64,13 +58,6 @@ impl HashtreeServer {
         self
     }
 
-    /// Enable git smart HTTP protocol
-    pub fn with_git(mut self, storage: Arc<GitStorage>, local_pubkey: String) -> Self {
-        self.git_storage = Some(storage);
-        self.local_pubkey = Some(local_pubkey);
-        self
-    }
-
     pub fn with_auth(mut self, username: String, password: String) -> Self {
         self.state.auth = Some(AuthCredentials { username, password });
         self
@@ -86,7 +73,7 @@ impl HashtreeServer {
         // Public endpoints (no auth required)
         // Note: /:id serves both CID and blossom SHA256 hash lookups
         // The handler differentiates based on hash format (64 char hex = blossom)
-        let mut public_routes = Router::new()
+        let public_routes = Router::new()
             .route("/", get(handlers::serve_root))
             // Nostr resolver endpoints - resolve npub/treename to content
             .route("/n/:pubkey/:treename", get(handlers::resolve_and_serve))
@@ -111,19 +98,6 @@ impl HashtreeServer {
             .route("/api/resolve/:pubkey/:treename", get(handlers::resolve_to_hash))
             .route("/api/trees/:pubkey", get(handlers::list_trees))
             .with_state(self.state.clone());
-
-        // Add git smart HTTP routes if git storage is configured
-        if let Some(git_storage) = self.git_storage {
-            let local_pubkey = self.local_pubkey.unwrap_or_default();
-            let git_state = git::GitState { storage: git_storage, local_pubkey };
-            let git_routes = Router::new()
-                .route("/git/:pubkey/:repo/info/refs", get(git::info_refs))
-                .route("/git/:pubkey/:repo/git-upload-pack", post(git::upload_pack))
-                .route("/git/:pubkey/:repo/git-receive-pack", post(git::receive_pack))
-                .route("/api/git/repos", get(git::list_repos))
-                .with_state(git_state);
-            public_routes = public_routes.merge(git_routes);
-        }
 
         // Protected endpoints (require auth if enabled)
         let protected_routes = Router::new()

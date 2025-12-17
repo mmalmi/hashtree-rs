@@ -6,7 +6,6 @@ pub mod sync;
 pub mod webrtc;
 
 pub use config::Config;
-pub use hashtree_git::GitStorage;
 pub use hashtree_resolver::nostr::{NostrRootResolver, NostrResolverConfig};
 pub use hashtree_resolver::{Keys as NostrKeys, ResolverEntry, ResolverError, RootResolver, ToBech32 as NostrToBech32};
 pub use server::HashtreeServer;

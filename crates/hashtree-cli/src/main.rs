@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
 use hashtree_cli::{
-    BackgroundSync, Config, GitStorage, HashtreeServer, HashtreeStore,
+    BackgroundSync, Config, HashtreeServer, HashtreeStore,
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RootResolver,
     WebRTCConfig, WebRTCManager,
 };
@@ -206,10 +206,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Initialize git storage at shared data directory
-            let git_storage = Arc::new(GitStorage::open(&data_dir)
-                .context("Failed to initialize git storage")?);
-
             // Start STUN server if configured
             let stun_handle = if config.server.stun_port > 0 {
                 let stun_addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.server.stun_port)
@@ -269,8 +265,7 @@ async fn main() -> Result<()> {
             let mut server = HashtreeServer::new(Arc::clone(&store), addr.clone())
                 .with_allowed_pubkeys(allowed_pubkeys.clone())
                 .with_max_upload_bytes((config.blossom.max_upload_mb as usize) * 1024 * 1024)
-                .with_public_writes(config.server.public_writes)
-                .with_git(git_storage, hex::encode(pk_bytes));
+                .with_public_writes(config.server.public_writes);
 
             // Add WebRTC peer state for P2P queries from HTTP handler
             if let Some(ref webrtc_state) = webrtc_state {
