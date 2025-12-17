@@ -262,6 +262,107 @@ pub fn compute_sha256(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Store implementation for Blossom (read-only, fetches from servers on demand)
+#[cfg(feature = "store")]
+mod store_impl {
+    use super::*;
+    use async_trait::async_trait;
+    use hashtree_core::{to_hex, Hash, Store, StoreError};
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    /// Blossom-backed store (read-only with local cache)
+    ///
+    /// Fetches data from Blossom servers on demand and caches locally.
+    /// Write operations are no-ops (data should be uploaded separately).
+    pub struct BlossomStore {
+        client: BlossomClient,
+        cache: RwLock<HashMap<String, Vec<u8>>>,
+    }
+
+    impl BlossomStore {
+        pub fn new(client: BlossomClient) -> Self {
+            Self {
+                client,
+                cache: RwLock::new(HashMap::new()),
+            }
+        }
+
+        /// Create with servers (convenience constructor)
+        pub fn with_servers(keys: nostr::Keys, servers: Vec<String>) -> Self {
+            let client = BlossomClient::new(keys).with_servers(servers);
+            Self::new(client)
+        }
+
+        /// Get underlying client
+        pub fn client(&self) -> &BlossomClient {
+            &self.client
+        }
+    }
+
+    #[async_trait]
+    impl Store for BlossomStore {
+        async fn put(&self, hash: Hash, data: Vec<u8>) -> Result<bool, StoreError> {
+            // Cache locally, but don't upload (caller should upload explicitly)
+            let key = to_hex(&hash);
+            let mut cache = self.cache.write().unwrap();
+            if cache.contains_key(&key) {
+                return Ok(false);
+            }
+            cache.insert(key, data);
+            Ok(true)
+        }
+
+        async fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+            let key = to_hex(hash);
+
+            // Check cache first
+            {
+                let cache = self.cache.read().unwrap();
+                if let Some(data) = cache.get(&key) {
+                    return Ok(Some(data.clone()));
+                }
+            }
+
+            // Fetch from Blossom
+            match self.client.try_download(&key).await {
+                Some(data) => {
+                    // Cache for future use
+                    let mut cache = self.cache.write().unwrap();
+                    cache.insert(key, data.clone());
+                    Ok(Some(data))
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn has(&self, hash: &Hash) -> Result<bool, StoreError> {
+            let key = to_hex(hash);
+
+            // Check cache first
+            {
+                let cache = self.cache.read().unwrap();
+                if cache.contains_key(&key) {
+                    return Ok(true);
+                }
+            }
+
+            // Check Blossom
+            Ok(self.client.exists(&key).await)
+        }
+
+        async fn delete(&self, hash: &Hash) -> Result<bool, StoreError> {
+            // Only delete from local cache (can't delete from Blossom)
+            let key = to_hex(hash);
+            let mut cache = self.cache.write().unwrap();
+            Ok(cache.remove(&key).is_some())
+        }
+    }
+}
+
+#[cfg(feature = "store")]
+pub use store_impl::BlossomStore;
+
 #[cfg(test)]
 mod tests {
     use super::*;

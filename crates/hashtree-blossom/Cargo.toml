@@ -26,5 +26,13 @@ thiserror.workspace = true
 tracing = "0.1"
 base64 = "0.22"
 
+# Core hashtree types (optional - for Store trait impl)
+hashtree-core = { path = "../hashtree", optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[features]
+default = []
+store = ["hashtree-core", "async-trait"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }

@@ -36,6 +36,7 @@
 
 use anyhow::{Context, Result};
 use hashtree_blossom::BlossomClient;
+use hashtree_core::{decode_tree_node, decrypt_chk, LinkType};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -214,9 +215,10 @@ pub struct NostrClient {
     blossom: BlossomClient,
     /// Cached refs from remote
     cached_refs: HashMap<String, HashMap<String, String>>,
-    /// Cached root hashes
-    #[allow(dead_code)]
-    cached_roots: HashMap<String, String>,
+    /// Cached root hashes (hashtree SHA256)
+    cached_root_hash: HashMap<String, String>,
+    /// Cached encryption keys
+    cached_encryption_key: HashMap<String, [u8; 32]>,
 }
 
 impl NostrClient {
@@ -247,7 +249,8 @@ impl NostrClient {
             relays: config.nostr.relays.clone(),
             blossom,
             cached_refs: HashMap::new(),
-            cached_roots: HashMap::new(),
+            cached_root_hash: HashMap::new(),
+            cached_encryption_key: HashMap::new(),
         })
     }
 
@@ -260,30 +263,41 @@ impl NostrClient {
     /// Fetch refs for a repository from nostr
     /// Returns refs parsed from the hashtree at the root hash
     pub fn fetch_refs(&mut self, repo_name: &str) -> Result<HashMap<String, String>> {
+        let (refs, _, _) = self.fetch_refs_with_root(repo_name)?;
+        Ok(refs)
+    }
+
+    /// Fetch refs and root hash info from nostr
+    /// Returns (refs, root_hash, encryption_key)
+    pub fn fetch_refs_with_root(&mut self, repo_name: &str) -> Result<(HashMap<String, String>, Option<String>, Option<[u8; 32]>)> {
         debug!("Fetching refs for {} from {}", repo_name, self.pubkey);
 
         // Check cache first
         if let Some(refs) = self.cached_refs.get(repo_name) {
-            return Ok(refs.clone());
+            let root = self.cached_root_hash.get(repo_name).cloned();
+            let key = self.cached_encryption_key.get(repo_name).cloned();
+            return Ok((refs.clone(), root, key));
         }
 
         // Query relays for kind 30078 events
-        let rt = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .handle()
-                    .clone()
-            });
+        // Create a new multi-threaded runtime for nostr-sdk which spawns background tasks
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create tokio runtime")?;
 
-        let refs = rt.block_on(self.fetch_refs_async(repo_name))?;
+        let (refs, root_hash, encryption_key) = rt.block_on(self.fetch_refs_async(repo_name))?;
         self.cached_refs.insert(repo_name.to_string(), refs.clone());
-        Ok(refs)
+        if let Some(ref root) = root_hash {
+            self.cached_root_hash.insert(repo_name.to_string(), root.clone());
+        }
+        if let Some(key) = encryption_key {
+            self.cached_encryption_key.insert(repo_name.to_string(), key);
+        }
+        Ok((refs, root_hash, encryption_key))
     }
 
-    async fn fetch_refs_async(&self, repo_name: &str) -> Result<HashMap<String, String>> {
+    async fn fetch_refs_async(&self, repo_name: &str) -> Result<(HashMap<String, String>, Option<String>, Option<[u8; 32]>)> {
         // Create nostr-sdk client
         let client = Client::default();
 
@@ -294,8 +308,30 @@ impl NostrClient {
             }
         }
 
-        // Connect
+        // Connect and wait for at least one relay to connect
         client.connect().await;
+
+        // Wait for relay connections (up to 15 seconds)
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(15);
+        loop {
+            let relays = client.relays().await;
+            let mut connected = 0;
+            for relay in relays.values() {
+                if relay.is_connected().await {
+                    connected += 1;
+                }
+            }
+            if connected > 0 {
+                debug!("Connected to {} relay(s)", connected);
+                break;
+            }
+            if start.elapsed() > timeout {
+                warn!("Timeout waiting for relay connections");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         // Build filter for kind 30078 events from this author with matching d-tag
         let author = PublicKey::from_hex(&self.pubkey)
@@ -335,7 +371,7 @@ impl NostrClient {
 
         let Some(event) = event else {
             debug!("No hashtree event found for {}", repo_name);
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), None, None));
         };
 
         // Get root hash from content or "hash" tag
@@ -348,14 +384,224 @@ impl NostrClient {
 
         if root_hash.is_empty() {
             debug!("Empty root hash in event");
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), None, None));
         }
 
-        info!("Found root hash {} for {}", &root_hash[..12.min(root_hash.len())], repo_name);
+        // Get optional encryption key from "key" tag
+        let encryption_key = event
+            .tags
+            .iter()
+            .find(|t| t.as_slice().len() >= 2 && t.as_slice()[0].as_str() == "key")
+            .and_then(|t| {
+                let key_hex = t.as_slice()[1].to_string();
+                hex::decode(&key_hex).ok().and_then(|bytes| {
+                    if bytes.len() == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&bytes);
+                        Some(key)
+                    } else {
+                        None
+                    }
+                })
+            });
 
-        // TODO: Fetch refs from hashtree at root_hash
-        // For now return empty - full implementation would traverse the tree
-        Ok(HashMap::new())
+        info!("Found root hash {} for {} (encrypted: {})",
+              &root_hash[..12.min(root_hash.len())], repo_name, encryption_key.is_some());
+
+        // Fetch refs from hashtree structure at root_hash
+        let refs = self.fetch_refs_from_hashtree(&root_hash, encryption_key.as_ref()).await?;
+        Ok((refs, Some(root_hash), encryption_key))
+    }
+
+    /// Decrypt data if encryption key is provided, then decode as tree node
+    fn decrypt_and_decode(&self, data: &[u8], key: Option<&[u8; 32]>) -> Option<hashtree_core::TreeNode> {
+        let decrypted_data: Vec<u8>;
+        let data_to_decode = if let Some(k) = key {
+            match decrypt_chk(data, k) {
+                Ok(d) => {
+                    decrypted_data = d;
+                    &decrypted_data
+                },
+                Err(e) => {
+                    debug!("Decryption failed: {}", e);
+                    return None;
+                }
+            }
+        } else {
+            data
+        };
+
+        match decode_tree_node(data_to_decode) {
+            Ok(node) => Some(node),
+            Err(e) => {
+                debug!("Failed to decode tree node: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Fetch git refs from hashtree structure
+    /// Structure: root -> .git/ -> refs/ -> heads/main -> <sha>
+    async fn fetch_refs_from_hashtree(&self, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> Result<HashMap<String, String>> {
+        let mut refs = HashMap::new();
+
+        // Download root directory from Blossom
+        let root_data = match self.blossom.try_download(root_hash).await {
+            Some(data) => data,
+            None => {
+                debug!("Could not download root hash {} from Blossom", root_hash);
+                return Ok(refs);
+            }
+        };
+
+        // Parse root as directory node (decrypt if needed)
+        let root_node = match self.decrypt_and_decode(&root_data, encryption_key) {
+            Some(node) => node,
+            None => {
+                return Ok(refs);
+            }
+        };
+
+        // Find .git directory
+        let git_link = root_node.links.iter().find(|l| l.name.as_deref() == Some(".git"));
+        let (git_hash, git_key) = match git_link {
+            Some(link) => (hex::encode(link.hash), link.key),
+            None => {
+                debug!("No .git directory in hashtree root");
+                return Ok(refs);
+            }
+        };
+
+        // Download .git directory
+        let git_data = match self.blossom.try_download(&git_hash).await {
+            Some(data) => data,
+            None => {
+                debug!("Could not download .git directory");
+                return Ok(refs);
+            }
+        };
+
+        let git_node = match self.decrypt_and_decode(&git_data, git_key.as_ref()) {
+            Some(node) => node,
+            None => {
+                return Ok(refs);
+            }
+        };
+
+        // Find refs directory
+        let refs_link = git_node.links.iter().find(|l| l.name.as_deref() == Some("refs"));
+        let (refs_hash, refs_key) = match refs_link {
+            Some(link) => (hex::encode(link.hash), link.key),
+            None => {
+                debug!("No refs directory in .git");
+                return Ok(refs);
+            }
+        };
+
+        // Download refs directory
+        let refs_data = match self.blossom.try_download(&refs_hash).await {
+            Some(data) => data,
+            None => {
+                debug!("Could not download refs directory");
+                return Ok(refs);
+            }
+        };
+
+        let refs_node = match self.decrypt_and_decode(&refs_data, refs_key.as_ref()) {
+            Some(node) => node,
+            None => {
+                return Ok(refs);
+            }
+        };
+
+        // Look for HEAD in .git directory
+        if let Some(head_link) = git_node.links.iter().find(|l| l.name.as_deref() == Some("HEAD")) {
+            let head_hash = hex::encode(head_link.hash);
+            if let Some(head_data) = self.blossom.try_download(&head_hash).await {
+                // HEAD is a blob, decrypt if needed
+                let head_content = if let Some(k) = head_link.key.as_ref() {
+                    match decrypt_chk(&head_data, k) {
+                        Ok(d) => String::from_utf8_lossy(&d).trim().to_string(),
+                        Err(_) => String::from_utf8_lossy(&head_data).trim().to_string(),
+                    }
+                } else {
+                    String::from_utf8_lossy(&head_data).trim().to_string()
+                };
+                refs.insert("HEAD".to_string(), head_content);
+            }
+        }
+
+        // Recursively walk refs/ subdirectories (heads, tags, etc.)
+        for subdir_link in &refs_node.links {
+            if subdir_link.link_type != LinkType::Dir {
+                continue;
+            }
+            let subdir_name = match &subdir_link.name {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            let subdir_hash = hex::encode(subdir_link.hash);
+
+            self.collect_refs_recursive(
+                &subdir_hash,
+                subdir_link.key.as_ref(),
+                &format!("refs/{}", subdir_name),
+                &mut refs,
+            ).await;
+        }
+
+        debug!("Found {} refs from hashtree", refs.len());
+        Ok(refs)
+    }
+
+    /// Recursively collect refs from a directory
+    async fn collect_refs_recursive(
+        &self,
+        dir_hash: &str,
+        dir_key: Option<&[u8; 32]>,
+        prefix: &str,
+        refs: &mut HashMap<String, String>,
+    ) {
+        let dir_data = match self.blossom.try_download(dir_hash).await {
+            Some(data) => data,
+            None => return,
+        };
+
+        let dir_node = match self.decrypt_and_decode(&dir_data, dir_key) {
+            Some(node) => node,
+            None => return,
+        };
+
+        for link in &dir_node.links {
+            let name = match &link.name {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            let link_hash = hex::encode(link.hash);
+            let ref_path = format!("{}/{}", prefix, name);
+
+            if link.link_type == LinkType::Dir {
+                // Recurse into subdirectory
+                Box::pin(self.collect_refs_recursive(&link_hash, link.key.as_ref(), &ref_path, refs)).await;
+            } else {
+                // This is a ref file - read the SHA
+                if let Some(ref_data) = self.blossom.try_download(&link_hash).await {
+                    // Decrypt if needed
+                    let sha = if let Some(k) = link.key.as_ref() {
+                        match decrypt_chk(&ref_data, k) {
+                            Ok(d) => String::from_utf8_lossy(&d).trim().to_string(),
+                            Err(_) => String::from_utf8_lossy(&ref_data).trim().to_string(),
+                        }
+                    } else {
+                        String::from_utf8_lossy(&ref_data).trim().to_string()
+                    };
+                    if !sha.is_empty() {
+                        debug!("Found ref {} -> {}", ref_path, sha);
+                        refs.insert(ref_path, sha);
+                    }
+                }
+            }
+        }
     }
 
     /// Update a ref in local cache (will be published with publish_repo)
@@ -378,6 +624,21 @@ impl NostrClient {
         }
 
         Ok(())
+    }
+
+    /// Get cached root hash for a repository
+    pub fn get_cached_root_hash(&self, repo_name: &str) -> Option<&String> {
+        self.cached_root_hash.get(repo_name)
+    }
+
+    /// Get cached encryption key for a repository
+    pub fn get_cached_encryption_key(&self, repo_name: &str) -> Option<&[u8; 32]> {
+        self.cached_encryption_key.get(repo_name)
+    }
+
+    /// Get the Blossom client for direct downloads
+    pub fn blossom(&self) -> &BlossomClient {
+        &self.blossom
     }
 
     /// Publish repository to nostr as kind 30078 event

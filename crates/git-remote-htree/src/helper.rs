@@ -3,7 +3,7 @@
 //! Implements the stateless git remote helper protocol.
 //! See: https://git-scm.com/docs/gitremote-helpers
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use hashtree_git::object::ObjectType;
 use hashtree_git::refs::Ref;
 use hashtree_git::storage::GitStorage;
@@ -192,20 +192,182 @@ impl RemoteHelper {
     fn execute_fetch(&mut self) -> Result<()> {
         info!("Fetching {} refs", self.fetch_specs.len());
 
-        for spec in &self.fetch_specs {
-            debug!("Fetching {} ({})", spec.name, spec.sha);
+        // Get the cached root hash from nostr (set during list command)
+        let root_hash = self.nostr.get_cached_root_hash(&self.repo_name).cloned();
 
-            // Use htree get to fetch objects (includes file server fallback)
-            let objects = self.fetch_objects_via_htree(&spec.sha)?;
+        if let Some(ref root) = root_hash {
+            // Fetch all git objects from the hashtree structure
+            let objects = self.fetch_all_git_objects(root)?;
+            info!("Downloaded {} git objects from hashtree", objects.len());
 
             // Store in local git
             for (oid, data) in objects {
                 self.write_git_object(&oid, &data)?;
             }
+        } else {
+            // Fallback to original per-ref fetch (will likely fail)
+            for spec in &self.fetch_specs {
+                debug!("Fetching {} ({})", spec.name, spec.sha);
+                let objects = self.fetch_objects_via_htree(&spec.sha)?;
+                for (oid, data) in objects {
+                    self.write_git_object(&oid, &data)?;
+                }
+            }
         }
 
         self.fetch_specs.clear();
         Ok(())
+    }
+
+    /// Fetch all git objects from hashtree's .git/objects/ directory
+    fn fetch_all_git_objects(&self, root_hash: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let encryption_key = self.nostr.get_cached_encryption_key(&self.repo_name).cloned();
+
+        // Create tokio runtime for async blossom downloads
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create tokio runtime")?;
+
+        rt.block_on(self.fetch_git_objects_async(root_hash, encryption_key.as_ref()))
+    }
+
+    /// Async implementation of git object fetching
+    async fn fetch_git_objects_async(
+        &self,
+        root_hash: &str,
+        encryption_key: Option<&[u8; 32]>,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        use hashtree_core::{decode_tree_node, decrypt_chk};
+
+        let blossom = self.nostr.blossom();
+        let mut objects = Vec::new();
+
+        // Helper to decrypt and decode a tree node
+        let decrypt_and_decode = |data: &[u8], key: Option<&[u8; 32]>| -> Option<hashtree_core::TreeNode> {
+            let decrypted = if let Some(k) = key {
+                match decrypt_chk(data, k) {
+                    Ok(d) => d,
+                    Err(_) => return None,
+                }
+            } else {
+                data.to_vec()
+            };
+            decode_tree_node(&decrypted).ok()
+        };
+
+        // Download root
+        let root_data = match blossom.try_download(root_hash).await {
+            Some(data) => data,
+            None => {
+                warn!("Could not download root hash {}", root_hash);
+                return Ok(objects);
+            }
+        };
+
+        let root_node = match decrypt_and_decode(&root_data, encryption_key) {
+            Some(node) => node,
+            None => return Ok(objects),
+        };
+
+        // Find .git directory
+        let git_link = root_node.links.iter().find(|l| l.name.as_deref() == Some(".git"));
+        let (git_hash, git_key) = match git_link {
+            Some(link) => (hex::encode(link.hash), link.key),
+            None => return Ok(objects),
+        };
+
+        let git_data = match blossom.try_download(&git_hash).await {
+            Some(data) => data,
+            None => return Ok(objects),
+        };
+
+        let git_node = match decrypt_and_decode(&git_data, git_key.as_ref()) {
+            Some(node) => node,
+            None => return Ok(objects),
+        };
+
+        // Find objects directory
+        let objects_link = git_node.links.iter().find(|l| l.name.as_deref() == Some("objects"));
+        let (objects_hash, objects_key) = match objects_link {
+            Some(link) => (hex::encode(link.hash), link.key),
+            None => return Ok(objects),
+        };
+
+        let objects_data = match blossom.try_download(&objects_hash).await {
+            Some(data) => data,
+            None => return Ok(objects),
+        };
+
+        let objects_node = match decrypt_and_decode(&objects_data, objects_key.as_ref()) {
+            Some(node) => node,
+            None => return Ok(objects),
+        };
+
+        // Git loose objects are stored as objects/XX/YYYYYYYY...
+        // where XX is first 2 hex chars (directory) and rest is the filename
+        for prefix_link in &objects_node.links {
+            let prefix = match &prefix_link.name {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+
+            // Skip pack files and info for now (we only support loose objects)
+            if prefix == "pack" || prefix == "info" {
+                continue;
+            }
+
+            // Skip non-hex directory names (must be 2 hex chars)
+            if prefix.len() != 2 || hex::decode(&prefix).is_err() {
+                continue;
+            }
+
+            // Download the prefix subdirectory
+            let prefix_hash = hex::encode(prefix_link.hash);
+            let prefix_data = match blossom.try_download(&prefix_hash).await {
+                Some(data) => data,
+                None => continue,
+            };
+
+            let prefix_node = match decrypt_and_decode(&prefix_data, prefix_link.key.as_ref()) {
+                Some(node) => node,
+                None => continue,
+            };
+
+            // Iterate over objects in this subdirectory
+            for obj_link in &prefix_node.links {
+                let suffix = match &obj_link.name {
+                    Some(n) => n.clone(),
+                    None => continue,
+                };
+
+                // Full git object id is prefix + suffix
+                let oid = format!("{}{}", prefix, suffix);
+
+                // Download the object data
+                let obj_hash = hex::encode(obj_link.hash);
+                let obj_data = match blossom.try_download(&obj_hash).await {
+                    Some(data) => data,
+                    None => continue,
+                };
+
+                // Decrypt if needed
+                let obj_content = if let Some(k) = obj_link.key.as_ref() {
+                    match decrypt_chk(&obj_data, k) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    }
+                } else {
+                    obj_data
+                };
+
+                // This is the zlib-compressed loose object
+                objects.push((oid, obj_content));
+            }
+        }
+
+        debug!("Fetched {} git objects from hashtree", objects.len());
+        Ok(objects)
     }
 
     /// Fetch objects using htree CLI (which has file server fallback)
@@ -242,27 +404,36 @@ impl RemoteHelper {
         }
     }
 
-    /// Write object to local git object store
+    /// Write loose object directly to local git object store
+    /// The data is already zlib-compressed loose object format
     fn write_git_object(&self, oid: &str, data: &[u8]) -> Result<()> {
-        // Use git hash-object to store
-        let mut child = Command::new("git")
-            .args(["hash-object", "-w", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
+        use std::fs;
+        use std::io::Write;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin.write_all(data)?;
+        // Git objects are stored as .git/objects/xx/yy... where xx is first 2 chars
+        if oid.len() < 3 {
+            bail!("Invalid object id: {}", oid);
         }
 
-        let output = child.wait_with_output()?;
-        let computed_oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let prefix = &oid[..2];
+        let suffix = &oid[2..];
 
-        if computed_oid != oid {
-            warn!("OID mismatch: expected {}, got {}", oid, computed_oid);
+        // Find .git directory (current directory should be the repo)
+        let git_dir = std::env::current_dir()?.join(".git");
+        if !git_dir.exists() {
+            bail!("Not in a git repository (no .git directory)");
         }
 
+        let object_dir = git_dir.join("objects").join(prefix);
+        fs::create_dir_all(&object_dir)?;
+
+        let object_path = object_dir.join(suffix);
+
+        // Write the zlib-compressed loose object
+        let mut file = fs::File::create(&object_path)?;
+        file.write_all(data)?;
+
+        debug!("Wrote git object {} to {:?}", oid, object_path);
         Ok(())
     }
 
