@@ -33,7 +33,6 @@ tower-http.workspace = true
 nostr.workspace = true
 nostr-sdk.workspace = true
 nostrdb.workspace = true
-enostr.workspace = true
 
 # WebRTC
 webrtc = "0.11"
