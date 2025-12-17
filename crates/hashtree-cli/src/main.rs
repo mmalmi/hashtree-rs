@@ -280,7 +280,6 @@ async fn main() -> Result<()> {
                 let sync_config = hashtree_cli::sync::SyncConfig {
                     sync_own: config.sync.sync_own,
                     sync_followed: config.sync.sync_followed,
-                    blossom_servers: blossom_read_servers,
                     relays: config.nostr.relays.clone(),
                     max_concurrent: config.sync.max_concurrent,
                     webrtc_timeout_ms: config.sync.webrtc_timeout_ms,
@@ -585,13 +584,8 @@ async fn main() -> Result<()> {
 
             let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
 
-            // Load config for Blossom servers
-            let config = Config::load()?;
-            let fetch_config = FetchConfig {
-                blossom_servers: config.blossom.servers.clone(),
-                ..Default::default()
-            };
-            let fetcher = Fetcher::new(fetch_config);
+            // Create fetcher (BlossomClient auto-loads servers from config)
+            let fetcher = Fetcher::new(FetchConfig::default());
 
             // Check if it's a directory (try local first, then fetch)
             let listing = match store.get_directory_listing(&cid) {
@@ -656,13 +650,8 @@ async fn main() -> Result<()> {
 
             let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
 
-            // Load config for Blossom servers
-            let config = Config::load()?;
-            let fetch_config = FetchConfig {
-                blossom_servers: config.blossom.servers.clone(),
-                ..Default::default()
-            };
-            let fetcher = Fetcher::new(fetch_config);
+            // Create fetcher (BlossomClient auto-loads servers from config)
+            let fetcher = Fetcher::new(FetchConfig::default());
 
             // Fetch file (local first, then Blossom)
             if let Some(content) = fetcher.fetch_file(&store, None, &cid).await? {
@@ -1045,10 +1034,8 @@ async fn follow_user(data_dir: &PathBuf, npub_str: &str, follow: bool) -> Result
         })
         .collect();
 
-    let event = EventBuilder::new(Kind::ContactList, "")
-        .tags(tags)
-        .sign(&keys)
-        .await
+    let event = EventBuilder::new(Kind::ContactList, "", tags)
+        .to_event(&keys)
         .context("Failed to sign contact list event")?;
 
     let event_json = ClientMessage::event(event).as_json();
@@ -1233,14 +1220,13 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
             let auth_event = EventBuilder::new(
                 Kind::Custom(24242),
                 "Upload",
+                vec![
+                    Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
+                    Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
+                    Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
+                ],
             )
-            .tags(vec![
-                Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
-                Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
-                Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
-            ])
-            .sign(&keys)
-            .await
+            .to_event(&keys)
             .context("Failed to sign auth event")?;
 
             let auth_json = auth_event.as_json();
@@ -1451,14 +1437,16 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
             hasher.update(data);
             let computed_hash = hex::encode(hasher.finalize());
 
-            let auth_event = match EventBuilder::new(Kind::Custom(24242), "Upload")
-                .tags(vec![
+            let auth_event = match EventBuilder::new(
+                Kind::Custom(24242),
+                "Upload",
+                vec![
                     Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
                     Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
                     Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
-                ])
-                .sign(&keys)
-                .await
+                ],
+            )
+            .to_event(&keys)
             {
                 Ok(e) => e,
                 Err(_) => continue,

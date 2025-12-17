@@ -50,5 +50,8 @@ tracing-subscriber.workspace = true
 # CLI
 clap.workspace = true
 
+# TLS crypto provider
+rustls = { version = "0.23", features = ["ring"] }
+
 [dev-dependencies]
 tempfile.workspace = true

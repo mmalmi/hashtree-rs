@@ -24,6 +24,9 @@ use nostr_client::resolve_identity;
 /// Entry point for the git remote helper
 /// Call this from main() to run the helper
 pub fn main_entry() {
+    // Install TLS crypto provider for reqwest/rustls
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     if let Err(e) = run() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);

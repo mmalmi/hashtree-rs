@@ -235,9 +235,9 @@ impl NostrClient {
         };
 
         // Create BlossomClient (needs keys for upload auth)
+        // BlossomClient auto-loads servers from config
         let blossom_keys = keys.clone().unwrap_or_else(Keys::generate);
         let blossom = BlossomClient::new(blossom_keys)
-            .with_servers(config.blossom.all_read_servers())
             .with_timeout(Duration::from_secs(30));
 
         Ok(Self {

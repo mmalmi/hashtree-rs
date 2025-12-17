@@ -57,17 +57,24 @@ pub enum BlossomError {
 /// Blossom protocol client
 pub struct BlossomClient {
     keys: Keys,
-    servers: Vec<String>,
+    /// Servers for reading (download)
+    read_servers: Vec<String>,
+    /// Servers for writing (upload)
+    write_servers: Vec<String>,
     http: reqwest::Client,
     timeout: Duration,
 }
 
 impl BlossomClient {
     /// Create a new client with the given keys
+    /// Automatically loads server config from ~/.hashtree/config.toml
+    #[cfg(feature = "config")]
     pub fn new(keys: Keys) -> Self {
+        let config = hashtree_config::Config::load_or_default();
         Self {
             keys,
-            servers: vec![],
+            read_servers: config.blossom.all_read_servers(),
+            write_servers: config.blossom.all_write_servers(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -76,9 +83,51 @@ impl BlossomClient {
         }
     }
 
-    /// Set the Blossom servers to use
+    /// Create a new client with the given keys (no config loading)
+    #[cfg(not(feature = "config"))]
+    pub fn new(keys: Keys) -> Self {
+        Self {
+            keys,
+            read_servers: vec![],
+            write_servers: vec![],
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Create a new client without loading config (empty servers)
+    pub fn new_empty(keys: Keys) -> Self {
+        Self {
+            keys,
+            read_servers: vec![],
+            write_servers: vec![],
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Set the Blossom servers to use (for both read and write)
     pub fn with_servers(mut self, servers: Vec<String>) -> Self {
-        self.servers = servers;
+        self.read_servers = servers.clone();
+        self.write_servers = servers;
+        self
+    }
+
+    /// Set read-only servers (for downloads)
+    pub fn with_read_servers(mut self, servers: Vec<String>) -> Self {
+        self.read_servers = servers;
+        self
+    }
+
+    /// Set write servers (for uploads)
+    pub fn with_write_servers(mut self, servers: Vec<String>) -> Self {
+        self.write_servers = servers;
         self
     }
 
@@ -92,22 +141,32 @@ impl BlossomClient {
         self
     }
 
-    /// Get configured servers
+    /// Get configured read servers
+    pub fn read_servers(&self) -> &[String] {
+        &self.read_servers
+    }
+
+    /// Get configured write servers
+    pub fn write_servers(&self) -> &[String] {
+        &self.write_servers
+    }
+
+    /// Get configured servers (returns read servers for backwards compatibility)
     pub fn servers(&self) -> &[String] {
-        &self.servers
+        &self.read_servers
     }
 
     /// Upload data to Blossom servers
     /// Returns the SHA256 hash of the uploaded data
     pub async fn upload(&self, data: &[u8]) -> Result<String, BlossomError> {
-        if self.servers.is_empty() {
+        if self.write_servers.is_empty() {
             return Err(BlossomError::NoServers);
         }
 
         let hash = compute_sha256(data);
         let auth_header = self.create_upload_auth(&hash).await?;
 
-        for server in &self.servers {
+        for server in &self.write_servers {
             match self.upload_to_server(server, data, &hash, &auth_header).await {
                 Ok(_) => {
                     debug!("Uploaded {} to {}", &hash[..12], server);
@@ -126,13 +185,13 @@ impl BlossomClient {
     /// Upload data only if it doesn't already exist
     /// Returns (hash, was_uploaded) tuple
     pub async fn upload_if_missing(&self, data: &[u8]) -> Result<(String, bool), BlossomError> {
-        if self.servers.is_empty() {
+        if self.write_servers.is_empty() {
             return Err(BlossomError::NoServers);
         }
 
         let hash = compute_sha256(data);
 
-        // Check if exists on any server
+        // Check if exists on any read server
         if self.exists(&hash).await {
             return Ok((hash, false));
         }
@@ -142,9 +201,9 @@ impl BlossomClient {
         Ok((hash, true))
     }
 
-    /// Check if a blob exists on any server
+    /// Check if a blob exists on any read server
     pub async fn exists(&self, hash: &str) -> bool {
-        for server in &self.servers {
+        for server in &self.read_servers {
             let url = format!("{}/{}", server.trim_end_matches('/'), hash);
             if let Ok(resp) = self.http.head(&url).send().await {
                 if resp.status().is_success() {
@@ -153,6 +212,15 @@ impl BlossomClient {
                         if let Ok(ct_str) = ct.to_str() {
                             if ct_str.starts_with("text/html") {
                                 continue; // Server returned HTML, blob doesn't exist
+                            }
+                        }
+                    }
+                    // Verify content-length > 0 (empty blobs don't count as existing)
+                    if let Some(cl) = resp.headers().get("content-length") {
+                        if let Ok(cl_str) = cl.to_str() {
+                            if cl_str == "0" {
+                                debug!("Blob {} has content-length 0 on {}, skipping", hash, server);
+                                continue;
                             }
                         }
                     }
@@ -166,13 +234,13 @@ impl BlossomClient {
     /// Download data from Blossom servers
     /// Verifies the hash matches before returning
     pub async fn download(&self, hash: &str) -> Result<Vec<u8>, BlossomError> {
-        if self.servers.is_empty() {
+        if self.read_servers.is_empty() {
             return Err(BlossomError::NoServers);
         }
 
         let mut last_error = String::new();
 
-        for server in &self.servers {
+        for server in &self.read_servers {
             let url = format!("{}/{}", server.trim_end_matches('/'), hash);
             match self.http.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {

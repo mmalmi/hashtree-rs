@@ -581,14 +581,12 @@ impl WebRTCManager {
                 let expiration = created_at + Duration::from_secs(5 * 60); // 5 minutes
 
                 let tags = vec![
-                    Tag::parse(["p", &recipient_pubkey.to_hex()])?,
-                    Tag::parse(["expiration", &expiration.as_u64().to_string()])?,
+                    Tag::parse(&["p", &recipient_pubkey.to_hex()])?,
+                    Tag::parse(&["expiration", &expiration.as_u64().to_string()])?,
                 ];
 
-                let event = EventBuilder::new(Kind::Ephemeral(WEBRTC_KIND as u16), encrypted_content)
-                    .tags(tags)
-                    .sign(&ephemeral_keys)
-                    .await?;
+                let event = EventBuilder::new(Kind::Ephemeral(WEBRTC_KIND as u16), encrypted_content, tags)
+                    .to_event(&ephemeral_keys)?;
 
                 return Ok(event);
             }
@@ -596,14 +594,12 @@ impl WebRTCManager {
 
         // Hello messages - kind 25050 with #l: "hello" tag and peerId
         let tags = vec![
-            Tag::parse(["l", HELLO_TAG])?,
-            Tag::parse(["peerId", msg.peer_id()])?,
+            Tag::parse(&["l", HELLO_TAG])?,
+            Tag::parse(&["peerId", msg.peer_id()])?,
         ];
 
-        let event = EventBuilder::new(Kind::Ephemeral(WEBRTC_KIND as u16), "")
-            .tags(tags)
-            .sign(keys)
-            .await?;
+        let event = EventBuilder::new(Kind::Ephemeral(WEBRTC_KIND as u16), "", tags)
+            .to_event(keys)?;
 
         Ok(event)
     }

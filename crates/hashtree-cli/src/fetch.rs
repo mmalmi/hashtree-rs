@@ -6,7 +6,9 @@
 //! 3. Blossom HTTP servers (fallback)
 
 use anyhow::Result;
+use hashtree_blossom::BlossomClient;
 use hashtree_core::{decode_tree_node, to_hex};
+use nostr::Keys;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +20,6 @@ use crate::webrtc::WebRTCState;
 /// Configuration for remote fetching
 #[derive(Clone)]
 pub struct FetchConfig {
-    /// Blossom servers for fallback
-    pub blossom_servers: Vec<String>,
     /// Timeout for WebRTC requests
     pub webrtc_timeout: Duration,
     /// Timeout for Blossom requests
@@ -29,7 +29,6 @@ pub struct FetchConfig {
 impl Default for FetchConfig {
     fn default() -> Self {
         Self {
-            blossom_servers: vec!["https://blossom.iris.to".to_string()],
             webrtc_timeout: Duration::from_millis(2000),
             blossom_timeout: Duration::from_millis(10000),
         }
@@ -39,19 +38,32 @@ impl Default for FetchConfig {
 /// Fetcher for remote content
 pub struct Fetcher {
     config: FetchConfig,
-    http_client: reqwest::Client,
+    blossom: BlossomClient,
 }
 
 impl Fetcher {
     /// Create a new fetcher with the given config
+    /// BlossomClient auto-loads servers from ~/.hashtree/config.toml
     pub fn new(config: FetchConfig) -> Self {
-        Self {
-            config,
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-        }
+        // Generate ephemeral keys for downloads (no signing needed)
+        let keys = Keys::generate();
+        let blossom = BlossomClient::new(keys)
+            .with_timeout(config.blossom_timeout);
+
+        Self { config, blossom }
+    }
+
+    /// Create a new fetcher with specific keys (for authenticated uploads)
+    pub fn with_keys(config: FetchConfig, keys: Keys) -> Self {
+        let blossom = BlossomClient::new(keys)
+            .with_timeout(config.blossom_timeout);
+
+        Self { config, blossom }
+    }
+
+    /// Get the underlying BlossomClient
+    pub fn blossom(&self) -> &BlossomClient {
+        &self.blossom
     }
 
     /// Fetch a single chunk by hash, trying WebRTC first then Blossom
@@ -82,36 +94,17 @@ impl Fetcher {
         }
 
         // Fallback to Blossom
-        for server in &self.config.blossom_servers {
-            let url = format!("{}/{}", server.trim_end_matches('/'), hash_hex);
-            debug!("Trying Blossom {} for {}", server, short_hash);
-
-            let result = tokio::time::timeout(
-                self.config.blossom_timeout,
-                self.http_client.get(&url).send(),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(response)) if response.status().is_success() => {
-                    if let Ok(data) = response.bytes().await {
-                        debug!("Got {} from Blossom ({} bytes)", short_hash, data.len());
-                        return Ok(data.to_vec());
-                    }
-                }
-                Ok(Ok(response)) => {
-                    debug!("Blossom {} returned {} for {}", server, response.status(), short_hash);
-                }
-                Ok(Err(e)) => {
-                    debug!("Blossom {} error for {}: {}", server, short_hash, e);
-                }
-                Err(_) => {
-                    debug!("Blossom {} timeout for {}", server, short_hash);
-                }
+        debug!("Trying Blossom for {}", short_hash);
+        match self.blossom.download(hash_hex).await {
+            Ok(data) => {
+                debug!("Got {} from Blossom ({} bytes)", short_hash, data.len());
+                Ok(data)
+            }
+            Err(e) => {
+                debug!("Blossom download failed for {}: {}", short_hash, e);
+                Err(anyhow::anyhow!("Failed to fetch {} from any source: {}", short_hash, e))
             }
         }
-
-        Err(anyhow::anyhow!("Failed to fetch {} from any source", short_hash))
     }
 
     /// Fetch a chunk, checking local storage first
@@ -226,5 +219,21 @@ impl Fetcher {
 
         // Now try to get the directory listing
         store.get_directory_listing(hash_hex)
+    }
+
+    /// Upload data to Blossom servers
+    pub async fn upload(&self, data: &[u8]) -> Result<String> {
+        self.blossom
+            .upload(data)
+            .await
+            .map_err(|e| anyhow::anyhow!("Blossom upload failed: {}", e))
+    }
+
+    /// Upload data if it doesn't already exist
+    pub async fn upload_if_missing(&self, data: &[u8]) -> Result<(String, bool)> {
+        self.blossom
+            .upload_if_missing(data)
+            .await
+            .map_err(|e| anyhow::anyhow!("Blossom upload failed: {}", e))
     }
 }

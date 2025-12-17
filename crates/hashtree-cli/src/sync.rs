@@ -49,8 +49,6 @@ pub struct SyncConfig {
     pub sync_own: bool,
     /// Enable syncing followed users' public trees
     pub sync_followed: bool,
-    /// Blossom servers for fallback
-    pub blossom_servers: Vec<String>,
     /// Nostr relays for subscriptions
     pub relays: Vec<String>,
     /// Max concurrent sync tasks
@@ -66,12 +64,24 @@ impl Default for SyncConfig {
         Self {
             sync_own: true,
             sync_followed: true,
-            blossom_servers: vec!["https://blossom.iris.to".to_string()],
-            relays: vec![
-                "wss://relay.damus.io".to_string(),
-                "wss://relay.primal.net".to_string(),
-                "wss://nos.lol".to_string(),
-            ],
+            relays: hashtree_config::DEFAULT_RELAYS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            max_concurrent: 3,
+            webrtc_timeout_ms: 2000,
+            blossom_timeout_ms: 10000,
+        }
+    }
+}
+
+impl SyncConfig {
+    /// Create from hashtree_config (respects user's config.toml)
+    pub fn from_config(config: &hashtree_config::Config) -> Self {
+        Self {
+            sync_own: true,
+            sync_followed: true,
+            relays: config.nostr.relays.clone(),
             max_concurrent: 3,
             webrtc_timeout_ms: 2000,
             blossom_timeout_ms: 10000,
@@ -134,8 +144,8 @@ impl BackgroundSync {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Create fetcher with config
+        // BlossomClient auto-loads servers from ~/.hashtree/config.toml
         let fetch_config = FetchConfig {
-            blossom_servers: config.blossom_servers.clone(),
             webrtc_timeout: Duration::from_millis(config.webrtc_timeout_ms),
             blossom_timeout: Duration::from_millis(config.blossom_timeout_ms),
         };

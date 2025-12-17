@@ -23,6 +23,8 @@ git-remote-htree = { path = "../git-remote-htree" }
 # Core hashtree crates
 hashtree-core.workspace = true
 hashtree-lmdb.workspace = true
+hashtree-blossom.workspace = true
+hashtree-config.workspace = true
 hashtree-resolver = { workspace = true, features = ["nostr"] }
 
 # AWS S3 (optional)
