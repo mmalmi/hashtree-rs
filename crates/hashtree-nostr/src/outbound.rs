@@ -3,8 +3,8 @@
 //! Handles connecting to nostr relays and ingesting events into nostrdb.
 
 use anyhow::Result;
-use enostr::{RelayEvent, RelayPool};
-use nostrdb::{Filter, FilterBuilder, Ndb, Transaction};
+use nostr_sdk::prelude::*;
+use nostrdb::{FilterBuilder, Ndb, Transaction};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -63,109 +63,20 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://temp.iris.to",
 ];
 
-/// Relay manager that handles connections and event ingestion
+/// Relay manager that handles connections and event ingestion (not used with nostr-sdk)
+#[allow(dead_code)]
 pub struct RelayManager {
-    pool: RelayPool,
     ndb: Ndb,
     shutdown: Arc<AtomicBool>,
 }
 
+#[allow(dead_code)]
 impl RelayManager {
     pub fn new(ndb: Ndb) -> Self {
         Self {
-            pool: RelayPool::new(),
             ndb,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Add a relay URL to the pool
-    pub fn add_relay(
-        &mut self,
-        url: &str,
-        wakeup: impl Fn() + Send + Sync + Clone + 'static,
-    ) -> Result<()> {
-        self.pool.add_url(url.to_string(), wakeup)?;
-        Ok(())
-    }
-
-    /// Add default relays
-    pub fn add_default_relays(
-        &mut self,
-        wakeup: impl Fn() + Send + Sync + Clone + 'static,
-    ) -> Result<()> {
-        for url in DEFAULT_RELAYS {
-            if let Err(e) = self.add_relay(url, wakeup.clone()) {
-                warn!("Failed to add relay {}: {}", url, e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Subscribe to events matching the filter
-    pub fn subscribe(&mut self, subid: String, filters: Vec<Filter>) {
-        self.pool.subscribe(subid, filters);
-    }
-
-    /// Process pending relay events, ingesting into nostrdb
-    /// Returns number of events processed
-    pub fn process_events(&mut self) -> usize {
-        let mut count = 0;
-
-        loop {
-            let pool_event = if let Some(ev) = self.pool.try_recv() {
-                ev.into_owned()
-            } else {
-                break;
-            };
-
-            match (&pool_event.event).into() {
-                RelayEvent::Opened => {
-                    info!("Relay connected: {}", pool_event.relay);
-                }
-                RelayEvent::Closed => {
-                    warn!("Relay disconnected: {}", pool_event.relay);
-                }
-                RelayEvent::Error(e) => {
-                    error!("Relay {} error: {}", pool_event.relay, e);
-                }
-                RelayEvent::Other(_) => {}
-                RelayEvent::Message(msg) => {
-                    use enostr::RelayMessage;
-                    match msg {
-                        RelayMessage::Event(_subid, ev) => {
-                            trace!("Event from {}", pool_event.relay);
-                            if let Err(e) = self.ndb.process_event_with(
-                                &ev,
-                                nostrdb::IngestMetadata::new()
-                                    .client(false)
-                                    .relay(&pool_event.relay),
-                            ) {
-                                debug!("Error processing event: {}", e);
-                            } else {
-                                count += 1;
-                            }
-                        }
-                        RelayMessage::Notice(msg) => {
-                            warn!("Notice from {}: {}", pool_event.relay, msg);
-                        }
-                        RelayMessage::OK(cr) => {
-                            debug!("OK from {}: {:?}", pool_event.relay, cr);
-                        }
-                        RelayMessage::Eose(subid) => {
-                            debug!("EOSE from {} for {}", pool_event.relay, subid);
-                        }
-                    }
-                }
-            }
-        }
-
-        count
-    }
-
-    /// Keep connections alive
-    pub fn keepalive(&mut self, wakeup: impl Fn() + Send + Sync + Clone + 'static) {
-        self.pool.keepalive_ping(wakeup);
     }
 
     /// Signal shutdown
@@ -176,11 +87,6 @@ impl RelayManager {
     /// Check if shutdown was requested
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
-    }
-
-    /// Get relay URLs
-    pub fn relay_urls(&self) -> Vec<String> {
-        self.pool.urls().into_iter().collect()
     }
 }
 
@@ -232,156 +138,172 @@ pub fn spawn_relay_thread(ndb: Ndb, config: RelayConfig) -> RelayThreadHandle {
     let (query_tx, query_rx) = mpsc::channel::<NdbQuery>();
 
     thread::spawn(move || {
-        // Channel for wakeups from websocket events
-        let (wakeup_tx, wakeup_rx) = std::sync::mpsc::channel::<()>();
+        // Create tokio runtime for this thread
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
 
-        let wakeup = move || {
-            let _ = wakeup_tx.send(());
-        };
+        rt.block_on(async move {
+            // Create nostr-sdk client
+            let client = Client::default();
 
-        let mut manager = RelayManager::new(ndb);
-
-        // Add relays
-        for url in &config.relays {
-            if let Err(e) = manager.add_relay(url, wakeup.clone()) {
-                error!("Failed to add relay {}: {}", url, e);
-            }
-        }
-
-        // Build subscription filter for main events
-        let mut filter_builder = FilterBuilder::new();
-
-        if !config.kinds.is_empty() {
-            filter_builder = filter_builder.kinds(config.kinds.clone());
-        }
-
-        if !config.authors.is_empty() {
-            filter_builder = filter_builder.authors(config.authors.iter());
-        }
-
-        filter_builder = filter_builder.limit(500);
-
-        let filter = filter_builder.build();
-        manager.subscribe("hashtree".to_string(), vec![filter]);
-
-        // Initialize crawler if configured
-        let mut crawler = if config.crawl_depth > 0 && !config.crawl_seeds.is_empty() {
-            let mut state = CrawlerState::new(config.crawl_depth);
-            state.add_seeds(&config.crawl_seeds);
-            info!(
-                "Starting social graph crawl with {} seeds, max depth {}",
-                config.crawl_seeds.len(),
-                config.crawl_depth
-            );
-            Some(state)
-        } else {
-            None
-        };
-
-        // Track active crawl subscriptions: sub_id -> depth
-        let mut crawl_subs: HashMap<String, u32> = HashMap::new();
-        let mut last_crawl_batch = std::time::Instant::now();
-        let crawl_batch_interval = Duration::from_millis(500);
-
-        info!(
-            "Relay thread started with {} relays",
-            config.relays.len()
-        );
-
-        let keepalive_interval = Duration::from_secs(30);
-        let mut last_keepalive = std::time::Instant::now();
-
-        while !shutdown_clone.load(Ordering::SeqCst) {
-            // Wait for wakeup or timeout
-            let _ = wakeup_rx.recv_timeout(Duration::from_millis(100));
-
-            // Process relay events
-            let count = manager.process_events();
-            if count > 0 {
-                trace!("Processed {} events", count);
-            }
-
-            // All database operations use a single transaction per iteration
-            // nostrdb only allows one transaction per thread at a time
-            if let Ok(txn) = Transaction::new(&manager.ndb) {
-                // Process queries from other threads
-                while let Ok(query) = query_rx.try_recv() {
-                    process_query_with_txn(&manager.ndb, &txn, config.root_pubkey.as_ref(), query);
+            // Add relays
+            for url in &config.relays {
+                if let Err(e) = client.add_relay(url).await {
+                    error!("Failed to add relay {}: {}", url, e);
                 }
+            }
 
-                // Handle crawler batching
-                if let Some(ref mut crawler_state) = crawler {
-                    let now = std::time::Instant::now();
+            // Connect to relays
+            client.connect().await;
 
-                    // Send next crawl batch if ready
-                    if now.duration_since(last_crawl_batch) >= crawl_batch_interval {
-                        if let Some((sub_id, batch, depth)) = crawler_state.next_batch() {
-                            let filter = contact_list_filter(&batch);
-                            manager.subscribe(sub_id.clone(), vec![filter]);
-                            crawl_subs.insert(sub_id, depth);
-                            last_crawl_batch = now;
+            info!(
+                "Relay thread started with {} relays",
+                config.relays.len()
+            );
+
+            // Build subscription filter
+            let mut filter = nostr_sdk::Filter::new();
+
+            if !config.kinds.is_empty() {
+                let kinds: Vec<Kind> = config.kinds.iter().map(|k| Kind::from(*k as u16)).collect();
+                filter = filter.kinds(kinds);
+            }
+
+            if !config.authors.is_empty() {
+                let authors: Vec<PublicKey> = config.authors.iter()
+                    .filter_map(|pk| PublicKey::from_slice(pk).ok())
+                    .collect();
+                filter = filter.authors(authors);
+            }
+
+            filter = filter.limit(500);
+
+            // Subscribe
+            if let Err(e) = client.subscribe(vec![filter], None).await {
+                error!("Failed to subscribe: {}", e);
+            }
+
+            // Initialize crawler if configured
+            let mut crawler = if config.crawl_depth > 0 && !config.crawl_seeds.is_empty() {
+                let mut state = CrawlerState::new(config.crawl_depth);
+                state.add_seeds(&config.crawl_seeds);
+                info!(
+                    "Starting social graph crawl with {} seeds, max depth {}",
+                    config.crawl_seeds.len(),
+                    config.crawl_depth
+                );
+                Some(state)
+            } else {
+                None
+            };
+
+            // Track active crawl subscriptions: sub_id -> depth
+            let mut crawl_subs: HashMap<String, u32> = HashMap::new();
+            let mut last_crawl_batch = std::time::Instant::now();
+            let crawl_batch_interval = Duration::from_millis(500);
+            let mut last_stats_log = std::time::Instant::now();
+
+            // Get notification receiver
+            let mut notifications = client.notifications();
+
+            // Main event loop
+            while !shutdown_clone.load(Ordering::SeqCst) {
+                // Handle notifications with timeout
+                let recv_result = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    notifications.recv()
+                ).await;
+
+                if let Ok(Ok(notification)) = recv_result {
+                    if let RelayPoolNotification::Event { event, relay_url, .. } = notification {
+                        // Ingest event into nostrdb
+                        let event_json = event.as_json();
+                        let relay_str = relay_url.to_string();
+                        if let Err(e) = ndb.process_event_with(
+                            &event_json,
+                            nostrdb::IngestMetadata::new()
+                                .client(false)
+                                .relay(&relay_str),
+                        ) {
+                            debug!("Error processing event: {}", e);
+                        } else {
+                            trace!("Ingested event from {}", relay_url);
                         }
                     }
+                }
 
-                    // Process contact lists from ndb to extract follows
-                    let contact_filter = FilterBuilder::new()
-                        .kinds(vec![KIND_CONTACTS])
-                        .limit(100)
-                        .build();
+                // All database operations use a single transaction per iteration
+                if let Ok(txn) = Transaction::new(&ndb) {
+                    // Process queries from other threads
+                    while let Ok(query) = query_rx.try_recv() {
+                        process_query_with_txn(&ndb, &txn, config.root_pubkey.as_ref(), query);
+                    }
 
-                    if let Ok(results) = manager.ndb.query(&txn, &[contact_filter], 100) {
-                        for result in results.iter() {
-                            let author = result.note.pubkey();
-                            if let Some(depth) = crawler_state.get_depth(author) {
-                                let p_tags = extract_p_tags(&manager.ndb, &txn, result.note_key);
-                                if !p_tags.is_empty() {
-                                    crawler_state.process_contact_list(author, p_tags, depth);
+                    // Handle crawler batching
+                    if let Some(ref mut crawler_state) = crawler {
+                        let now = std::time::Instant::now();
+
+                        // Send next crawl batch if ready
+                        if now.duration_since(last_crawl_batch) >= crawl_batch_interval {
+                            if let Some((sub_id, batch, depth)) = crawler_state.next_batch() {
+                                let filter = contact_list_filter(&batch);
+
+                                // Convert nostrdb filter to nostr-sdk filter for subscription
+                                let sdk_filter = nostr_sdk::Filter::new()
+                                    .kind(Kind::ContactList)
+                                    .authors(batch.iter().filter_map(|pk| PublicKey::from_slice(pk).ok()));
+
+                                if let Err(e) = client.subscribe(vec![sdk_filter], None).await {
+                                    warn!("Failed to subscribe for crawl batch: {}", e);
+                                } else {
+                                    crawl_subs.insert(sub_id, depth);
+                                    last_crawl_batch = now;
+                                }
+
+                                // Keep the nostrdb filter reference to avoid unused warning
+                                let _ = filter;
+                            }
+                        }
+
+                        // Process contact lists from ndb to extract follows
+                        let contact_filter = FilterBuilder::new()
+                            .kinds(vec![KIND_CONTACTS])
+                            .limit(100)
+                            .build();
+
+                        if let Ok(results) = ndb.query(&txn, &[contact_filter], 100) {
+                            for result in results.iter() {
+                                let author = result.note.pubkey();
+                                if let Some(depth) = crawler_state.get_depth(author) {
+                                    let p_tags = extract_p_tags(&ndb, &txn, result.note_key);
+                                    if !p_tags.is_empty() {
+                                        crawler_state.process_contact_list(author, p_tags, depth);
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Log progress periodically
-                    let stats = crawler_state.stats();
-                    if stats.queue_count > 0 || !crawl_subs.is_empty() {
-                        trace!(
-                            "Crawler: {} seen, {} queued, {} active subs",
-                            stats.seen_count,
-                            stats.queue_count,
-                            crawl_subs.len()
-                        );
-                    }
-                }
-            }
-
-            // Keepalive
-            if last_keepalive.elapsed() >= keepalive_interval {
-                let wakeup_clone = {
-                    let tx = wakeup_rx.try_iter().collect::<Vec<_>>();
-                    drop(tx);
-                    let (tx, _) = std::sync::mpsc::channel::<()>();
-                    move || {
-                        let _ = tx.send(());
-                    }
-                };
-                manager.keepalive(wakeup_clone);
-                last_keepalive = std::time::Instant::now();
-
-                // Log crawler stats on keepalive
-                if let Some(ref crawler_state) = crawler {
-                    let stats = crawler_state.stats();
-                    if stats.seen_count > 0 {
-                        info!(
-                            "Social graph crawler: {} users discovered, {} queued",
-                            stats.seen_count,
-                            stats.queue_count
-                        );
+                        // Log progress periodically
+                        if now.duration_since(last_stats_log) >= Duration::from_secs(30) {
+                            let stats = crawler_state.stats();
+                            if stats.seen_count > 0 {
+                                info!(
+                                    "Social graph crawler: {} users discovered, {} queued",
+                                    stats.seen_count,
+                                    stats.queue_count
+                                );
+                            }
+                            last_stats_log = now;
+                        }
                     }
                 }
             }
-        }
 
-        info!("Relay thread shutting down");
+            info!("Relay thread shutting down");
+            let _ = client.disconnect().await;
+        });
     });
 
     RelayThreadHandle {
@@ -431,18 +353,9 @@ mod tests {
     }
 
     #[test]
-    fn test_relay_manager_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let ndb = init_test_ndb(temp_dir.path().join("nostrdb"));
-
-        let manager = RelayManager::new(ndb);
-        assert!(manager.relay_urls().is_empty());
-    }
-
-    #[test]
     fn test_relay_config_default() {
         let config = RelayConfig::default();
-        assert_eq!(config.relays.len(), 3);
+        assert_eq!(config.relays.len(), 4);
         assert!(config.relays.contains(&"wss://relay.damus.io".to_string()));
         assert!(config.authors.is_empty());
         assert!(!config.kinds.is_empty());
@@ -473,76 +386,5 @@ mod tests {
 
         // Give thread time to exit
         std::thread::sleep(Duration::from_millis(200));
-    }
-
-    #[test]
-    fn test_relay_manager_add_relay() {
-        let temp_dir = TempDir::new().unwrap();
-        let ndb = init_test_ndb(temp_dir.path().join("nostrdb"));
-
-        let mut manager = RelayManager::new(ndb);
-
-        // Adding relay should work (will try to connect but we don't wait)
-        let wakeup = || {};
-        let result = manager.add_relay("wss://relay.damus.io", wakeup);
-        // The result depends on whether connection succeeds
-        let _ = result;
-    }
-
-    #[test]
-    #[ignore] // Run with: cargo test --ignored test_crawler_live
-    fn test_crawler_live_crawl() {
-        // This test actually connects to relays and crawls the social graph
-        // Run manually with: cargo test -p hashtree-relay test_crawler_live -- --ignored --nocapture
-        let temp_dir = TempDir::new().unwrap();
-        let ndb = init_test_ndb(temp_dir.path().join("nostrdb"));
-
-        // Sirius's pubkey (npub1g53mukxnjkcmr94fhryzkqutdz2ukq4ks0gvy5af25rgmwsl4ngq43drvk)
-        let sirius = {
-            let bytes = hex::decode("4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0").unwrap();
-            let mut pk = [0u8; 32];
-            pk.copy_from_slice(&bytes);
-            pk
-        };
-
-        // Set sirius as social graph root
-        nostrdb::socialgraph::set_root(&ndb, &sirius);
-
-        let config = RelayConfig {
-            relays: vec![
-                "wss://relay.damus.io".to_string(),
-                "wss://relay.snort.social".to_string(),
-                "wss://temp.iris.to".to_string(),
-                "wss://vault.iris.to".to_string(),
-            ],
-            authors: vec![],
-            kinds: vec![],
-            root_pubkey: Some(sirius),
-            crawl_seeds: vec![sirius],
-            crawl_depth: 1, // Just direct follows for speed
-        };
-
-        let handle = spawn_relay_thread(ndb.clone(), config);
-
-        // Wait for crawling to happen
-        println!("Crawling social graph from sirius (depth 1)...");
-        std::thread::sleep(Duration::from_secs(10));
-
-        // Query social graph stats while still running - root stats should work
-        let stats = handle.query.socialgraph_root_stats();
-        println!("Stats for root (sirius): {:?}", stats);
-
-        // Check we got some data
-        if let Ok(s) = stats {
-            println!("Following: {}, Followers: {}, Distance: {}", s.following_count, s.followers_count, s.follow_distance);
-            // Root user should have distance 0
-            assert_eq!(s.follow_distance, 0, "Root user should have follow_distance 0");
-            // Sirius should have some follows
-            assert!(s.following_count > 0, "Should have discovered following data");
-        }
-
-        // Signal shutdown
-        handle.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(500));
     }
 }

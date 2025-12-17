@@ -6,16 +6,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Social graph and relay connections using nostrdb"
-publish = false  # Uses git dependencies (enostr, nostrdb fork)
+publish = false  # Uses git dependency (nostrdb fork)
 
 [dependencies]
 # Core
 nostrdb = { git = "https://github.com/mmalmi/nostrdb-rs" }
-enostr = { git = "https://github.com/mmalmi/notedeck" }
-nostr = "0.37"
+nostr-sdk = "0.35"
 
 # Async
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread"] }
 futures.workspace = true
 
 # Serialization
