@@ -9,7 +9,7 @@
 //!
 //! ```ignore
 //! use hashtree_s3::{S3Store, S3Config};
-//! use hashtree::store::MemoryStore;
+//! use hashtree_core::store::MemoryStore;
 //! use std::sync::Arc;
 //!
 //! let local_store = Arc::new(MemoryStore::new());
@@ -26,8 +26,8 @@
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
-use hashtree::store::{Store, StoreError};
-use hashtree::types::{to_hex, Hash};
+use hashtree_core::store::{Store, StoreError};
+use hashtree_core::types::{to_hex, Hash};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -337,8 +337,8 @@ pub enum S3StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hashtree::store::MemoryStore;
-    use hashtree::hash::sha256;
+    use hashtree_core::store::MemoryStore;
+    use hashtree_core::hash::sha256;
 
     #[test]
     fn test_s3_key_generation() {

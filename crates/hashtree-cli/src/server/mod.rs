@@ -37,6 +37,7 @@ impl HashtreeServer {
                 webrtc_peers: None,
                 max_upload_bytes: 5 * 1024 * 1024, // 5 MB default
                 public_writes: true, // Allow anyone with valid Nostr auth by default
+                max_write_distance: 3, // Default: up to 3rd degree
             },
             git_storage: None,
             local_pubkey: None,
@@ -77,6 +78,12 @@ impl HashtreeServer {
 
     pub fn with_ndb_query(mut self, query: hashtree_nostr::NdbQuerySender) -> Self {
         self.state.ndb_query = Some(query);
+        self
+    }
+
+    /// Set maximum follow distance for write access
+    pub fn with_max_write_distance(mut self, distance: u32) -> Self {
+        self.state.max_write_distance = distance;
         self
     }
 

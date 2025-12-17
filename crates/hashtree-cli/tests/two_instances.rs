@@ -163,6 +163,7 @@ fn create_test_directory() -> TempDir {
 }
 
 #[test]
+#[ignore = "requires external Nostr relays and network connectivity - run manually with --ignored"]
 fn test_two_instances_discover_and_sync() {
     let htree_bin = find_htree_binary();
     let htree_bin_str = htree_bin.to_str().unwrap();

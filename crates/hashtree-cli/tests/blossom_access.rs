@@ -2,7 +2,7 @@
 //!
 //! Tests the access control logic for blossom blob uploads:
 //! - Hardcoded subscribers are always allowed
-//! - Users within MAX_WRITE_DISTANCE (3) degrees of separation are allowed
+//! - Users within DEFAULT_MAX_WRITE_DISTANCE (3) degrees of separation are allowed
 //! - Users muted by root are denied
 //! - Overmuted users (high muter/follower ratio) are denied
 //!
@@ -373,12 +373,12 @@ fn test_hardcoded_subscriber_check_exists() {
     // This test verifies the access control logic exists
     // We can't test actual subscriber access without their private keys
 
-    use hashtree_cli::server::blossom::{HARDCODED_SUBSCRIBERS, SOCIAL_GRAPH_ROOT, MAX_WRITE_DISTANCE};
+    use hashtree_cli::server::blossom::{HARDCODED_SUBSCRIBERS, SOCIAL_GRAPH_ROOT, DEFAULT_MAX_WRITE_DISTANCE};
 
     // Verify constants are set correctly
     assert!(!HARDCODED_SUBSCRIBERS.is_empty(), "Should have hardcoded subscribers");
     assert!(HARDCODED_SUBSCRIBERS.contains(SOCIAL_GRAPH_ROOT), "Root should be in subscribers");
-    assert_eq!(MAX_WRITE_DISTANCE, 3, "Max distance should be 3");
+    assert_eq!(DEFAULT_MAX_WRITE_DISTANCE, 3, "Max distance should be 3");
     assert_eq!(SOCIAL_GRAPH_ROOT.len(), 64, "Root pubkey should be 64 hex chars");
 }
 

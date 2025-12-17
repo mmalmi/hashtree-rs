@@ -22,8 +22,9 @@ use super::mime::get_mime_type;
 /// Social graph root pubkey (sirius - npub1g53mukxnjkcmr94fhryzkqutdz2ukq4ks0gvy5af25rgmwsl4ngq43drvk)
 pub const SOCIAL_GRAPH_ROOT: &str = "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0";
 
-/// Maximum follow distance for blossom write access (0 = root only, 3 = up to 3rd degree)
-pub const MAX_WRITE_DISTANCE: u32 = 3;
+/// Default maximum follow distance for blossom write access (0 = root only, 3 = up to 3rd degree)
+/// This can be overridden via config
+pub const DEFAULT_MAX_WRITE_DISTANCE: u32 = 3;
 
 /// Ratio threshold for "overmuted" - if muters/followers exceeds this ratio, deny access
 /// e.g., 0.1 means if 10% or more of your followers mute you, you're overmuted
@@ -153,7 +154,8 @@ fn check_write_access(state: &AppState, pubkey: &str) -> Result<(), Response<Bod
             }
 
             // Check follow distance (u32::MAX or very high value means not in graph)
-            if stats.follow_distance <= MAX_WRITE_DISTANCE {
+            let max_distance = state.max_write_distance;
+            if stats.follow_distance <= max_distance {
                 tracing::debug!(
                     "Blossom write allowed for {}... (distance: {}, muters: {})",
                     &pubkey[..8],
@@ -166,7 +168,7 @@ fn check_write_access(state: &AppState, pubkey: &str) -> Result<(), Response<Bod
                     "Blossom write denied for {}... (distance: {} > max: {})",
                     &pubkey[..8],
                     stats.follow_distance,
-                    MAX_WRITE_DISTANCE
+                    max_distance
                 );
                 Err(Response::builder()
                     .status(StatusCode::FORBIDDEN)
@@ -174,7 +176,7 @@ fn check_write_access(state: &AppState, pubkey: &str) -> Result<(), Response<Bod
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(format!(
                         r#"{{"error":"Not authorized. Your follow distance is {} but max allowed is {}. You need to be within {} degrees of separation from npub1g53mukxnjkcmr94fhryzkqutdz2ukq4ks0gvy5af25rgmwsl4ngq43drvk (follow them or be followed by someone they follow)."}}"#,
-                        stats.follow_distance, MAX_WRITE_DISTANCE, MAX_WRITE_DISTANCE
+                        stats.follow_distance, max_distance, max_distance
                     )))
                     .unwrap())
             }
@@ -885,8 +887,8 @@ mod tests {
 
     #[test]
     fn test_max_write_distance() {
-        // 3 degrees of separation
-        assert_eq!(MAX_WRITE_DISTANCE, 3);
+        // 3 degrees of separation (default)
+        assert_eq!(DEFAULT_MAX_WRITE_DISTANCE, 3);
     }
 
     #[test]

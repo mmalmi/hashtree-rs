@@ -5,6 +5,7 @@ use hashtree_lmdb::LmdbBlobStore;
 use hashtree_core::{
     HashTree, HashTreeConfig, Cid,
     sha256, to_hex, from_hex, TreeNode, DirEntry as HashTreeDirEntry,
+    types::Hash,
 };
 use hashtree_core::store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
@@ -1328,7 +1329,7 @@ impl HashtreeStore {
             let rtxn = self.env.read_txn()?;
             let mut has_other_tree = false;
 
-            for item in self.blob_trees.prefix_iter(&rtxn, blob_hash.as_slice())? {
+            for item in self.blob_trees.prefix_iter(&rtxn, &blob_hash[..])? {
                 if item.is_ok() {
                     has_other_tree = true;
                     break;

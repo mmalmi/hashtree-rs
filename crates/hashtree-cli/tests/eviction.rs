@@ -8,7 +8,7 @@
 //!
 //! Run with: cargo test --package hashtree-cli --test eviction -- --nocapture
 
-use hashtree::from_hex;
+use hashtree_core::from_hex;
 use hashtree_cli::storage::{HashtreeStore, PRIORITY_OWN, PRIORITY_FOLLOWED, PRIORITY_OTHER};
 use tempfile::TempDir;
 use std::thread;
@@ -136,7 +136,7 @@ fn test_eviction_under_limit() {
     assert_eq!(freed, 0, "Should not evict when under limit");
 
     // Blob should still exist
-    let hash_hex = hashtree::to_hex(&hash);
+    let hash_hex = hashtree_core::to_hex(&hash);
     assert!(store.blob_exists(&hash_hex).unwrap(), "Blob should still exist");
 }
 
@@ -184,7 +184,7 @@ fn test_pinned_tree_protection() {
     let data_pinned = vec![0u8; 200];
     let hash_pinned = add_blob(&store, &data_pinned);
     store.index_tree(&hash_pinned, "me", Some("pinned"), PRIORITY_OWN, None).unwrap();
-    let hash_pinned_hex = hashtree::to_hex(&hash_pinned);
+    let hash_pinned_hex = hashtree_core::to_hex(&hash_pinned);
     store.pin(&hash_pinned_hex).expect("Failed to pin");
 
     // Add other tree (evictable)
@@ -250,7 +250,7 @@ fn test_priority_order_eviction() {
     let data_own = vec![2u8; 150];
     let hash_own = add_blob(&store, &data_own);
     store.index_tree(&hash_own, "me", Some("own"), PRIORITY_OWN, None).unwrap();
-    let hash_own_hex = hashtree::to_hex(&hash_own);
+    let hash_own_hex = hashtree_core::to_hex(&hash_own);
     store.pin(&hash_own_hex).expect("Failed to pin");
 
     // Total is 450 bytes, limit is 400
@@ -282,7 +282,7 @@ fn test_unindex_tree() {
 
     // Verify it exists
     assert!(store.get_tree_meta(&hash).unwrap().is_some());
-    let hash_hex = hashtree::to_hex(&hash);
+    let hash_hex = hashtree_core::to_hex(&hash);
     assert!(store.blob_exists(&hash_hex).unwrap());
 
     // Unindex it
@@ -309,7 +309,7 @@ fn test_orphan_eviction_first() {
     // Add an orphan blob (not indexed as part of any tree)
     let orphan_data = vec![0u8; 200];
     let orphan_hash = add_blob(&store, &orphan_data);
-    let orphan_hex = hashtree::to_hex(&orphan_hash);
+    let orphan_hex = hashtree_core::to_hex(&orphan_hash);
 
     // Add an indexed tree
     let tree_data = vec![1u8; 200];
@@ -340,7 +340,7 @@ fn test_pinned_not_evicted_as_orphan() {
     // Add a pinned blob (not in any tree but pinned)
     let pinned_data = vec![0u8; 200];
     let pinned_hash = add_blob(&store, &pinned_data);
-    let pinned_hex = hashtree::to_hex(&pinned_hash);
+    let pinned_hex = hashtree_core::to_hex(&pinned_hash);
     store.pin(&pinned_hex).expect("Failed to pin");
 
     // Add another blob to push over limit

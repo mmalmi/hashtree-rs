@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
-#[cfg(feature = "encryption")]
 use hashtree_core::{decrypt, encrypt};
 
 const HASHTREE_KIND: u16 = 30078;

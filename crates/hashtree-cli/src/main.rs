@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
             // Set up server with ndb query sender for social graph
             let mut server = HashtreeServer::new(Arc::clone(&store), addr.clone())
                 .with_ndb_query(relay_handle.query.clone())
-                .with_max_write_distance(config.nostr.max_write_distance)
+                .with_max_write_distance(config.nostr.max_write_distance.unwrap_or(3))
                 .with_max_upload_bytes((config.blossom.max_upload_mb as usize) * 1024 * 1024)
                 .with_public_writes(config.server.public_writes)
                 .with_git(git_storage, hex::encode(pk_bytes));
@@ -970,7 +970,7 @@ async fn main() -> Result<()> {
                     println!("Utilization: {:.1}%", utilization);
                 }
                 StorageCommands::Trees => {
-                    use hashtree::to_hex;
+                    use hashtree_core::to_hex;
                     let trees = store.list_indexed_trees()?;
 
                     if trees.is_empty() {
@@ -1361,7 +1361,7 @@ async fn fetch_from_blossom(hash_hex: &str, servers: &[String]) -> Option<Vec<u8
 /// Background push to Blossom - fire and forget with server-level backoff
 /// Tries up to MAX_ATTEMPTS total, gives up and drops if still failing
 async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[String]) -> Result<()> {
-    use hashtree::to_hex;
+    use hashtree_core::to_hex;
     use sha2::{Sha256, Digest};
     use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
     use std::collections::HashMap;

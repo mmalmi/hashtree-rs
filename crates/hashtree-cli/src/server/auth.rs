@@ -21,6 +21,8 @@ pub struct AppState {
     /// Allow anyone with valid Nostr auth to write (default: true)
     /// When false, only social graph members can write
     pub public_writes: bool,
+    /// Maximum follow distance for write access (default: 3)
+    pub max_write_distance: u32,
 }
 
 #[derive(Clone)]
