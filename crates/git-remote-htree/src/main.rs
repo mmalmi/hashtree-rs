@@ -27,11 +27,11 @@ use helper::RemoteHelper;
 use nostr_client::resolve_identity;
 
 fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize logging - default to error, override with RUST_LOG=git_remote_htree=debug
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("git_remote_htree=debug".parse().unwrap()),
+                .add_directive("git_remote_htree=error".parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .init();

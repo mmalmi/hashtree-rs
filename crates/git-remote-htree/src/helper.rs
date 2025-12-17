@@ -404,36 +404,66 @@ impl RemoteHelper {
         }
     }
 
-    /// Write loose object directly to local git object store
-    /// The data is already zlib-compressed loose object format
+    /// Write loose object to local git object store
+    /// The data is zlib-compressed loose object format - decompress and use git hash-object
     fn write_git_object(&self, oid: &str, data: &[u8]) -> Result<()> {
-        use std::fs;
-        use std::io::Write;
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
 
         // Git objects are stored as .git/objects/xx/yy... where xx is first 2 chars
         if oid.len() < 3 {
             bail!("Invalid object id: {}", oid);
         }
 
-        let prefix = &oid[..2];
-        let suffix = &oid[2..];
+        // Decompress the zlib data to get the raw git object (header + content)
+        let mut decoder = ZlibDecoder::new(data);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)
+            .context("Failed to decompress git object")?;
 
-        // Find .git directory (current directory should be the repo)
-        let git_dir = std::env::current_dir()?.join(".git");
-        if !git_dir.exists() {
-            bail!("Not in a git repository (no .git directory)");
+        // Parse git object format: "<type> <size>\0<content>"
+        let null_pos = decompressed.iter().position(|&b| b == 0)
+            .context("Invalid git object: no null byte")?;
+
+        let header = std::str::from_utf8(&decompressed[..null_pos])
+            .context("Invalid git object header")?;
+
+        let content = &decompressed[null_pos + 1..];
+
+        // Parse header to get type
+        let parts: Vec<&str> = header.split(' ').collect();
+        if parts.len() != 2 {
+            bail!("Invalid git object header: {}", header);
+        }
+        let obj_type = parts[0];
+
+        // Use git hash-object to write the object - this works during clone
+        // because git sets GIT_DIR for the remote helper
+        let mut child = Command::new("git")
+            .args(["hash-object", "-w", "-t", obj_type, "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn git hash-object")?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(content)?;
         }
 
-        let object_dir = git_dir.join("objects").join(prefix);
-        fs::create_dir_all(&object_dir)?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git hash-object failed: {}", stderr);
+        }
 
-        let object_path = object_dir.join(suffix);
+        let written_oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if written_oid != oid {
+            warn!("Object hash mismatch: expected {}, got {}", oid, written_oid);
+        }
 
-        // Write the zlib-compressed loose object
-        let mut file = fs::File::create(&object_path)?;
-        file.write_all(data)?;
-
-        debug!("Wrote git object {} to {:?}", oid, object_path);
+        debug!("Wrote git object {} via hash-object", oid);
         Ok(())
     }
 

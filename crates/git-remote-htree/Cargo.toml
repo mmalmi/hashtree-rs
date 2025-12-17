@@ -38,6 +38,7 @@ toml = "0.8"
 
 # Utilities
 anyhow.workspace = true
+flate2 = "1"
 hex.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
