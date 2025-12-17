@@ -16,7 +16,6 @@ path = "src/main.rs"
 # Core hashtree crates
 hashtree-core.workspace = true
 hashtree-lmdb.workspace = true
-hashtree-nostr.workspace = true
 hashtree-git.workspace = true
 hashtree-resolver = { path = "../hashtree-resolver", features = ["nostr"] }
 
@@ -36,7 +35,6 @@ tower-http.workspace = true
 # Nostr
 nostr.workspace = true
 nostr-sdk.workspace = true
-hashtree-nostrdb.workspace = true
 
 # WebRTC
 webrtc = "0.11"

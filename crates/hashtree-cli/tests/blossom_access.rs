@@ -43,7 +43,6 @@ enable_webrtc = false
 
 [nostr]
 relays = []
-crawl_depth = 0
 "#, enable_auth);
         std::fs::write(config_dir.join("config.toml"), config_content)
             .expect("Failed to write config");
@@ -365,37 +364,5 @@ fn test_list_blobs() {
     );
 }
 
-/// Test upload with hardcoded subscriber pubkey
-/// This requires using one of the actual hardcoded pubkeys which we shouldn't have the private key for
-/// So we just verify the check exists by testing with a non-subscriber key
-#[test]
-fn test_hardcoded_subscriber_check_exists() {
-    // This test verifies the access control logic exists
-    // We can't test actual subscriber access without their private keys
-
-    use hashtree_cli::server::blossom::{HARDCODED_SUBSCRIBERS, SOCIAL_GRAPH_ROOT, DEFAULT_MAX_WRITE_DISTANCE};
-
-    // Verify constants are set correctly
-    assert!(!HARDCODED_SUBSCRIBERS.is_empty(), "Should have hardcoded subscribers");
-    assert!(HARDCODED_SUBSCRIBERS.contains(SOCIAL_GRAPH_ROOT), "Root should be in subscribers");
-    assert_eq!(DEFAULT_MAX_WRITE_DISTANCE, 3, "Max distance should be 3");
-    assert_eq!(SOCIAL_GRAPH_ROOT.len(), 64, "Root pubkey should be 64 hex chars");
-}
-
-/// Test overmuted helper function
-#[test]
-fn test_overmuted_function() {
-    use hashtree_cli::server::blossom::{is_overmuted, OVERMUTED_RATIO, OVERMUTED_MIN_MUTERS};
-
-    // Verify constants
-    assert_eq!(OVERMUTED_RATIO, 0.1);
-    assert_eq!(OVERMUTED_MIN_MUTERS, 5);
-
-    // Test the function
-    assert!(!is_overmuted(0, 100), "0 muters should not be overmuted");
-    assert!(!is_overmuted(4, 100), "Below min muters should not be overmuted");
-    assert!(!is_overmuted(5, 100), "5% should not be overmuted");
-    assert!(is_overmuted(10, 100), "10% should be overmuted");
-    assert!(is_overmuted(50, 100), "50% should be overmuted");
-    assert!(!is_overmuted(10, 0), "0 followers should not be overmuted");
-}
+// Social graph tests removed - nostrdb dependency has been removed
+// Access control now uses allowed_npubs config + public_writes flag

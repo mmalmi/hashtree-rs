@@ -18,11 +18,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
 use hashtree_cli::{
-    init_nostrdb_at, spawn_relay_thread, BackgroundSync, Config, GitStorage, HashtreeServer, HashtreeStore,
-    NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RelayConfig, RootResolver,
+    BackgroundSync, Config, GitStorage, HashtreeServer, HashtreeStore,
+    NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RootResolver,
     WebRTCConfig, WebRTCManager,
 };
 use nostr::nips::nip19::ToBech32;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -186,40 +187,24 @@ async fn main() -> Result<()> {
             let max_size_bytes = config.storage.max_size_gb * 1024 * 1024 * 1024;
             let store = Arc::new(HashtreeStore::with_options(&data_dir, config.storage.s3.as_ref(), max_size_bytes)?);
 
-            // Initialize nostrdb for event storage
-            let nostrdb_path = data_dir.join("nostrdb");
-            let ndb = init_nostrdb_at(&nostrdb_path)
-                .context("Failed to initialize nostrdb")?;
-
             // Ensure nsec exists (generate if needed)
             let (keys, was_generated) = ensure_nsec()?;
             let pk_bytes = pubkey_bytes(&keys);
             let npub = keys.public_key().to_bech32()
                 .context("Failed to encode npub")?;
 
-            // Determine social graph root (from config or local nsec)
-            let (root_pubkey, root_npub) = if let Some(ref npub_str) = config.nostr.socialgraph_root {
-                let root_pk = parse_npub(npub_str)
-                    .context("Invalid socialgraph_root npub in config")?;
-                (root_pk, npub_str.clone())
-            } else {
-                (pk_bytes, npub.clone())
-            };
-
-            // Set social graph root
-            hashtree_nostrdb::socialgraph::set_root(&ndb, &root_pubkey);
-
-            // Start relay connections (outbound)
-            // Crawl social graph starting from root user
-            let relay_config = RelayConfig {
-                relays: config.nostr.relays.clone(),
-                authors: vec![pk_bytes], // Subscribe to own events
-                root_pubkey: Some(root_pubkey),
-                crawl_seeds: if config.nostr.crawl_depth > 0 { vec![root_pubkey] } else { vec![] },
-                crawl_depth: config.nostr.crawl_depth,
-                ..Default::default()
-            };
-            let relay_handle = spawn_relay_thread(ndb.clone(), relay_config);
+            // Convert allowed_npubs to hex pubkeys for blossom access control
+            let mut allowed_pubkeys: HashSet<String> = HashSet::new();
+            // Always allow own pubkey
+            allowed_pubkeys.insert(hex::encode(pk_bytes));
+            // Add configured allowed npubs
+            for npub_str in &config.nostr.allowed_npubs {
+                if let Ok(pk) = parse_npub(npub_str) {
+                    allowed_pubkeys.insert(hex::encode(pk));
+                } else {
+                    tracing::warn!("Invalid npub in allowed_npubs: {}", npub_str);
+                }
+            }
 
             // Initialize git storage at shared data directory
             let git_storage = Arc::new(GitStorage::open(&data_dir)
@@ -243,31 +228,14 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 };
 
-                // Create peer classifier based on social graph
-                // Distance 0 = self, 1 = direct follow/follower -> Follows pool
-                // Distance > 1 or unknown -> Other pool
-                let ndb_for_classifier = ndb.clone();
+                // Create peer classifier based on local contacts file
                 let contacts_file = data_dir.join("contacts.json");
                 let peer_classifier: hashtree_cli::PeerClassifier = Arc::new(move |pubkey_hex: &str| {
-                    // First check local contacts.json file (updated by htree follow command)
+                    // Check local contacts.json file (updated by htree follow command)
                     if contacts_file.exists() {
                         if let Ok(data) = std::fs::read_to_string(&contacts_file) {
                             if let Ok(contacts) = serde_json::from_str::<Vec<String>>(&data) {
                                 if contacts.contains(&pubkey_hex.to_string()) {
-                                    return PeerPool::Follows;
-                                }
-                            }
-                        }
-                    }
-
-                    // Fall back to nostrdb social graph
-                    if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
-                        if pubkey_bytes.len() == 32 {
-                            let pk: [u8; 32] = pubkey_bytes.try_into().unwrap();
-                            if let Ok(txn) = hashtree_nostrdb::Transaction::new(&ndb_for_classifier) {
-                                let distance = hashtree_nostrdb::socialgraph::get_follow_distance(&txn, &ndb_for_classifier, &pk);
-                                // Distance 0 = self (skip), 1 = direct follow/follower
-                                if distance == 1 {
                                     return PeerPool::Follows;
                                 }
                             }
@@ -297,10 +265,9 @@ async fn main() -> Result<()> {
                 (None, None)
             };
 
-            // Set up server with ndb query sender for social graph
+            // Set up server with allowed pubkeys for blossom write access
             let mut server = HashtreeServer::new(Arc::clone(&store), addr.clone())
-                .with_ndb_query(relay_handle.query.clone())
-                .with_max_write_distance(config.nostr.max_write_distance.unwrap_or(3))
+                .with_allowed_pubkeys(allowed_pubkeys.clone())
                 .with_max_upload_bytes((config.blossom.max_upload_mb as usize) * 1024 * 1024)
                 .with_public_writes(config.server.public_writes)
                 .with_git(git_storage, hex::encode(pk_bytes));
@@ -372,23 +339,18 @@ async fn main() -> Result<()> {
             // Print startup info
             println!("Starting hashtree daemon on {}", addr);
             println!("Data directory: {}", data_dir.display());
-            println!("Nostrdb: {}", nostrdb_path.display());
             if was_generated {
                 println!("Identity: {} (new)", npub);
             } else {
                 println!("Identity: {}", npub);
             }
-            if root_npub != npub {
-                println!("Social graph root: {}", root_npub);
+            if !config.nostr.allowed_npubs.is_empty() {
+                println!("Allowed writers: {} npubs", config.nostr.allowed_npubs.len());
             }
-            if config.nostr.crawl_depth > 0 {
-                println!("Crawl depth: {}", config.nostr.crawl_depth);
-            }
-            if let Some(max_dist) = config.nostr.max_write_distance {
-                println!("Write access: social graph distance <= {}", max_dist);
+            if config.server.public_writes {
+                println!("Public writes: enabled");
             }
             println!("Relays: {} configured", config.nostr.relays.len());
-            println!("Nostr relay: ws://{}", addr);
             println!("Git remote: http://{}/git/<pubkey>/<repo>", addr);
             if let Some(ref handle) = stun_handle {
                 println!("STUN server: {}", handle.addr);
@@ -437,9 +399,6 @@ async fn main() -> Result<()> {
             if let Some(handle) = stun_handle {
                 handle.shutdown();
             }
-
-            // Shutdown relay thread
-            relay_handle.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         Commands::Add { path, only_hash, public, no_ignore, publish, local } => {
             let is_dir = path.is_dir();

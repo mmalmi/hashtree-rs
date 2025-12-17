@@ -16,6 +16,7 @@ use axum::{
 use crate::storage::HashtreeStore;
 use crate::webrtc::WebRTCState;
 use hashtree_git::GitStorage;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub use auth::{AppState, AuthCredentials};
@@ -33,11 +34,10 @@ impl HashtreeServer {
             state: AppState {
                 store,
                 auth: None,
-                ndb_query: None,
                 webrtc_peers: None,
                 max_upload_bytes: 5 * 1024 * 1024, // 5 MB default
                 public_writes: true, // Allow anyone with valid Nostr auth by default
-                max_write_distance: 3, // Default: up to 3rd degree
+                allowed_pubkeys: HashSet::new(), // No pubkeys allowed by default (use public_writes)
             },
             git_storage: None,
             local_pubkey: None,
@@ -76,14 +76,9 @@ impl HashtreeServer {
         self
     }
 
-    pub fn with_ndb_query(mut self, query: hashtree_nostr::NdbQuerySender) -> Self {
-        self.state.ndb_query = Some(query);
-        self
-    }
-
-    /// Set maximum follow distance for write access
-    pub fn with_max_write_distance(mut self, distance: u32) -> Self {
-        self.state.max_write_distance = distance;
+    /// Set allowed pubkeys for blossom write access (hex format)
+    pub fn with_allowed_pubkeys(mut self, pubkeys: HashSet<String>) -> Self {
+        self.state.allowed_pubkeys = pubkeys;
         self
     }
 

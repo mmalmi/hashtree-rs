@@ -562,24 +562,11 @@ pub async fn garbage_collect(State(state): State<AppState>) -> impl IntoResponse
     }
 }
 
-pub async fn socialgraph_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let Some(query) = &state.ndb_query else {
-        return Json(json!({
-            "error": "nostrdb not configured"
-        }));
-    };
-
-    // Query social graph stats for root user via channel to ndb thread
-    match query.socialgraph_root_stats() {
-        Ok(stats) => Json(json!({
-            "following_count": stats.following_count,
-            "followers_count": stats.followers_count,
-            "follow_distance": stats.follow_distance,
-        })),
-        Err(e) => Json(json!({
-            "error": e.to_string()
-        })),
-    }
+pub async fn socialgraph_stats(State(_state): State<AppState>) -> impl IntoResponse {
+    // Social graph via nostrdb has been removed - return empty stats
+    Json(json!({
+        "message": "Social graph stats not available (nostrdb removed)"
+    }))
 }
 
 /// Timeout for HTTP resolver requests

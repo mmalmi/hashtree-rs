@@ -6,23 +6,22 @@ use axum::{
 };
 use crate::storage::HashtreeStore;
 use crate::webrtc::WebRTCState;
-use hashtree_nostr::NdbQuerySender;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<HashtreeStore>,
     pub auth: Option<AuthCredentials>,
-    pub ndb_query: Option<NdbQuerySender>,
     /// WebRTC peer state for forwarding requests to connected P2P peers
     pub webrtc_peers: Option<Arc<WebRTCState>>,
     /// Maximum upload size in bytes for Blossom uploads (default: 5 MB)
     pub max_upload_bytes: usize,
     /// Allow anyone with valid Nostr auth to write (default: true)
-    /// When false, only social graph members can write
+    /// When false, only allowed_pubkeys can write
     pub public_writes: bool,
-    /// Maximum follow distance for write access (default: 3)
-    pub max_write_distance: u32,
+    /// Pubkeys allowed to write (hex format, from config allowed_npubs)
+    pub allowed_pubkeys: HashSet<String>,
 }
 
 #[derive(Clone)]

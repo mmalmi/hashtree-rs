@@ -84,16 +84,9 @@ fn default_s3_region() -> String {
 pub struct NostrConfig {
     #[serde(default = "default_relays")]
     pub relays: Vec<String>,
-    /// Social graph root npub (for crawling follows). If not set, uses the local nsec's pubkey.
+    /// List of npubs allowed to write (blossom uploads). If empty, uses public_writes setting.
     #[serde(default)]
-    pub socialgraph_root: Option<String>,
-    /// Crawl depth for social graph (0 = disabled, 1 = direct follows, 2 = friends of friends, etc)
-    #[serde(default = "default_crawl_depth")]
-    pub crawl_depth: u32,
-    /// Maximum follow distance for write access to relay (None = no restriction)
-    /// 0 = only root user, 1 = root + direct follows, 2 = friends of friends, etc.
-    #[serde(default)]
-    pub max_write_distance: Option<u32>,
+    pub allowed_npubs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,10 +164,6 @@ fn default_blossom_timeout_ms() -> u64 {
     10000
 }
 
-fn default_crawl_depth() -> u32 {
-    3
-}
-
 fn default_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".to_string(),
@@ -237,9 +226,7 @@ impl Default for NostrConfig {
     fn default() -> Self {
         Self {
             relays: default_relays(),
-            socialgraph_root: None,
-            crawl_depth: default_crawl_depth(),
-            max_write_distance: None,
+            allowed_npubs: Vec::new(),
         }
     }
 }
@@ -329,42 +316,9 @@ pub fn get_auth_cookie_path() -> PathBuf {
     get_hashtree_dir().join("auth.cookie")
 }
 
-/// Get the nostrdb directory (~/.hashtree/nostrdb)
-pub fn get_nostrdb_dir() -> PathBuf {
-    get_hashtree_dir().join("nostrdb")
-}
-
 /// Get the nsec file path (~/.hashtree/nsec)
 pub fn get_nsec_path() -> PathBuf {
     get_hashtree_dir().join("nsec")
-}
-
-/// Initialize nostrdb with reasonable defaults (similar to notedeck)
-pub fn init_nostrdb() -> Result<hashtree_nostrdb::Ndb> {
-    init_nostrdb_at(get_nostrdb_dir())
-}
-
-/// Initialize nostrdb at a specific path
-pub fn init_nostrdb_at<P: AsRef<std::path::Path>>(path: P) -> Result<hashtree_nostrdb::Ndb> {
-    let db_path = path.as_ref();
-
-    // Create directory if needed
-    fs::create_dir_all(db_path)?;
-
-    // Map size: 1 TiB on unix (virtual), 16 GiB on windows (actual file)
-    let map_size = if cfg!(target_os = "windows") {
-        1024 * 1024 * 1024 * 16 // 16 GiB
-    } else {
-        1024 * 1024 * 1024 * 1024 // 1 TiB
-    };
-
-    let config = hashtree_nostrdb::Config::new()
-        .set_ingester_threads(2)
-        .set_mapsize(map_size);
-
-    let db_path_str = db_path.to_string_lossy();
-    hashtree_nostrdb::Ndb::new(&db_path_str, &config)
-        .context("Failed to initialize nostrdb")
 }
 
 /// Generate and save auth cookie if it doesn't exist

@@ -36,6 +36,19 @@ pub struct TreeMeta {
     pub priority: u8,
 }
 
+/// Cached root info from Nostr events (replaces nostrdb caching)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedRoot {
+    /// Root hash (hex)
+    pub hash: String,
+    /// Optional decryption key (hex)
+    pub key: Option<String>,
+    /// Unix timestamp when this was cached (from event created_at)
+    pub updated_at: u64,
+    /// Visibility: "public" or "private"
+    pub visibility: String,
+}
+
 #[cfg(feature = "s3")]
 use tokio::sync::mpsc;
 
@@ -304,6 +317,8 @@ pub struct HashtreeStore {
     blob_trees: Database<Bytes, Unit>,
     /// Tree refs: "npub/path" -> tree_root_hash (32 bytes) - for replacing old versions
     tree_refs: Database<Str, Bytes>,
+    /// Cached roots from Nostr: "pubkey_hex/tree_name" -> CachedRoot (msgpack)
+    cached_roots: Database<Str, Bytes>,
     /// Storage router - handles LMDB + optional S3
     router: StorageRouter,
     /// Maximum storage size in bytes (from config)
@@ -329,7 +344,7 @@ impl HashtreeStore {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(10 * 1024 * 1024 * 1024) // 10GB virtual address space
-                .max_dbs(8)  // pins, sha256_index, blob_owners, pubkey_blobs, tree_meta, blob_trees, tree_refs, blobs
+                .max_dbs(9)  // pins, sha256_index, blob_owners, pubkey_blobs, tree_meta, blob_trees, tree_refs, cached_roots, blobs
                 .open(path)?
         };
 
@@ -341,6 +356,7 @@ impl HashtreeStore {
         let tree_meta = env.create_database(&mut wtxn, Some("tree_meta"))?;
         let blob_trees = env.create_database(&mut wtxn, Some("blob_trees"))?;
         let tree_refs = env.create_database(&mut wtxn, Some("tree_refs"))?;
+        let cached_roots = env.create_database(&mut wtxn, Some("cached_roots"))?;
         wtxn.commit()?;
 
         // Create local LMDB blob store
@@ -377,6 +393,7 @@ impl HashtreeStore {
             tree_meta,
             blob_trees,
             tree_refs,
+            cached_roots,
             router,
             max_size_bytes,
         })
@@ -1606,6 +1623,74 @@ impl HashtreeStore {
             pinned_dags: total_pins,
             total_bytes: stats.total_bytes,
         })
+    }
+
+    // === Cached roots (replaces nostrdb event caching) ===
+
+    /// Get cached root for a pubkey/tree_name pair
+    pub fn get_cached_root(&self, pubkey_hex: &str, tree_name: &str) -> Result<Option<CachedRoot>> {
+        let key = format!("{}/{}", pubkey_hex, tree_name);
+        let rtxn = self.env.read_txn()?;
+        if let Some(bytes) = self.cached_roots.get(&rtxn, &key)? {
+            let root: CachedRoot = rmp_serde::from_slice(bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize CachedRoot: {}", e))?;
+            Ok(Some(root))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set cached root for a pubkey/tree_name pair
+    pub fn set_cached_root(
+        &self,
+        pubkey_hex: &str,
+        tree_name: &str,
+        hash: &str,
+        key: Option<&str>,
+        visibility: &str,
+        updated_at: u64,
+    ) -> Result<()> {
+        let db_key = format!("{}/{}", pubkey_hex, tree_name);
+        let root = CachedRoot {
+            hash: hash.to_string(),
+            key: key.map(|k| k.to_string()),
+            updated_at,
+            visibility: visibility.to_string(),
+        };
+        let bytes = rmp_serde::to_vec(&root)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize CachedRoot: {}", e))?;
+        let mut wtxn = self.env.write_txn()?;
+        self.cached_roots.put(&mut wtxn, &db_key, &bytes)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// List all cached roots for a pubkey
+    pub fn list_cached_roots(&self, pubkey_hex: &str) -> Result<Vec<(String, CachedRoot)>> {
+        let prefix = format!("{}/", pubkey_hex);
+        let rtxn = self.env.read_txn()?;
+        let mut results = Vec::new();
+
+        for item in self.cached_roots.iter(&rtxn)? {
+            let (key, bytes) = item?;
+            if key.starts_with(&prefix) {
+                let tree_name = key.strip_prefix(&prefix).unwrap_or(key);
+                let root: CachedRoot = rmp_serde::from_slice(bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize CachedRoot: {}", e))?;
+                results.push((tree_name.to_string(), root));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Delete a cached root
+    pub fn delete_cached_root(&self, pubkey_hex: &str, tree_name: &str) -> Result<bool> {
+        let key = format!("{}/{}", pubkey_hex, tree_name);
+        let mut wtxn = self.env.write_txn()?;
+        let deleted = self.cached_roots.delete(&mut wtxn, &key)?;
+        wtxn.commit()?;
+        Ok(deleted)
     }
 
     /// Garbage collect unpinned content

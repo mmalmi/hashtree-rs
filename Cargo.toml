@@ -30,7 +30,6 @@ uuid = { version = "1.0", features = ["v4"] }
 # Internal (path for local dev, version for publishing)
 hashtree-core = { path = "crates/hashtree", version = "0.1.0" }
 hashtree-lmdb = { path = "crates/hashtree-lmdb", version = "0.1.0" }
-hashtree-nostr = { path = "crates/hashtree-nostr", version = "0.1.0" }
 hashtree-git = { path = "crates/hashtree-git", version = "0.1.0" }
 hashtree-s3 = { path = "crates/hashtree-s3", version = "0.1.0" }
 hashtree-blossom = { path = "crates/hashtree-blossom", version = "0.1.0" }
@@ -50,7 +49,6 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 
 # Nostr
 nostr = { version = "0.37", features = ["nip44"] }
-hashtree-nostrdb = { path = "crates/hashtree-nostrdb", version = "0.1.0" }
 
 # Utilities
 anyhow = "1"
