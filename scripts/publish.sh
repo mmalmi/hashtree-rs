@@ -16,7 +16,7 @@ if [[ "$1" == "--dry-run" ]]; then
 fi
 
 # Wait time between publishes for crates.io indexing (seconds)
-WAIT_TIME=60
+WAIT_TIME=30
 
 publish_crate() {
     local crate=$1
