@@ -109,7 +109,7 @@ pub fn handle_upload_pack(storage: &GitStorage, body: &[u8]) -> Result<Vec<u8>> 
     let mut reader = PktLineReader::new(body);
     let mut wants = Vec::new();
     let mut haves = Vec::new();
-    let mut done = false;
+    let mut _done = false;
 
     // Parse want/have lines
     while let Some(pkt) = reader.read()? {
@@ -130,7 +130,7 @@ pub fn handle_upload_pack(storage: &GitStorage, body: &[u8]) -> Result<Vec<u8>> 
                         haves.push(oid);
                     }
                 } else if line == "done" {
-                    done = true;
+                    _done = true;
                 }
             }
             _ => {}
@@ -145,7 +145,7 @@ pub fn handle_upload_pack(storage: &GitStorage, body: &[u8]) -> Result<Vec<u8>> 
             if let PktLine::Data(data) = pkt {
                 let line = std::str::from_utf8(data).unwrap_or("").trim();
                 if line == "done" {
-                    done = true;
+                    _done = true;
                 } else if let Some(oid_hex) = line.strip_prefix("have ") {
                     if let Some(oid) = ObjectId::from_hex(oid_hex.trim()) {
                         haves.push(oid);

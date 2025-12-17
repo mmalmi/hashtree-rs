@@ -34,6 +34,7 @@ pub struct InfoRefsQuery {
     service: String,
 }
 
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 pub struct GitPath {
     pub pubkey: String,

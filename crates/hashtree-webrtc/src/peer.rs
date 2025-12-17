@@ -54,6 +54,7 @@ struct PendingRequest {
 /// Request this peer sent TO US that we couldn't fulfill locally
 /// We track it so we can push data back when/if we get it from another peer
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TheirRequest {
     /// Their request ID (for response correlation)
     id: u32,

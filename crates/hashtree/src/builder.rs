@@ -235,6 +235,7 @@ impl<S: Store> TreeBuilder<S> {
 
     /// Build a balanced tree from links
     /// Handles fanout by creating intermediate nodes
+    #[allow(dead_code)]
     async fn build_tree(&self, links: Vec<Link>, total_size: Option<u64>) -> Result<Hash, BuilderError> {
         // Single link with matching size - return it directly
         if links.len() == 1 {

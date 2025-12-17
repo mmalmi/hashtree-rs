@@ -242,6 +242,7 @@ impl NostrClient {
     }
 
     /// Check if we can sign (have secret key for this pubkey)
+    #[allow(dead_code)]
     pub fn can_sign(&self) -> bool {
         self.secret_key.is_some()
     }

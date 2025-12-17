@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use super::peer::{ContentStore, Peer, PendingRequest};
 use super::types::{
-    generate_uuid, PeerDirection, PeerId, PeerPool, PeerStatus, PoolConfig, SignalingMessage, WebRTCConfig, WEBRTC_TAG,
+    generate_uuid, PeerDirection, PeerId, PeerPool, PeerStatus, SignalingMessage, WebRTCConfig, WEBRTC_TAG,
 };
 
 /// Callback type for classifying peers into pools
@@ -119,7 +119,7 @@ impl WebRTCState {
         };
 
         // Query peers sequentially with 500ms delay between each
-        for (i, (peer_id, pending_requests, dc)) in connected_peers.into_iter().enumerate() {
+        for (_i, (peer_id, pending_requests, dc)) in connected_peers.into_iter().enumerate() {
             debug!("Querying peer {} for {}", peer_id, &hash_hex[..8.min(hash_hex.len())]);
 
             // Create response channel
@@ -325,6 +325,7 @@ impl WebRTCManager {
     }
 
     /// Check if a pool is satisfied
+    #[allow(dead_code)]
     fn is_pool_satisfied(&self, pool: PeerPool, pool_counts: &(usize, usize, usize, usize)) -> bool {
         let (follows_connected, _, other_connected, _) = *pool_counts;
         match pool {
@@ -334,6 +335,7 @@ impl WebRTCManager {
     }
 
     /// Check if both pools are satisfied
+    #[allow(dead_code)]
     fn is_satisfied(&self, pool_counts: &(usize, usize, usize, usize)) -> bool {
         self.is_pool_satisfied(PeerPool::Follows, pool_counts)
             && self.is_pool_satisfied(PeerPool::Other, pool_counts)
@@ -987,6 +989,7 @@ impl WebRTCManager {
 }
 
 // Keep the old PeerState for backward compatibility with tests
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PeerState {
     pub peer_id: PeerId,

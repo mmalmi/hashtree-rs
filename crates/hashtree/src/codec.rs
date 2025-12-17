@@ -69,7 +69,7 @@ struct WireLink {
 
 /// Helper module for optional bytes serialization
 mod option_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(data: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
     where

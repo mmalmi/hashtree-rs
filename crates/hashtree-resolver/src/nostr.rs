@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
 #[cfg(feature = "encryption")]
-use hashtree_core::{decrypt, encrypt, key_from_hex, key_to_hex};
+use hashtree_core::{decrypt, encrypt};
 
 const HASHTREE_KIND: u16 = 30078;
 const HASHTREE_LABEL: &str = "hashtree";
@@ -54,6 +54,7 @@ impl Default for NostrResolverConfig {
 /// Tag names for hashtree events
 const TAG_HASH: &str = "hash";
 const TAG_KEY: &str = "key";
+#[allow(dead_code)]
 const TAG_ENCRYPTED_KEY: &str = "encrypted_key";
 
 /// Subscription state

@@ -4,7 +4,7 @@ use heed::types::*;
 use hashtree_lmdb::LmdbBlobStore;
 use hashtree_core::{
     HashTree, HashTreeConfig, Cid,
-    sha256, to_hex, from_hex, Hash, TreeNode, DirEntry as HashTreeDirEntry,
+    sha256, to_hex, from_hex, TreeNode, DirEntry as HashTreeDirEntry,
 };
 use hashtree_core::store::Store;
 use std::path::Path;

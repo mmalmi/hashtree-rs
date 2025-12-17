@@ -3,7 +3,6 @@
 //! Core principle: Every node is stored by SHA256(msgpack(node)) -> msgpack(node)
 //! This enables pure KV content-addressed storage.
 
-use std::collections::HashMap;
 
 /// Link type - distinguishes blobs, chunked files, and directories
 /// Uses small integer values for efficient MessagePack encoding

@@ -5,7 +5,6 @@ use heed::types::*;
 use heed::{Database, EnvOpenOptions};
 use hashtree_core::store::{Store, StoreError};
 use hashtree_core::types::Hash;
-use hashtree_core::hash::sha256;
 use std::path::Path;
 
 // Re-export sha256 for convenience

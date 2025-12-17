@@ -80,6 +80,7 @@ impl Default for SyncConfig {
 }
 
 /// State for a subscribed tree
+#[allow(dead_code)]
 struct TreeSubscription {
     key: String,
     current_cid: Option<Cid>,

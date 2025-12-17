@@ -15,5 +15,6 @@ tokio = { workspace = true, features = ["sync", "time"] }
 nostr-sdk = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["encryption"]
 nostr = ["nostr-sdk"]
+encryption = ["hashtree-core/encryption"]
