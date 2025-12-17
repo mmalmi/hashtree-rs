@@ -19,7 +19,7 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use hashtree::{sha256, HashTree, HashTreeConfig, DirEntry, Store, Cid, LinkType};
+use hashtree_core::{sha256, HashTree, HashTreeConfig, DirEntry, Store, Cid, LinkType};
 use hashtree_lmdb::LmdbBlobStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};

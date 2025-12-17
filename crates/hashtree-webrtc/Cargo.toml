@@ -7,7 +7,7 @@ description = "WebRTC P2P transport for hashtree using Nostr relay signaling"
 keywords = ["merkle", "webrtc", "p2p", "nostr", "hashtree"]
 
 [dependencies]
-hashtree.workspace = true
+hashtree-core.workspace = true
 webrtc.workspace = true
 nostr-sdk.workspace = true
 tokio.workspace = true

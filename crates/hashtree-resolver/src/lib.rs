@@ -22,7 +22,7 @@
 //! async fn example(resolver: impl RootResolver) {
 //!     // One-shot resolve
 //!     if let Some(hash) = resolver.resolve("npub1.../mydata").await.unwrap() {
-//!         println!("Found hash: {}", hashtree::to_hex(&hash));
+//!         println!("Found hash: {}", hashtree_core::to_hex(&hash));
 //!     }
 //!
 //!     // Subscribe to updates (returns a channel receiver)

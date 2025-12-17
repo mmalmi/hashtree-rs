@@ -6,7 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use hashtree::{nhash_decode, to_hex};
+use hashtree_core::{nhash_decode, to_hex};
 use hashtree_resolver::{nostr::{NostrRootResolver, NostrResolverConfig}, RootResolver};
 use serde_json::json;
 use std::sync::Arc;

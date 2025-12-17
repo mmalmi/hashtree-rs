@@ -1,4 +1,5 @@
 pub mod config;
+pub mod fetch;
 pub mod server;
 pub mod storage;
 pub mod sync;
@@ -14,5 +15,6 @@ pub use hashtree_resolver::nostr::{NostrRootResolver, NostrResolverConfig};
 pub use hashtree_resolver::{Keys as NostrKeys, ResolverEntry, ResolverError, RootResolver, ToBech32 as NostrToBech32};
 pub use server::HashtreeServer;
 pub use storage::HashtreeStore;
+pub use fetch::{FetchConfig, Fetcher};
 pub use sync::{BackgroundSync, SyncConfig, SyncPriority, SyncStatus, SyncTask};
 pub use webrtc::{ContentStore, DataMessage, PeerClassifier, PeerId, PeerPool, PoolConfig, PoolSettings, WebRTCConfig, WebRTCManager, WebRTCState};

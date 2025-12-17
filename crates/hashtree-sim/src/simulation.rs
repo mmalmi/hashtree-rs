@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use crate::flooding::{FloodingConfig, FloodingStore, RoutingStrategy};
 use crate::relay::{MockRelay, RelayClient};
 use crate::store::NetworkStore;
-use hashtree::{HashTree, HashTreeConfig};
+use hashtree_core::{HashTree, HashTreeConfig};
 
 /// Simulation configuration
 #[derive(Clone)]

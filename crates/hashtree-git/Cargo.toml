@@ -7,7 +7,7 @@ description = "Git smart HTTP protocol implementation for hashtree"
 
 [dependencies]
 # Hashtree storage
-hashtree.workspace = true
+hashtree-core.workspace = true
 hashtree-lmdb.workspace = true
 
 # Async runtime

@@ -25,7 +25,7 @@ futures = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 
 # Internal
-hashtree = { path = "crates/hashtree" }
+hashtree-core = { path = "crates/hashtree" }
 hashtree-lmdb = { path = "crates/hashtree-lmdb" }
 hashtree-relay = { path = "crates/hashtree-relay" }
 hashtree-git = { path = "crates/hashtree-git" }

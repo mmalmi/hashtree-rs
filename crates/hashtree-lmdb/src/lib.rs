@@ -3,13 +3,13 @@
 use async_trait::async_trait;
 use heed::types::*;
 use heed::{Database, EnvOpenOptions};
-use hashtree::store::{Store, StoreError};
-use hashtree::types::Hash;
-use hashtree::hash::sha256;
+use hashtree_core::store::{Store, StoreError};
+use hashtree_core::types::Hash;
+use hashtree_core::hash::sha256;
 use std::path::Path;
 
 // Re-export sha256 for convenience
-pub use hashtree::hash::sha256 as compute_sha256;
+pub use hashtree_core::hash::sha256 as compute_sha256;
 
 /// LMDB-backed blob store implementing hashtree's Store trait.
 pub struct LmdbBlobStore {

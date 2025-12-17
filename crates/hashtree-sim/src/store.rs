@@ -5,7 +5,7 @@
 //! - Different NetworkStore implementations for different routing strategies
 
 use async_trait::async_trait;
-use hashtree::{Hash, Store, StoreError};
+use hashtree_core::{Hash, Store, StoreError};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -118,7 +118,7 @@ pub trait NetworkStore: Store + Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hashtree::{sha256, HashTree, HashTreeConfig};
+    use hashtree_core::{sha256, HashTree, HashTreeConfig};
 
     #[tokio::test]
     async fn test_sim_store_basic() {

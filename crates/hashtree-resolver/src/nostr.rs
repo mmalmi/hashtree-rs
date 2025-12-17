@@ -13,7 +13,7 @@
 
 use crate::{ResolverEntry, ResolverError, RootResolver};
 use async_trait::async_trait;
-use hashtree::{from_hex, to_hex, Cid};
+use hashtree_core::{from_hex, to_hex, Cid};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
 #[cfg(feature = "encryption")]
-use hashtree::{decrypt, encrypt, key_from_hex, key_to_hex};
+use hashtree_core::{decrypt, encrypt, key_from_hex, key_to_hex};
 
 const HASHTREE_KIND: u16 = 30078;
 const HASHTREE_LABEL: &str = "hashtree";

@@ -4,7 +4,7 @@
 //!
 //! ## Architecture
 //!
-//! - `SimStore` - local-only storage (implements hashtree::Store)
+//! - `SimStore` - local-only storage (implements hashtree_core::Store)
 //! - `FloodingStore` - complete P2P node with signaling + multi-hop forwarding (like WebRTCStore)
 //! - `SequentialStore` - sends to one peer at a time, forwards if not found locally
 //! - `MockRelay` - Nostr-like relay for signaling
@@ -46,4 +46,4 @@ pub use store::{NetworkStore, SimStore};
 pub type NodeId = u64;
 
 // Re-export hashtree types for convenience
-pub use hashtree::{Cid, HashTree, HashTreeConfig, MemoryStore, Store};
+pub use hashtree_core::{Cid, HashTree, HashTreeConfig, MemoryStore, Store};

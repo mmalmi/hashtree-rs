@@ -3,7 +3,7 @@
 //! These tests connect to actual Nostr relays for signaling and establish
 //! WebRTC connections between peers.
 
-use hashtree::MemoryStore;
+use hashtree_core::MemoryStore;
 use hashtree_webrtc::{WebRTCStore, WebRTCStoreConfig};
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
@@ -99,7 +99,7 @@ async fn test_peer_discovery() {
 
 #[tokio::test]
 async fn test_data_transfer_between_peers() {
-    use hashtree::{Store, sha256};
+    use hashtree_core::{Store, sha256};
 
     // Store1 has data, store2 fetches it via WebRTC
     let store1_local = Arc::new(MemoryStore::new());

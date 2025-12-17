@@ -14,7 +14,7 @@ path = "src/main.rs"
 hashtree-git.workspace = true
 
 # Content-addressed storage
-hashtree.workspace = true
+hashtree-core.workspace = true
 hashtree-lmdb.workspace = true
 dirs = "5"
 

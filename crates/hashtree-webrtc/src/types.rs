@@ -3,7 +3,7 @@
 //! Defines message types for WebRTC signaling via Nostr relays
 //! and the data channel protocol for hash-based data requests.
 
-use hashtree::Hash;
+use hashtree_core::Hash;
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a peer in the network

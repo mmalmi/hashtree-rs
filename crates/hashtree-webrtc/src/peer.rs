@@ -5,7 +5,7 @@
 
 use crate::types::{DataMessage, PeerId, PeerState, SignalingMessage, DATA_CHANNEL_LABEL};
 use bytes::Bytes;
-use hashtree::{from_hex, to_hex, Hash, Store};
+use hashtree_core::{from_hex, to_hex, Hash, Store};
 use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;

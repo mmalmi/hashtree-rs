@@ -9,7 +9,7 @@
 //! This is the simulation equivalent of WebRTCStore.
 
 use async_trait::async_trait;
-use hashtree::{Hash, Store, StoreError};
+use hashtree_core::{Hash, Store, StoreError};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -696,7 +696,7 @@ impl FloodingStore {
     /// Handle incoming response
     async fn handle_response(&self, _from_peer: u64, hash: [u8; 32], data: Vec<u8>) {
         // Verify hash
-        if hashtree::sha256(&data) != hash {
+        if hashtree_core::sha256(&data) != hash {
             return;
         }
 
@@ -797,7 +797,7 @@ mod tests {
     async fn test_flooding_local_hit() {
         let store = FloodingStore::with_defaults("1");
         let data = b"test data";
-        let hash = hashtree::sha256(data);
+        let hash = hashtree_core::sha256(data);
         store.local().put_local(hash, data.to_vec());
 
         let result = store.get(&hash).await.unwrap();
@@ -810,7 +810,7 @@ mod tests {
         let store2 = FloodingStore::with_defaults("2");
 
         let data = b"network data";
-        let hash = hashtree::sha256(data);
+        let hash = hashtree_core::sha256(data);
         store2.local().put_local(hash, data.to_vec());
 
         // Connect them directly (without signaling)
@@ -835,7 +835,7 @@ mod tests {
 
         // C has the data
         let data = b"multi-hop data";
-        let hash = hashtree::sha256(data);
+        let hash = hashtree_core::sha256(data);
         store_c.local().put_local(hash, data.to_vec());
 
         // Connect A-B
@@ -910,7 +910,7 @@ mod tests {
 
         // Store2 has data
         let data = b"signaling test data";
-        let hash = hashtree::sha256(data);
+        let hash = hashtree_core::sha256(data);
         store2.local().put_local(hash, data.to_vec());
 
         // Connect via signaling

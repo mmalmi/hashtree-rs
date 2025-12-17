@@ -4,7 +4,7 @@
 //! then tries next peer. Lower bandwidth, higher latency.
 
 use async_trait::async_trait;
-use hashtree::{Hash, Store, StoreError};
+use hashtree_core::{Hash, Store, StoreError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,7 +129,7 @@ impl NetworkStore for SequentialStore {
                             if let Some(h) = res.hash() {
                                 if h == *hash {
                                     // Verify data matches hash
-                                    if hashtree::sha256(&res.d) == *hash {
+                                    if hashtree_core::sha256(&res.d) == *hash {
                                         // Cache locally and return
                                         let _ = self.local.put(*hash, res.d.clone()).await;
                                         return Ok(Some(res.d));
@@ -208,7 +208,7 @@ mod tests {
         let store = SequentialStore::new(local.clone(), Duration::from_millis(100));
 
         let data = b"test data";
-        let hash = hashtree::sha256(data);
+        let hash = hashtree_core::sha256(data);
         local.put_local(hash, data.to_vec());
 
         let result = store.get(&hash).await.unwrap();
@@ -223,7 +223,7 @@ mod tests {
         let local2 = Arc::new(SimStore::new(2));
         let store2 = Arc::new(SequentialStore::new(local2.clone(), Duration::from_secs(1)));
         let data = b"peer data";
-        let hash = hashtree::sha256(data);
+        let hash = hashtree_core::sha256(data);
         local2.put_local(hash, data.to_vec());
 
         let (chan1, chan2) = MockChannel::pair(1, 2);
@@ -255,7 +255,7 @@ mod tests {
         let local3 = Arc::new(SimStore::new(3));
         let store3 = Arc::new(SequentialStore::new(local3.clone(), Duration::from_millis(100)));
         let data = b"found on third";
-        let hash = hashtree::sha256(data);
+        let hash = hashtree_core::sha256(data);
         local3.put_local(hash, data.to_vec());
 
         let (chan1_2, chan2) = MockChannel::pair(1, 2);

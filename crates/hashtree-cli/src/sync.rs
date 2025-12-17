@@ -7,15 +7,16 @@
 //! Uses WebRTC peers first, falls back to Blossom HTTP servers
 
 use anyhow::Result;
-use hashtree::{from_hex, to_hex, Cid};
+use hashtree_core::{from_hex, to_hex, Cid};
 use nostr_sdk::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
+use crate::fetch::{FetchConfig, Fetcher};
 use crate::storage::HashtreeStore;
 use crate::webrtc::WebRTCState;
 
@@ -104,8 +105,8 @@ pub struct BackgroundSync {
     /// Shutdown signal
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    /// HTTP client for Blossom
-    http_client: reqwest::Client,
+    /// Fetcher for remote content
+    fetcher: Arc<Fetcher>,
 }
 
 impl BackgroundSync {
@@ -131,6 +132,14 @@ impl BackgroundSync {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+        // Create fetcher with config
+        let fetch_config = FetchConfig {
+            blossom_servers: config.blossom_servers.clone(),
+            webrtc_timeout: Duration::from_millis(config.webrtc_timeout_ms),
+            blossom_timeout: Duration::from_millis(config.blossom_timeout_ms),
+        };
+        let fetcher = Arc::new(Fetcher::new(fetch_config));
+
         Ok(Self {
             config,
             store,
@@ -142,10 +151,7 @@ impl BackgroundSync {
             syncing: Arc::new(RwLock::new(HashSet::new())),
             shutdown_tx,
             shutdown_rx,
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
+            fetcher,
         })
     }
 
@@ -171,10 +177,7 @@ impl BackgroundSync {
         let syncing = self.syncing.clone();
         let store = self.store.clone();
         let webrtc_state = self.webrtc_state.clone();
-        let blossom_servers = self.config.blossom_servers.clone();
-        let http_client = self.http_client.clone();
-        let webrtc_timeout = Duration::from_millis(self.config.webrtc_timeout_ms);
-        let blossom_timeout = Duration::from_millis(self.config.blossom_timeout_ms);
+        let fetcher = self.fetcher.clone();
         let max_concurrent = self.config.max_concurrent;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
@@ -219,27 +222,22 @@ impl BackgroundSync {
                             let syncing_clone = syncing.clone();
                             let store_clone = store.clone();
                             let webrtc_clone = webrtc_state.clone();
-                            let servers = blossom_servers.clone();
-                            let http = http_client.clone();
+                            let fetcher_clone = fetcher.clone();
 
                             tokio::spawn(async move {
-                                let result = Self::sync_tree(
+                                let result = fetcher_clone.fetch_tree(
                                     &store_clone,
                                     webrtc_clone.as_ref(),
-                                    &servers,
-                                    &http,
-                                    &task.cid,
-                                    webrtc_timeout,
-                                    blossom_timeout,
+                                    &task.cid.hash,
                                 ).await;
 
                                 match result {
-                                    Ok(stats) => {
+                                    Ok((chunks_fetched, bytes_fetched)) => {
                                         info!(
                                             "Synced tree {} ({} chunks, {} bytes)",
                                             &hash_hex[..12],
-                                            stats.chunks_fetched,
-                                            stats.bytes_fetched
+                                            chunks_fetched,
+                                            bytes_fetched
                                         );
                                     }
                                     Err(e) => {
@@ -470,133 +468,6 @@ impl BackgroundSync {
         }
     }
 
-    /// Sync a tree - fetch all chunks
-    async fn sync_tree(
-        store: &HashtreeStore,
-        webrtc_state: Option<&Arc<WebRTCState>>,
-        blossom_servers: &[String],
-        http_client: &reqwest::Client,
-        cid: &Cid,
-        webrtc_timeout: Duration,
-        blossom_timeout: Duration,
-    ) -> Result<SyncStats> {
-        let mut stats = SyncStats::default();
-        let hash_hex = to_hex(&cid.hash);
-
-        // Check if we already have this root
-        if store.blob_exists(&hash_hex)? {
-            debug!("Already have root {}", &hash_hex[..12]);
-            return Ok(stats);
-        }
-
-        // Fetch the root and recursively fetch all children
-        let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
-        queue.push_back(cid.hash);
-
-        while let Some(hash) = queue.pop_front() {
-            let hash_hex = to_hex(&hash);
-
-            // Check if we already have it
-            if store.blob_exists(&hash_hex)? {
-                continue;
-            }
-
-            // Try to fetch
-            let data = Self::fetch_chunk(
-                webrtc_state,
-                blossom_servers,
-                http_client,
-                &hash_hex,
-                webrtc_timeout,
-                blossom_timeout,
-            )
-            .await?;
-
-            // Store it
-            store.put_blob(&data)?;
-            stats.chunks_fetched += 1;
-            stats.bytes_fetched += data.len() as u64;
-
-            // Try to parse as tree node and queue children
-            if let Ok(node) = hashtree::decode_tree_node(&data) {
-                for link in node.links {
-                    queue.push_back(link.hash);
-                }
-            }
-        }
-
-        Ok(stats)
-    }
-
-    /// Fetch a chunk using WebRTC first, then Blossom fallback
-    async fn fetch_chunk(
-        webrtc_state: Option<&Arc<WebRTCState>>,
-        blossom_servers: &[String],
-        http_client: &reqwest::Client,
-        hash_hex: &str,
-        webrtc_timeout: Duration,
-        blossom_timeout: Duration,
-    ) -> Result<Vec<u8>> {
-        // Try WebRTC first
-        if let Some(state) = webrtc_state {
-            debug!("Trying WebRTC for {}", &hash_hex[..12]);
-            let webrtc_result = tokio::time::timeout(
-                webrtc_timeout,
-                state.request_from_peers(hash_hex),
-            )
-            .await;
-
-            if let Ok(Some(data)) = webrtc_result {
-                debug!("Got {} from WebRTC ({} bytes)", &hash_hex[..12], data.len());
-                return Ok(data);
-            }
-        }
-
-        // Fallback to Blossom
-        for server in blossom_servers {
-            let url = format!("{}/{}", server.trim_end_matches('/'), hash_hex);
-            debug!("Trying Blossom {} for {}", server, &hash_hex[..12]);
-
-            let result = tokio::time::timeout(
-                blossom_timeout,
-                http_client.get(&url).send(),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(response)) if response.status().is_success() => {
-                    if let Ok(data) = response.bytes().await {
-                        debug!(
-                            "Got {} from Blossom ({} bytes)",
-                            &hash_hex[..12],
-                            data.len()
-                        );
-                        return Ok(data.to_vec());
-                    }
-                }
-                Ok(Ok(response)) => {
-                    debug!(
-                        "Blossom {} returned {} for {}",
-                        server,
-                        response.status(),
-                        &hash_hex[..12]
-                    );
-                }
-                Ok(Err(e)) => {
-                    debug!("Blossom {} error for {}: {}", server, &hash_hex[..12], e);
-                }
-                Err(_) => {
-                    debug!("Blossom {} timeout for {}", server, &hash_hex[..12]);
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "Failed to fetch {} from any source",
-            &hash_hex[..12]
-        ))
-    }
-
     /// Signal shutdown
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -631,13 +502,6 @@ impl BackgroundSync {
             active_syncs: syncing.len(),
         }
     }
-}
-
-/// Sync statistics for a single tree
-#[derive(Debug, Default)]
-pub struct SyncStats {
-    pub chunks_fetched: usize,
-    pub bytes_fetched: u64,
 }
 
 /// Overall sync status

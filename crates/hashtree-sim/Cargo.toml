@@ -7,7 +7,7 @@ description = "Simulation tools for hashtree P2P protocols"
 
 [dependencies]
 # Core hashtree crate
-hashtree = { path = "../hashtree" }
+hashtree-core = { path = "../hashtree" }
 
 # Core
 async-trait.workspace = true

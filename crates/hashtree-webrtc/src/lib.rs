@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use hashtree::MemoryStore;
+//! use hashtree_core::MemoryStore;
 //! use hashtree_webrtc::{WebRTCStore, WebRTCStoreConfig};
 //! use nostr_sdk::prelude::*;
 //! use std::sync::Arc;

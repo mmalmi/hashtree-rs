@@ -387,8 +387,8 @@ async fn main() -> Result<()> {
 
             if only_hash {
                 // Use in-memory store for hash-only mode
-                use hashtree::store::MemoryStore;
-                use hashtree::{HashTree, HashTreeConfig, to_hex};
+                use hashtree_core::store::MemoryStore;
+                use hashtree_core::{HashTree, HashTreeConfig, to_hex};
                 use std::sync::Arc;
 
                 let store = Arc::new(MemoryStore::new());
@@ -418,7 +418,7 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Store in local hashtree
-                use hashtree::{nhash_encode, nhash_encode_full, NHashData, from_hex, key_from_hex, Cid};
+                use hashtree_core::{nhash_encode, nhash_encode_full, NHashData, from_hex, key_from_hex, Cid};
 
                 let store = HashtreeStore::new(&cli.data_dir)?;
 
@@ -525,24 +525,56 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Get { cid, output } => {
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            use hashtree_cli::{FetchConfig, Fetcher};
 
-            // Check if it's a directory
-            if let Ok(Some(_)) = store.get_directory_listing(&cid) {
+            let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
+
+            // Load config for Blossom servers
+            let config = Config::load()?;
+            let fetch_config = FetchConfig {
+                blossom_servers: config.blossom.servers.clone(),
+                ..Default::default()
+            };
+            let fetcher = Fetcher::new(fetch_config);
+
+            // Check if it's a directory (try local first, then fetch)
+            let listing = match store.get_directory_listing(&cid) {
+                Ok(Some(listing)) => Some(listing),
+                _ => {
+                    // Try to fetch it
+                    if let Ok(Some(listing)) = fetcher.fetch_directory(&store, None, &cid).await {
+                        Some(listing)
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(_) = listing {
                 // It's a directory - create it and download contents
                 let out_dir = output.unwrap_or_else(|| PathBuf::from(&cid));
                 std::fs::create_dir_all(&out_dir)?;
 
-                fn download_dir(store: &HashtreeStore, cid: &str, dir: &std::path::Path) -> Result<()> {
-                    if let Some(listing) = store.get_directory_listing(cid)? {
+                async fn download_dir(
+                    store: &Arc<HashtreeStore>,
+                    fetcher: &Fetcher,
+                    cid: &str,
+                    dir: &std::path::Path,
+                ) -> Result<()> {
+                    // Get listing (fetch if needed)
+                    let listing = fetcher.fetch_directory(store, None, cid).await?;
+                    if let Some(listing) = listing {
                         for entry in listing.entries {
                             let entry_path = dir.join(&entry.name);
                             if entry.is_directory {
                                 std::fs::create_dir_all(&entry_path)?;
-                                download_dir(store, &entry.cid, &entry_path)?;
-                            } else if let Some(content) = store.get_file(&entry.cid)? {
-                                std::fs::write(&entry_path, content)?;
-                                println!("  {} -> {}", entry.cid, entry_path.display());
+                                Box::pin(download_dir(store, fetcher, &entry.cid, &entry_path)).await?;
+                            } else {
+                                // Fetch file content
+                                if let Some(content) = fetcher.fetch_file(store, None, &entry.cid).await? {
+                                    std::fs::write(&entry_path, content)?;
+                                    println!("  {} -> {}", entry.cid, entry_path.display());
+                                }
                             }
                         }
                     }
@@ -550,25 +582,38 @@ async fn main() -> Result<()> {
                 }
 
                 println!("Downloading directory to {}", out_dir.display());
-                download_dir(&store, &cid, &out_dir)?;
+                download_dir(&store, &fetcher, &cid, &out_dir).await?;
                 println!("Done.");
-            } else if let Some(content) = store.get_file(&cid)? {
-                // It's a file
-                let out_path = output.unwrap_or_else(|| PathBuf::from(&cid));
-                std::fs::write(&out_path, content)?;
-                println!("{} -> {}", cid, out_path.display());
             } else {
-                anyhow::bail!("CID not found: {}", cid);
+                // Try as a file
+                if let Some(content) = fetcher.fetch_file(&store, None, &cid).await? {
+                    let out_path = output.unwrap_or_else(|| PathBuf::from(&cid));
+                    std::fs::write(&out_path, content)?;
+                    println!("{} -> {}", cid, out_path.display());
+                } else {
+                    anyhow::bail!("CID not found locally or on remote servers: {}", cid);
+                }
             }
         }
         Commands::Cat { cid } => {
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            use hashtree_cli::{FetchConfig, Fetcher};
 
-            if let Some(content) = store.get_file(&cid)? {
+            let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
+
+            // Load config for Blossom servers
+            let config = Config::load()?;
+            let fetch_config = FetchConfig {
+                blossom_servers: config.blossom.servers.clone(),
+                ..Default::default()
+            };
+            let fetcher = Fetcher::new(fetch_config);
+
+            // Fetch file (local first, then Blossom)
+            if let Some(content) = fetcher.fetch_file(&store, None, &cid).await? {
                 use std::io::Write;
                 std::io::stdout().write_all(&content)?;
             } else {
-                anyhow::bail!("CID not found: {}", cid);
+                anyhow::bail!("CID not found locally or on remote servers: {}", cid);
             }
         }
         Commands::Pins => {
@@ -629,7 +674,7 @@ async fn main() -> Result<()> {
                     for (i, link) in node.links.iter().enumerate() {
                         let name = link.name.as_ref().map(|n| n.as_str()).unwrap_or("<unnamed>");
                         let size_str = format!("{} bytes", link.size);
-                        println!("    [{}] {} -> {} ({})", i, name, hashtree::to_hex(&link.hash), size_str);
+                        println!("    [{}] {} -> {} ({})", i, name, hashtree_core::to_hex(&link.hash), size_str);
                     }
                 }
             } else {
@@ -704,7 +749,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Publish { ref_name, hash, key } => {
-            use hashtree::{from_hex, key_from_hex, Cid};
+            use hashtree_core::{from_hex, key_from_hex, Cid};
 
             // Load config for relay list
             let config = Config::load()?;
@@ -903,7 +948,7 @@ async fn list_following(data_dir: &PathBuf) -> Result<()> {
 
 /// Push content to Blossom servers
 async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Option<String>) -> Result<()> {
-    use hashtree::{from_hex, to_hex};
+    use hashtree_core::{from_hex, to_hex};
     use sha2::{Sha256, Digest};
     use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
 
@@ -1073,17 +1118,17 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
 }
 
 /// Recursively add a directory (handles encryption automatically based on tree config)
-async fn add_directory<S: hashtree::store::Store>(
-    tree: &hashtree::HashTree<S>,
+async fn add_directory<S: hashtree_core::store::Store>(
+    tree: &hashtree_core::HashTree<S>,
     dir: &std::path::Path,
     respect_gitignore: bool,
-) -> Result<hashtree::Cid> {
+) -> Result<hashtree_core::Cid> {
     use ignore::WalkBuilder;
-    use hashtree::DirEntry;
+    use hashtree_core::DirEntry;
     use std::collections::HashMap;
 
     // Collect files by their parent directory path
-    let mut dir_contents: HashMap<String, Vec<(String, hashtree::Cid)>> = HashMap::new();
+    let mut dir_contents: HashMap<String, Vec<(String, hashtree_core::Cid)>> = HashMap::new();
 
     // Use ignore crate for gitignore-aware walking
     let walker = WalkBuilder::new(dir)
@@ -1132,7 +1177,7 @@ async fn add_directory<S: hashtree::store::Store>(
         depth_b.cmp(&depth_a) // Deepest first
     });
 
-    let mut dir_cids: HashMap<String, hashtree::Cid> = HashMap::new();
+    let mut dir_cids: HashMap<String, hashtree_core::Cid> = HashMap::new();
 
     for dir_path in dirs {
         let files = dir_contents.get(&dir_path).cloned().unwrap_or_default();

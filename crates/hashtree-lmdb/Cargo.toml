@@ -6,7 +6,7 @@ license.workspace = true
 description = "LMDB-backed content-addressed blob storage for hashtree"
 
 [dependencies]
-hashtree.workspace = true
+hashtree-core.workspace = true
 heed.workspace = true
 async-trait.workspace = true
 

@@ -8,7 +8,7 @@ use crate::types::{
     PeerId, PeerState, SignalingMessage, WebRTCStats, WebRTCStoreConfig, NOSTR_KIND_HASHTREE,
 };
 use async_trait::async_trait;
-use hashtree::{to_hex, Hash, Store, StoreError};
+use hashtree_core::{to_hex, Hash, Store, StoreError};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -415,7 +415,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
                 match peer.request(hash).await {
                     Ok(Some(data)) => {
                         // Verify hash
-                        if hashtree::sha256(&data) == *hash {
+                        if hashtree_core::sha256(&data) == *hash {
                             // Store locally for future requests
                             let _ = self.local_store.put(*hash, data.clone()).await;
                             let mut stats = self.stats.write().await;

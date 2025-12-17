@@ -1,7 +1,7 @@
 //! Core traits for root resolvers
 
 use async_trait::async_trait;
-use hashtree::Cid;
+use hashtree_core::Cid;
 use thiserror::Error;
 use tokio::sync::mpsc;
 

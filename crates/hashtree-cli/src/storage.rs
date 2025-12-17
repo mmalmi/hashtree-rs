@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use heed::{Database, EnvOpenOptions};
 use heed::types::*;
 use hashtree_lmdb::LmdbBlobStore;
-use hashtree::{
+use hashtree_core::{
     HashTree, HashTreeConfig, Cid,
     sha256, to_hex, from_hex, Hash, TreeNode, DirEntry as HashTreeDirEntry,
 };
-use hashtree::store::Store;
+use hashtree_core::store::Store;
 use std::path::Path;
 use std::collections::HashSet;
 use std::io::Read;
@@ -689,7 +689,7 @@ impl HashtreeStore {
             }
 
             // Get directory entries (public Cid - no encryption key)
-            let cid = hashtree::Cid::public(hash, 0);
+            let cid = hashtree_core::Cid::public(hash, 0);
             let tree_entries = tree.list_directory(&cid).await
                 .map_err(|e| anyhow::anyhow!("Failed to list directory: {}", e))?;
 

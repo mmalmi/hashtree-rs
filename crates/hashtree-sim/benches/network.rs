@@ -15,7 +15,7 @@ async fn setup_flooding_network(
     peer_count: usize,
     data: &[u8],
 ) -> (Arc<FloodingStore>, Vec<tokio::task::JoinHandle<()>>) {
-    let hash = hashtree::sha256(data);
+    let hash = hashtree_core::sha256(data);
 
     // Requester node
     let local = Arc::new(SimStore::new(0));
@@ -56,7 +56,7 @@ async fn setup_sequential_network(
     peer_count: usize,
     data: &[u8],
 ) -> (Arc<SequentialStore>, Vec<tokio::task::JoinHandle<()>>) {
-    let hash = hashtree::sha256(data);
+    let hash = hashtree_core::sha256(data);
 
     let local = Arc::new(SimStore::new(0));
     let store = Arc::new(SequentialStore::new(local, Duration::from_secs(5)));
@@ -94,7 +94,7 @@ fn bench_flooding_vs_sequential(c: &mut Criterion) {
     let mut group = c.benchmark_group("routing_strategy");
 
     let data = vec![0u8; 1024]; // 1KB data
-    let hash = hashtree::sha256(&data);
+    let hash = hashtree_core::sha256(&data);
 
     for peer_count in [2, 5, 10] {
         group.bench_with_input(
@@ -136,7 +136,7 @@ fn bench_bandwidth(c: &mut Criterion) {
     let mut group = c.benchmark_group("bandwidth");
 
     let data = vec![0u8; 1024];
-    let hash = hashtree::sha256(&data);
+    let hash = hashtree_core::sha256(&data);
     let peer_count = 5;
 
     group.bench_function("flooding_bandwidth", |b| {
