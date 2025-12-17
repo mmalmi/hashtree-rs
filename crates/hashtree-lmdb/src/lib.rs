@@ -196,6 +196,7 @@ impl Store for LmdbBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hashtree_core::sha256;
     use tempfile::TempDir;
 
     #[tokio::test]

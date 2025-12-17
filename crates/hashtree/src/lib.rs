@@ -21,7 +21,7 @@
 //! # Example
 //!
 //! ```rust
-//! use hashtree::{HashTree, HashTreeConfig, MemoryStore};
+//! use hashtree_core::{HashTree, HashTreeConfig, MemoryStore};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]

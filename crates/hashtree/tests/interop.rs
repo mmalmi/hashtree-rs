@@ -3,7 +3,7 @@
 //! These tests verify that the Rust implementation produces identical
 //! hashes and MessagePack encodings as the TypeScript implementation.
 
-use hashtree::{
+use hashtree_core::{
     sha256, encode_tree_node, to_hex, from_hex, Link, LinkType, TreeNode,
     HashTree, HashTreeConfig, MemoryStore,
 };
@@ -210,7 +210,7 @@ fn test_hex_roundtrip() {
 #[cfg(feature = "encryption")]
 #[test]
 fn test_chk_encryption_vectors() {
-    use hashtree::crypto::{encrypt_chk, decrypt_chk};
+    use hashtree_core::crypto::{encrypt_chk, decrypt_chk};
 
     let vectors = load_vectors();
 
@@ -331,7 +331,7 @@ fn generate_msgpack_vectors() {
 #[test]
 #[ignore]
 fn generate_chk_vectors() {
-    use hashtree::crypto::encrypt_chk;
+    use hashtree_core::crypto::encrypt_chk;
 
     let test_cases = vec![
         ("chk_empty", ""),

@@ -10,7 +10,7 @@
 //! from [`Ndb::get_note_metadata`] and then iterate over it.
 //!
 //! ```no_run
-//! # use nostrdb::{Ndb, Transaction, Error, NoteMetadataEntryVariant};
+//! # use hashtree_nostrdb::{Ndb, Transaction, Error, NoteMetadataEntryVariant};
 //! # let ndb: Ndb = todo!();
 //! # let txn: Transaction = todo!();
 //! # let note_id: [u8; 32] = [0; 32];
@@ -44,7 +44,7 @@
 //! To create a new metadata blob, you can use the [`NoteMetadataBuilder`].
 //!
 //! ```no_run
-//! # use nostrdb::{NoteMetadataBuilder, NoteMetadataEntryBuf, Counts};
+//! # use hashtree_nostrdb::{NoteMetadataBuilder, NoteMetadataEntryBuf, Counts};
 //! // Create a "counts" entry
 //! let counts_data = Counts {
 //!     total_reactions: 10,

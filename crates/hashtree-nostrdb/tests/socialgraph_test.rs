@@ -1,4 +1,4 @@
-use nostrdb::{Config, Ndb, Transaction};
+use hashtree_nostrdb::{Config, Ndb, Transaction};
 use std::fs;
 
 fn cleanup_db(path: &str) {
@@ -80,10 +80,10 @@ fn test_follow_distance() {
     // Query distances
     let txn = Transaction::new(&ndb).expect("txn failed");
 
-    let root_dist = nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &root_pk);
-    let alice_dist = nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &alice_pk);
-    let bob_dist = nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &bob_pk);
-    let carol_dist = nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &carol_pk);
+    let root_dist = hashtree_nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &root_pk);
+    let alice_dist = hashtree_nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &alice_pk);
+    let bob_dist = hashtree_nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &bob_pk);
+    let carol_dist = hashtree_nostrdb::socialgraph::get_follow_distance(&txn, &ndb, &carol_pk);
 
     println!("Root distance: {}", root_dist);
     println!("Alice distance: {}", alice_dist);
@@ -120,9 +120,9 @@ fn test_is_following() {
 
     let txn = Transaction::new(&ndb).expect("txn failed");
 
-    assert!(nostrdb::socialgraph::is_following(&txn, &ndb, &root_pk, &alice_pk));
-    assert!(!nostrdb::socialgraph::is_following(&txn, &ndb, &root_pk, &bob_pk));
-    assert!(!nostrdb::socialgraph::is_following(&txn, &ndb, &alice_pk, &root_pk));
+    assert!(hashtree_nostrdb::socialgraph::is_following(&txn, &ndb, &root_pk, &alice_pk));
+    assert!(!hashtree_nostrdb::socialgraph::is_following(&txn, &ndb, &root_pk, &bob_pk));
+    assert!(!hashtree_nostrdb::socialgraph::is_following(&txn, &ndb, &alice_pk, &root_pk));
 
     drop(txn);
     cleanup_db(db);
@@ -148,7 +148,7 @@ fn test_get_followed() {
 
     let txn = Transaction::new(&ndb).expect("txn failed");
 
-    let followed = nostrdb::socialgraph::get_followed(&txn, &ndb, &root_pk, 10);
+    let followed = hashtree_nostrdb::socialgraph::get_followed(&txn, &ndb, &root_pk, 10);
     assert_eq!(followed.len(), 2);
     assert!(followed.contains(&alice_pk));
     assert!(followed.contains(&bob_pk));
@@ -180,7 +180,7 @@ fn test_follower_count() {
 
     let txn = Transaction::new(&ndb).expect("txn failed");
 
-    let count = nostrdb::socialgraph::follower_count(&txn, &ndb, &alice_pk);
+    let count = hashtree_nostrdb::socialgraph::follower_count(&txn, &ndb, &alice_pk);
     assert_eq!(count, 2, "Alice should have 2 followers");
 
     drop(txn);
@@ -207,9 +207,9 @@ fn test_is_muting() {
 
     let txn = Transaction::new(&ndb).expect("txn failed");
 
-    assert!(nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &bob_pk));
-    assert!(!nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &root_pk));
-    assert!(!nostrdb::socialgraph::is_muting(&txn, &ndb, &bob_pk, &alice_pk));
+    assert!(hashtree_nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &bob_pk));
+    assert!(!hashtree_nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &root_pk));
+    assert!(!hashtree_nostrdb::socialgraph::is_muting(&txn, &ndb, &bob_pk, &alice_pk));
 
     drop(txn);
     cleanup_db(db);
@@ -235,7 +235,7 @@ fn test_get_muted() {
 
     let txn = Transaction::new(&ndb).expect("txn failed");
 
-    let muted = nostrdb::socialgraph::get_muted(&txn, &ndb, &root_pk, 10);
+    let muted = hashtree_nostrdb::socialgraph::get_muted(&txn, &ndb, &root_pk, 10);
     assert_eq!(muted.len(), 2);
     assert!(muted.contains(&alice_pk));
     assert!(muted.contains(&bob_pk));
@@ -267,7 +267,7 @@ fn test_get_muters() {
 
     let txn = Transaction::new(&ndb).expect("txn failed");
 
-    let muters = nostrdb::socialgraph::get_muters(&txn, &ndb, &bob_pk, 10);
+    let muters = hashtree_nostrdb::socialgraph::get_muters(&txn, &ndb, &bob_pk, 10);
     assert_eq!(muters.len(), 2, "Bob should be muted by 2 users");
     assert!(muters.contains(&root_pk));
     assert!(muters.contains(&alice_pk));
@@ -301,17 +301,17 @@ fn test_mute_list_update() {
     let txn = Transaction::new(&ndb).expect("txn failed");
 
     // Alice should no longer mute Bob
-    assert!(!nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &bob_pk));
+    assert!(!hashtree_nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &bob_pk));
 
     // Alice should still mute Charlie
-    assert!(nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &charlie_pk));
+    assert!(hashtree_nostrdb::socialgraph::is_muting(&txn, &ndb, &alice_pk, &charlie_pk));
 
     // Bob should have 0 muters now
-    let bob_muters = nostrdb::socialgraph::get_muters(&txn, &ndb, &bob_pk, 10);
+    let bob_muters = hashtree_nostrdb::socialgraph::get_muters(&txn, &ndb, &bob_pk, 10);
     assert_eq!(bob_muters.len(), 0);
 
     // Charlie should have 1 muter (Alice)
-    let charlie_muters = nostrdb::socialgraph::get_muters(&txn, &ndb, &charlie_pk, 10);
+    let charlie_muters = hashtree_nostrdb::socialgraph::get_muters(&txn, &ndb, &charlie_pk, 10);
     assert_eq!(charlie_muters.len(), 1);
     assert!(charlie_muters.contains(&alice_pk));
 

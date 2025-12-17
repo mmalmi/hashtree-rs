@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use hashtree::{
+use hashtree_core::{
     Cid, DirEntry, HashTree, HashTreeConfig, HashTreeError, Link, LinkType, MemoryStore, Store, to_hex,
 };
 
@@ -746,7 +746,7 @@ mod edit {
 
 mod verify {
     use super::*;
-    use hashtree::hashtree_verify_tree;
+    use hashtree_core::hashtree_verify_tree;
 
     #[tokio::test]
     async fn test_verify_valid_tree() {

@@ -1,6 +1,6 @@
 //! Streaming tests for HashTree put_stream and get_stream API
 
-use hashtree::{HashTree, HashTreeConfig, MemoryStore};
+use hashtree_core::{HashTree, HashTreeConfig, MemoryStore};
 use futures::StreamExt;
 use std::sync::Arc;
 
