@@ -43,6 +43,7 @@ pub mod types;
 pub use peer::{Peer, PeerError};
 pub use store::{WebRTCStore, WebRTCStoreError};
 pub use types::{
-    DataMessage, IceCandidate, PeerId, PeerState, SignalingMessage, WebRTCStats,
-    WebRTCStoreConfig, DATA_CHANNEL_LABEL, NOSTR_KIND_HASHTREE,
+    classifier_channel, ClassifierRx, ClassifierTx, ClassifyRequest,
+    DataMessage, IceCandidate, PeerId, PeerPool, PeerState, PoolConfig, PoolSettings,
+    SignalingMessage, WebRTCStats, WebRTCStoreConfig, DATA_CHANNEL_LABEL, NOSTR_KIND_HASHTREE,
 };

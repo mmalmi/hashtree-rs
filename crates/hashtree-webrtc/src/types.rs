@@ -144,23 +144,94 @@ pub enum DataMessage {
     },
 }
 
-/// Configuration for WebRTC store
+use tokio::sync::{mpsc, oneshot};
+
+/// Peer pool classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerPool {
+    /// Users in social graph (followed or followers)
+    Follows,
+    /// Everyone else
+    Other,
+}
+
+/// Settings for a peer pool
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    /// Maximum connections in this pool
+    pub max_connections: usize,
+    /// Number of connections to consider "satisfied"
+    pub satisfied_connections: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            satisfied_connections: 5,
+        }
+    }
+}
+
+/// Pool settings for both pools
 #[derive(Debug, Clone)]
+pub struct PoolSettings {
+    pub follows: PoolConfig,
+    pub other: PoolConfig,
+}
+
+impl Default for PoolSettings {
+    fn default() -> Self {
+        Self {
+            follows: PoolConfig {
+                max_connections: 20,
+                satisfied_connections: 10,
+            },
+            other: PoolConfig {
+                max_connections: 10,
+                satisfied_connections: 5,
+            },
+        }
+    }
+}
+
+/// Request to classify a peer by pubkey
+pub struct ClassifyRequest {
+    /// Pubkey to classify (hex)
+    pub pubkey: String,
+    /// Channel to send result back
+    pub response: oneshot::Sender<PeerPool>,
+}
+
+/// Sender for peer classification requests
+pub type ClassifierTx = mpsc::Sender<ClassifyRequest>;
+
+/// Receiver for peer classification requests (implement this to provide classification)
+pub type ClassifierRx = mpsc::Receiver<ClassifyRequest>;
+
+/// Create a classifier channel pair
+pub fn classifier_channel(buffer: usize) -> (ClassifierTx, ClassifierRx) {
+    mpsc::channel(buffer)
+}
+
+/// Configuration for WebRTC store
+#[derive(Clone)]
 pub struct WebRTCStoreConfig {
     /// Nostr relays for signaling
     pub relays: Vec<String>,
     /// Root hashes to advertise
     pub roots: Vec<Hash>,
-    /// Target number of peer connections
-    pub satisfied_connections: usize,
-    /// Maximum number of peer connections
-    pub max_connections: usize,
     /// Timeout for data requests (ms)
     pub request_timeout_ms: u64,
     /// Interval for sending hello messages (ms)
     pub hello_interval_ms: u64,
     /// Enable verbose logging
     pub debug: bool,
+    /// Pool settings for follows and other peers
+    pub pools: PoolSettings,
+    /// Channel for peer classification (optional)
+    /// If None, all peers go to "Other" pool
+    pub classifier_tx: Option<ClassifierTx>,
 }
 
 impl Default for WebRTCStoreConfig {
@@ -171,11 +242,11 @@ impl Default for WebRTCStoreConfig {
                 "wss://relay.damus.io".to_string(),
             ],
             roots: Vec::new(),
-            satisfied_connections: 3,
-            max_connections: 10,
             request_timeout_ms: 10000,
             hello_interval_ms: 30000,
             debug: false,
+            pools: PoolSettings::default(),
+            classifier_tx: None,
         }
     }
 }

@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn test_new_client() {
         let client = NostrClient::new(TEST_PUBKEY, None).unwrap();
-        assert_eq!(client.relays.len(), 3);
+        assert_eq!(client.relays.len(), 4);
         assert_eq!(client.blossom_servers.len(), 2);
         assert!(!client.can_sign());
     }

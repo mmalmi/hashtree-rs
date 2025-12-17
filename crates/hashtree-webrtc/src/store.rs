@@ -5,7 +5,8 @@
 
 use crate::peer::{Peer, PeerError};
 use crate::types::{
-    PeerId, PeerState, SignalingMessage, WebRTCStats, WebRTCStoreConfig, NOSTR_KIND_HASHTREE,
+    ClassifyRequest, PeerId, PeerPool, PeerState, SignalingMessage, WebRTCStats,
+    WebRTCStoreConfig, NOSTR_KIND_HASHTREE,
 };
 use async_trait::async_trait;
 use hashtree_core::{to_hex, Hash, Store, StoreError};
@@ -30,6 +31,12 @@ pub enum WebRTCStoreError {
     Store(#[from] StoreError),
 }
 
+/// Peer entry with pool classification
+struct PeerEntry<S: Store> {
+    peer: Arc<Peer<S>>,
+    pool: PeerPool,
+}
+
 /// WebRTC store that fetches data from P2P network
 pub struct WebRTCStore<S: Store> {
     /// Local backing store
@@ -40,8 +47,8 @@ pub struct WebRTCStore<S: Store> {
     client: Option<Client>,
     /// Local peer identifier
     peer_id: PeerId,
-    /// Connected peers
-    peers: Arc<RwLock<HashMap<String, Arc<Peer<S>>>>>,
+    /// Connected peers with pool classification
+    peers: Arc<RwLock<HashMap<String, PeerEntry<S>>>>,
     /// Known peer roots (peer_id -> Vec<root_hash>)
     peer_roots: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Signaling message sender
@@ -220,6 +227,19 @@ impl<S: Store + 'static> WebRTCStore<S> {
                     return; // Ignore own messages
                 }
 
+                // Extract pubkey from peer_id (format: "pubkey:uuid")
+                let peer_pubkey = peer_id.split(':').next().unwrap_or("");
+
+                // Check allowed_pubkeys filter
+                if !config.allowed_pubkeys.is_empty()
+                    && !config.allowed_pubkeys.iter().any(|pk| pk == peer_pubkey)
+                {
+                    if config.debug {
+                        println!("[Store] Ignoring hello from {} (not in allowed_pubkeys)", peer_id);
+                    }
+                    return;
+                }
+
                 if config.debug {
                     println!("[Store] Received hello from {}", peer_id);
                 }
@@ -279,6 +299,17 @@ impl<S: Store + 'static> WebRTCStore<S> {
             } => {
                 if target_peer_id != local_peer_id {
                     return; // Not for us
+                }
+
+                // Extract pubkey from peer_id and check allowed_pubkeys filter
+                let peer_pubkey = peer_id.split(':').next().unwrap_or("");
+                if !config.allowed_pubkeys.is_empty()
+                    && !config.allowed_pubkeys.iter().any(|pk| pk == peer_pubkey)
+                {
+                    if config.debug {
+                        println!("[Store] Ignoring signaling from {} (not in allowed_pubkeys)", peer_id);
+                    }
+                    return;
                 }
 
                 // Get or create peer

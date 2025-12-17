@@ -49,21 +49,35 @@ async fn test_peer_discovery() {
     let store1_local = Arc::new(MemoryStore::new());
     let store2_local = Arc::new(MemoryStore::new());
 
-    let config = WebRTCStoreConfig {
+    // Generate keys first so we can set allowed_pubkeys
+    let keys1 = Keys::generate();
+    let keys2 = Keys::generate();
+    let pubkey1 = keys1.public_key().to_hex();
+    let pubkey2 = keys2.public_key().to_hex();
+    println!("Store1 pubkey: {}", pubkey1);
+    println!("Store2 pubkey: {}", pubkey2);
+
+    // Each store only allows the other peer (ignores random people on the relay)
+    let config1 = WebRTCStoreConfig {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
         hello_interval_ms: 2000, // More frequent hellos
         satisfied_connections: 1,
+        allowed_pubkeys: vec![pubkey2.clone()], // Only connect to store2
         ..Default::default()
     };
 
-    let mut store1 = WebRTCStore::new(store1_local, config.clone());
-    let mut store2 = WebRTCStore::new(store2_local, config);
+    let config2 = WebRTCStoreConfig {
+        relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
+        debug: true,
+        hello_interval_ms: 2000,
+        satisfied_connections: 1,
+        allowed_pubkeys: vec![pubkey1.clone()], // Only connect to store1
+        ..Default::default()
+    };
 
-    let keys1 = Keys::generate();
-    let keys2 = Keys::generate();
-    println!("Store1 pubkey: {}", keys1.public_key().to_hex());
-    println!("Store2 pubkey: {}", keys2.public_key().to_hex());
+    let mut store1 = WebRTCStore::new(store1_local, config1);
+    let mut store2 = WebRTCStore::new(store2_local, config2);
 
     // Start both stores
     store1.start(keys1).await.expect("Store1 failed to start");
@@ -110,19 +124,33 @@ async fn test_data_transfer_between_peers() {
     let hash = sha256(test_data);
     store1_local.put(hash, test_data.to_vec()).await.unwrap();
 
-    let config = WebRTCStoreConfig {
+    // Generate keys first so we can set allowed_pubkeys
+    let keys1 = Keys::generate();
+    let keys2 = Keys::generate();
+    let pubkey1 = keys1.public_key().to_hex();
+    let pubkey2 = keys2.public_key().to_hex();
+
+    // Each store only allows the other peer
+    let config1 = WebRTCStoreConfig {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
         hello_interval_ms: 3000,
         satisfied_connections: 1,
+        allowed_pubkeys: vec![pubkey2.clone()],
         ..Default::default()
     };
 
-    let mut store1 = WebRTCStore::new(store1_local.clone(), config.clone());
-    let mut store2 = WebRTCStore::new(store2_local.clone(), config);
+    let config2 = WebRTCStoreConfig {
+        relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
+        debug: true,
+        hello_interval_ms: 3000,
+        satisfied_connections: 1,
+        allowed_pubkeys: vec![pubkey1.clone()],
+        ..Default::default()
+    };
 
-    let keys1 = Keys::generate();
-    let keys2 = Keys::generate();
+    let mut store1 = WebRTCStore::new(store1_local.clone(), config1);
+    let mut store2 = WebRTCStore::new(store2_local.clone(), config2);
 
     // Start both stores (same timing as peer_discovery test)
     store1.start(keys1).await.expect("Store1 failed to start");
