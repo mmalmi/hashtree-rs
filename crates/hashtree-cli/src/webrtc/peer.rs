@@ -20,7 +20,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use super::types::{DataMessage, DataRequest, DataResponse, PeerDirection, PeerId, SignalingMessage, encode_message, encode_request, encode_response, parse_message, hash_to_hex};
+use super::types::{DataMessage, DataRequest, DataResponse, PeerDirection, PeerId, PeerStateEvent, SignalingMessage, encode_message, encode_request, encode_response, parse_message, hash_to_hex};
 
 /// Trait for content storage that can be used by WebRTC peers
 pub trait ContentStore: Send + Sync + 'static {
@@ -58,6 +58,9 @@ pub struct Peer {
     message_tx: mpsc::Sender<(DataMessage, Option<Vec<u8>>)>,
     #[allow(dead_code)]
     message_rx: Option<mpsc::Receiver<(DataMessage, Option<Vec<u8>>)>>,
+
+    // Optional channel to notify signaling layer of state changes
+    state_event_tx: Option<mpsc::Sender<PeerStateEvent>>,
 }
 
 impl Peer {
@@ -69,7 +72,7 @@ impl Peer {
         signaling_tx: mpsc::Sender<SignalingMessage>,
         stun_servers: Vec<String>,
     ) -> Result<Self> {
-        Self::new_with_store(peer_id, direction, my_peer_id, signaling_tx, stun_servers, None).await
+        Self::new_with_store_and_events(peer_id, direction, my_peer_id, signaling_tx, stun_servers, None, None).await
     }
 
     /// Create a new peer connection with content store
@@ -80,6 +83,19 @@ impl Peer {
         signaling_tx: mpsc::Sender<SignalingMessage>,
         stun_servers: Vec<String>,
         store: Option<Arc<dyn ContentStore>>,
+    ) -> Result<Self> {
+        Self::new_with_store_and_events(peer_id, direction, my_peer_id, signaling_tx, stun_servers, store, None).await
+    }
+
+    /// Create a new peer connection with content store and state event channel
+    pub async fn new_with_store_and_events(
+        peer_id: PeerId,
+        direction: PeerDirection,
+        my_peer_id: PeerId,
+        signaling_tx: mpsc::Sender<SignalingMessage>,
+        stun_servers: Vec<String>,
+        store: Option<Arc<dyn ContentStore>>,
+        state_event_tx: Option<mpsc::Sender<PeerStateEvent>>,
     ) -> Result<Self> {
         // Create WebRTC API
         let mut m = MediaEngine::default();
@@ -123,6 +139,7 @@ impl Peer {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             message_tx,
             message_rx: Some(message_rx),
+            state_event_tx,
         })
     }
 
@@ -174,11 +191,30 @@ impl Peer {
 
         // Handle connection state changes - work MUST be inside the returned future
         let peer_id_log = peer_id.clone();
+        let state_event_tx = self.state_event_tx.clone();
         self.pc
             .on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
                 let peer_id = peer_id_log.clone();
+                let state_event_tx = state_event_tx.clone();
                 Box::pin(async move {
                     info!("Peer {} connection state: {:?}", peer_id.short(), state);
+
+                    // Notify signaling layer of state changes
+                    if let Some(tx) = state_event_tx {
+                        let event = match state {
+                            RTCPeerConnectionState::Connected => Some(PeerStateEvent::Connected(peer_id)),
+                            RTCPeerConnectionState::Failed => Some(PeerStateEvent::Failed(peer_id)),
+                            RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Closed => {
+                                Some(PeerStateEvent::Disconnected(peer_id))
+                            }
+                            _ => None,
+                        };
+                        if let Some(event) = event {
+                            if let Err(e) = tx.send(event).await {
+                                error!("Failed to send peer state event: {}", e);
+                            }
+                        }
+                    }
                 })
             }));
 

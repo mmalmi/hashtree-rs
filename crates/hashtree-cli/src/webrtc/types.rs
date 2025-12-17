@@ -342,6 +342,17 @@ pub enum PeerDirection {
     Outbound,
 }
 
+/// Peer state change event for signaling layer notification
+#[derive(Debug, Clone)]
+pub enum PeerStateEvent {
+    /// Peer connection succeeded
+    Connected(PeerId),
+    /// Peer connection failed
+    Failed(PeerId),
+    /// Peer disconnected
+    Disconnected(PeerId),
+}
+
 /// Pool type for peer classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerPool {

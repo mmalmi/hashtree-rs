@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use super::peer::{ContentStore, Peer, PendingRequest};
 use super::types::{
-    PeerDirection, PeerId, PeerPool, PeerStatus, SignalingMessage, WebRTCConfig, WEBRTC_KIND, HELLO_TAG,
+    PeerDirection, PeerId, PeerPool, PeerStateEvent, PeerStatus, SignalingMessage, WebRTCConfig, WEBRTC_KIND, HELLO_TAG,
 };
 
 /// Callback type for classifying peers into pools
@@ -184,6 +184,9 @@ pub struct WebRTCManager {
     store: Option<Arc<dyn ContentStore>>,
     /// Peer classifier for pool assignment
     peer_classifier: PeerClassifier,
+    /// Channel for peer state events (connection success/failure)
+    state_event_tx: mpsc::Sender<PeerStateEvent>,
+    state_event_rx: Option<mpsc::Receiver<PeerStateEvent>>,
 }
 
 impl WebRTCManager {
@@ -193,6 +196,7 @@ impl WebRTCManager {
         let my_peer_id = PeerId::new(pubkey, None);
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let (signaling_tx, signaling_rx) = mpsc::channel(100);
+        let (state_event_tx, state_event_rx) = mpsc::channel(100);
 
         // Default classifier: all peers go to 'other' pool
         let peer_classifier: PeerClassifier = Arc::new(|_| PeerPool::Other);
@@ -208,6 +212,8 @@ impl WebRTCManager {
             signaling_rx: Some(signaling_rx),
             store: None,
             peer_classifier,
+            state_event_tx,
+            state_event_rx: Some(state_event_rx),
         }
     }
 
@@ -289,23 +295,34 @@ impl WebRTCManager {
     }
 
     /// Get pool counts
+    /// Returns (follows_connected, follows_active, other_connected, other_active)
+    /// "active" = Connected or Connecting (excludes Discovered and Failed)
     pub async fn get_pool_counts(&self) -> (usize, usize, usize, usize) {
         let peers = self.state.peers.read().await;
         let mut follows_connected = 0;
-        let mut follows_total = 0;
+        let mut follows_active = 0;
         let mut other_connected = 0;
-        let mut other_total = 0;
+        let mut other_active = 0;
 
         for entry in peers.values() {
+            // Only count Connected or Connecting as "active" connections
+            // Discovered peers are just seen hellos, not real connections
+            let is_active = entry.state == ConnectionState::Connected
+                || entry.state == ConnectionState::Connecting;
+
             match entry.pool {
                 PeerPool::Follows => {
-                    follows_total += 1;
+                    if is_active {
+                        follows_active += 1;
+                    }
                     if entry.state == ConnectionState::Connected {
                         follows_connected += 1;
                     }
                 }
                 PeerPool::Other => {
-                    other_total += 1;
+                    if is_active {
+                        other_active += 1;
+                    }
                     if entry.state == ConnectionState::Connected {
                         other_connected += 1;
                     }
@@ -313,15 +330,15 @@ impl WebRTCManager {
             }
         }
 
-        (follows_connected, follows_total, other_connected, other_total)
+        (follows_connected, follows_active, other_connected, other_active)
     }
 
     /// Check if we can accept a peer in a given pool
     fn can_accept_peer(&self, pool: PeerPool, pool_counts: &(usize, usize, usize, usize)) -> bool {
-        let (_, follows_total, _, other_total) = *pool_counts;
+        let (_, follows_active, _, other_active) = *pool_counts;
         match pool {
-            PeerPool::Follows => follows_total < self.config.pools.follows.max_connections,
-            PeerPool::Other => other_total < self.config.pools.other.max_connections,
+            PeerPool::Follows => follows_active < self.config.pools.follows.max_connections,
+            PeerPool::Other => other_active < self.config.pools.other.max_connections,
         }
     }
 
@@ -359,6 +376,9 @@ impl WebRTCManager {
 
         // Take the signaling receiver
         let mut signaling_rx = self.signaling_rx.take().expect("signaling_rx already taken");
+
+        // Take the state event receiver
+        let mut state_event_rx = self.state_event_rx.take().expect("state_event_rx already taken");
 
         // Create a shared write channel for all relay tasks
         let (relay_write_tx, _) = tokio::sync::broadcast::channel::<SignalingMessage>(100);
@@ -409,6 +429,10 @@ impl WebRTCManager {
                 Some(msg) = signaling_rx.recv() => {
                     // Forward signaling messages to relay broadcast
                     let _ = relay_write_tx.send(msg);
+                }
+                Some(event) = state_event_rx.recv() => {
+                    // Handle peer state events (connected, failed, disconnected)
+                    self.handle_peer_state_event(event).await;
                 }
                 _ = state_sync_interval.tick() => {
                     // Sync peer connection states
@@ -768,12 +792,25 @@ impl WebRTCManager {
         // Decide if we should initiate based on tie-breaking
         let should_initiate = self.should_initiate(their_uuid);
 
+        // If pool is already satisfied, don't initiate new outbound connections
+        // This reserves space for inbound connections
+        let pool_satisfied = self.is_pool_satisfied(pool, &pool_counts);
+        let will_initiate = should_initiate && !pool_satisfied;
+
         info!(
-            "Discovered peer: {} (pool: {:?}, initiate: {})",
+            "Discovered peer: {} (pool: {:?}, initiate: {}, pool_satisfied: {})",
             full_peer_id.short(),
             pool,
-            should_initiate
+            will_initiate,
+            pool_satisfied
         );
+
+        // If we're not initiating and pool is satisfied, don't even add to discovered
+        // (we won't accept their offer either since pool check happens in handle_offer)
+        if !will_initiate && pool_satisfied {
+            debug!("Pool {:?} is satisfied, not tracking peer {}", pool, full_peer_id.short());
+            return Ok(());
+        }
 
         // Create peer entry with pool assignment
         {
@@ -782,7 +819,7 @@ impl WebRTCManager {
                 peer_key.clone(),
                 PeerEntry {
                     peer_id: full_peer_id.clone(),
-                    direction: if should_initiate {
+                    direction: if will_initiate {
                         PeerDirection::Outbound
                     } else {
                         PeerDirection::Inbound
@@ -796,7 +833,7 @@ impl WebRTCManager {
         }
 
         // If we should initiate, create offer
-        if should_initiate {
+        if will_initiate {
             self.initiate_connection(&full_peer_id, pool, relay_write_tx)
                 .await?;
         }
@@ -815,14 +852,15 @@ impl WebRTCManager {
 
         info!("Initiating connection to {} (pool: {:?})", peer_id.short(), pool);
 
-        // Create peer connection with content store if available
-        let mut peer = Peer::new_with_store(
+        // Create peer connection with content store and state events
+        let mut peer = Peer::new_with_store_and_events(
             peer_id.clone(),
             PeerDirection::Outbound,
             self.my_peer_id.clone(),
             self.signaling_tx.clone(),
             self.config.stun_servers.clone(),
             self.store.clone(),
+            Some(self.state_event_tx.clone()),
         )
         .await?;
 
@@ -890,14 +928,15 @@ impl WebRTCManager {
             warn!("Rejecting offer from {} - pool {:?} is full", full_peer_id.short(), pool);
             return Ok(());
         }
-        // Create peer connection with content store if available
-        let mut peer = Peer::new_with_store(
+        // Create peer connection with content store and state events
+        let mut peer = Peer::new_with_store_and_events(
             full_peer_id.clone(),
             PeerDirection::Inbound,
             self.my_peer_id.clone(),
             self.signaling_tx.clone(),
             self.config.stun_servers.clone(),
             self.store.clone(),
+            Some(self.state_event_tx.clone()),
         )
         .await?;
 
@@ -1009,6 +1048,44 @@ impl WebRTCManager {
         }
 
         Ok(())
+    }
+
+    /// Handle peer state change events from peer connections
+    async fn handle_peer_state_event(&self, event: PeerStateEvent) {
+        match event {
+            PeerStateEvent::Connected(peer_id) => {
+                let peer_key = peer_id.to_string();
+                let mut peers = self.state.peers.write().await;
+                if let Some(entry) = peers.get_mut(&peer_key) {
+                    if entry.state != ConnectionState::Connected {
+                        info!("Peer {} connected (via state event)", peer_id.short());
+                        entry.state = ConnectionState::Connected;
+                    }
+                }
+            }
+            PeerStateEvent::Failed(peer_id) => {
+                let peer_key = peer_id.to_string();
+                info!("Peer {} connection failed - removing from pool", peer_id.short());
+                let mut peers = self.state.peers.write().await;
+                if let Some(entry) = peers.remove(&peer_key) {
+                    // Close the peer connection if it exists
+                    if let Some(peer) = entry.peer {
+                        let _ = peer.close().await;
+                    }
+                }
+            }
+            PeerStateEvent::Disconnected(peer_id) => {
+                let peer_key = peer_id.to_string();
+                info!("Peer {} disconnected - removing from pool", peer_id.short());
+                let mut peers = self.state.peers.write().await;
+                if let Some(entry) = peers.remove(&peer_key) {
+                    // Close the peer connection if it exists
+                    if let Some(peer) = entry.peer {
+                        let _ = peer.close().await;
+                    }
+                }
+            }
+        }
     }
 
     /// Sync connection states from peer objects
