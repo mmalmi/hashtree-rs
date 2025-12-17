@@ -54,20 +54,20 @@ fi
 
 # Tier 1: No internal dependencies
 publish_crate "hashtree-core"
-publish_crate "hashtree-nostrdb"
+publish_crate "hashtree-blossom"
+# hashtree-bep52 excluded - internal testing only
 
 # Tier 2: Depends on hashtree-core only
 publish_crate "hashtree-lmdb"
-publish_crate "hashtree-webrtc"
-publish_crate "hashtree-bep52"
-publish_crate "hashtree-sim"
-
-# Tier 3: Depends on hashtree-nostrdb
-publish_crate "hashtree-nostr"
-
-# Tier 4: Depends on hashtree-core
-publish_crate "hashtree-git"
+publish_crate "hashtree-s3"
 publish_crate "hashtree-resolver"
+# hashtree-sim excluded - internal testing only
+
+# Tier 3: Depends on hashtree-core + hashtree-lmdb
+publish_crate "hashtree-git"
+
+# Tier 4: Depends on hashtree-core only (hashtree-sim is dev-dependency)
+publish_crate "hashtree-webrtc"
 
 # Tier 5: Depends on multiple crates
 publish_crate "hashtree-cli"
