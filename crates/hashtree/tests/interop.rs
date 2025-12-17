@@ -207,7 +207,6 @@ fn test_hex_roundtrip() {
     assert_eq!(result, original);
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn test_chk_encryption_vectors() {
     use hashtree_core::crypto::{encrypt_chk, decrypt_chk};
@@ -327,7 +326,6 @@ fn generate_msgpack_vectors() {
 }
 
 /// Generate CHK test vectors - run with: cargo test generate_chk_vectors -- --nocapture --ignored
-#[cfg(feature = "encryption")]
 #[test]
 #[ignore]
 fn generate_chk_vectors() {

@@ -132,12 +132,13 @@ pub fn handle_upload_pack(storage: &GitStorage, body: &[u8]) -> Result<Vec<u8>> 
                 } else if line == "done" {
                     _done = true;
                 }
+                // Note: "done" is parsed by protocol but not used in this implementation
             }
             _ => {}
         }
     }
 
-    // Check for "done" in remaining data after flush
+    // Check for additional "have" lines in remaining data after flush
     let remaining = reader.remaining();
     if !remaining.is_empty() {
         let mut reader2 = PktLineReader::new(remaining);

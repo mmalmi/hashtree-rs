@@ -59,6 +59,7 @@ struct TheirRequest {
     /// Their request ID (for response correlation)
     id: u32,
     /// When they requested it
+    #[allow(dead_code)]
     requested_at: std::time::Instant,
 }
 
@@ -175,6 +176,9 @@ impl<S: Store + 'static> Peer<S> {
             .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 let state = state_clone.clone();
                 Box::pin(async move {
+                    if debug {
+                        println!("[Peer] Connection state changed: {:?}", s);
+                    }
                     let mut state = state.write().await;
                     match s {
                         RTCPeerConnectionState::Connected => {
@@ -253,6 +257,26 @@ impl<S: Store + 'static> Peer<S> {
                 })
             }));
 
+        // Handle ICE connection state for debugging
+        let debug_clone = debug;
+        self.connection
+            .on_ice_connection_state_change(Box::new(move |s| {
+                if debug_clone {
+                    println!("[Peer] ICE connection state: {:?}", s);
+                }
+                Box::pin(async {})
+            }));
+
+        // Handle ICE gathering state for debugging
+        let debug_clone2 = debug;
+        self.connection
+            .on_ice_gathering_state_change(Box::new(move |s| {
+                if debug_clone2 {
+                    println!("[Peer] ICE gathering state: {:?}", s);
+                }
+                Box::pin(async {})
+            }));
+
         Ok(())
     }
 
@@ -281,95 +305,95 @@ impl<S: Store + 'static> Peer<S> {
                     return;
                 }
 
-                // Match hashtree-ts: distinguish by whether it's valid UTF-8 JSON
+                // Match hashtree-ts: distinguish by whether it's valid JSON
                 // - String/JSON: control messages (req, res, have, want, root)
                 // - Binary: [4 bytes requestId LE][data]
-                if let Ok(json_str) = std::str::from_utf8(&data) {
-                    // JSON message
-                    if let Ok(msg) = serde_json::from_str::<DataMessage>(json_str) {
-                        match msg {
-                            DataMessage::Response {
-                                id, found, hash, ..
-                            } => {
-                                if !found {
-                                    let mut requests = pending_requests.write().await;
-                                    if let Some(request) = requests.remove(&id) {
-                                        let _ = request.response_tx.send(None);
-                                    }
-                                }
-                                // If found, binary data follows in separate message
-                                if debug {
-                                    println!(
-                                        "[Peer] Response: id={}, hash={}, found={}",
-                                        id, hash, found
-                                    );
+                // Note: We try JSON first. If it fails, treat as binary.
+                // This handles cases where binary data happens to be valid UTF-8.
+                let json_result = std::str::from_utf8(&data)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<DataMessage>(s).ok());
+
+                if let Some(msg) = json_result {
+                    match msg {
+                        DataMessage::Response {
+                            id, found, hash, ..
+                        } => {
+                            if !found {
+                                let mut requests = pending_requests.write().await;
+                                if let Some(request) = requests.remove(&id) {
+                                    let _ = request.response_tx.send(None);
                                 }
                             }
-                            DataMessage::Request { id, hash } => {
-                                if debug {
-                                    println!("[Peer] Request: id={}, hash={}", id, hash);
-                                }
-                                // Look up data in local store and respond
-                                if let Ok(hash_bytes) = from_hex(&hash) {
-                                    let response = match local_store.get(&hash_bytes).await {
-                                        Ok(Some(payload)) => {
-                                            if debug {
-                                                println!("[Peer] Responding with {} bytes", payload.len());
-                                            }
-                                            // Send JSON response header
-                                            let res_msg = DataMessage::Response {
-                                                id,
-                                                hash: hash.clone(),
-                                                found: true,
-                                                size: Some(payload.len() as u64),
-                                            };
-                                            let json = serde_json::to_string(&res_msg).unwrap();
-                                            let _ = dc.send(&Bytes::from(json)).await;
-
-                                            // Send binary data: [4 bytes requestId LE][data]
-                                            let mut binary = Vec::with_capacity(4 + payload.len());
-                                            binary.extend_from_slice(&id.to_le_bytes());
-                                            binary.extend_from_slice(&payload);
-                                            let _ = dc.send(&Bytes::from(binary)).await;
-                                            true
-                                        }
-                                        _ => false,
-                                    };
-                                    if !response {
-                                        // Track this request so we can push data later
-                                        // (like hashtree-ts theirRequests)
-                                        {
-                                            let mut their_reqs = their_requests.write().await;
-                                            their_reqs.put(
-                                                hash.clone(),
-                                                TheirRequest {
-                                                    id,
-                                                    requested_at: std::time::Instant::now(),
-                                                },
-                                            );
-                                        }
-
-                                        // Send not found response
+                            // If found, binary data follows in separate message
+                            if debug {
+                                println!(
+                                    "[Peer] Response: id={}, hash={}, found={}",
+                                    id, hash, found
+                                );
+                            }
+                        }
+                        DataMessage::Request { id, hash } => {
+                            if debug {
+                                println!("[Peer] Request: id={}, hash={}", id, hash);
+                            }
+                            // Look up data in local store and respond
+                            if let Ok(hash_bytes) = from_hex(&hash) {
+                                let response = match local_store.get(&hash_bytes).await {
+                                    Ok(Some(payload)) => {
+                                        // Send JSON response header
                                         let res_msg = DataMessage::Response {
                                             id,
-                                            hash,
-                                            found: false,
-                                            size: None,
+                                            hash: hash.clone(),
+                                            found: true,
+                                            size: Some(payload.len() as u64),
                                         };
                                         let json = serde_json::to_string(&res_msg).unwrap();
                                         let _ = dc.send(&Bytes::from(json)).await;
+
+                                        // Send binary data: [4 bytes requestId LE][data]
+                                        let mut binary = Vec::with_capacity(4 + payload.len());
+                                        binary.extend_from_slice(&id.to_le_bytes());
+                                        binary.extend_from_slice(&payload);
+                                        let _ = dc.send(&Bytes::from(binary)).await;
+                                        true
                                     }
+                                    _ => false,
+                                };
+                                if !response {
+                                    // Track this request so we can push data later
+                                    // (like hashtree-ts theirRequests)
+                                    {
+                                        let mut their_reqs = their_requests.write().await;
+                                        their_reqs.put(
+                                            hash.clone(),
+                                            TheirRequest {
+                                                id,
+                                                requested_at: std::time::Instant::now(),
+                                            },
+                                        );
+                                    }
+
+                                    // Send not found response
+                                    let res_msg = DataMessage::Response {
+                                        id,
+                                        hash,
+                                        found: false,
+                                        size: None,
+                                    };
+                                    let json = serde_json::to_string(&res_msg).unwrap();
+                                    let _ = dc.send(&Bytes::from(json)).await;
                                 }
                             }
-                            DataMessage::Push { hash } => {
-                                // Peer is pushing data we previously requested
-                                if debug {
-                                    println!("[Peer] Received push for hash: {}...", &hash[..16.min(hash.len())]);
-                                }
-                                // Binary data will follow - handled in binary message section
-                            }
-                            _ => {}
                         }
+                        DataMessage::Push { hash } => {
+                            // Peer is pushing data we previously requested
+                            if debug {
+                                println!("[Peer] Received push for hash: {}...", &hash[..16.min(hash.len())]);
+                            }
+                            // Binary data will follow - handled in binary message section
+                        }
+                        _ => {}
                     }
                 } else {
                     // Binary data: [4 bytes requestId little-endian][data]
@@ -451,11 +475,17 @@ impl<S: Store + 'static> Peer<S> {
     pub async fn handle_signaling(&self, msg: SignalingMessage) -> Result<(), PeerError> {
         match msg {
             SignalingMessage::Offer { sdp, .. } => {
+                if self.debug {
+                    println!("[Peer] Received offer, setting remote description");
+                }
                 let offer = RTCSessionDescription::offer(sdp)?;
                 self.connection.set_remote_description(offer).await?;
 
                 // Add any pending candidates
                 let candidates = self.pending_candidates.write().await.drain(..).collect::<Vec<_>>();
+                if self.debug && !candidates.is_empty() {
+                    println!("[Peer] Adding {} pending candidates after offer", candidates.len());
+                }
                 for candidate in candidates {
                     self.connection.add_ice_candidate(candidate).await?;
                 }
@@ -477,11 +507,17 @@ impl<S: Store + 'static> Peer<S> {
                 *self.state.write().await = PeerState::Connecting;
             }
             SignalingMessage::Answer { sdp, .. } => {
+                if self.debug {
+                    println!("[Peer] Received answer, setting remote description");
+                }
                 let answer = RTCSessionDescription::answer(sdp)?;
                 self.connection.set_remote_description(answer).await?;
 
                 // Add any pending candidates
                 let candidates = self.pending_candidates.write().await.drain(..).collect::<Vec<_>>();
+                if self.debug && !candidates.is_empty() {
+                    println!("[Peer] Adding {} pending candidates after answer", candidates.len());
+                }
                 for candidate in candidates {
                     self.connection.add_ice_candidate(candidate).await?;
                 }
@@ -493,7 +529,7 @@ impl<S: Store + 'static> Peer<S> {
                 ..
             } => {
                 let init = RTCIceCandidateInit {
-                    candidate,
+                    candidate: candidate.clone(),
                     sdp_mid,
                     sdp_mline_index: sdp_m_line_index,
                     ..Default::default()
@@ -501,8 +537,14 @@ impl<S: Store + 'static> Peer<S> {
 
                 // Check if remote description is set
                 if self.connection.remote_description().await.is_some() {
+                    if self.debug {
+                        println!("[Peer] Adding ICE candidate: {}...", &candidate[..candidate.len().min(50)]);
+                    }
                     self.connection.add_ice_candidate(init).await?;
                 } else {
+                    if self.debug {
+                        println!("[Peer] Queueing ICE candidate (no remote description yet)");
+                    }
                     self.pending_candidates.write().await.push(init);
                 }
             }

@@ -9,7 +9,6 @@ use crate::codec::{decode_tree_node, is_directory_node, is_tree_node, try_decode
 use crate::store::Store;
 use crate::types::{to_hex, Cid, Hash, Link, LinkType, TreeNode};
 
-#[cfg(feature = "encryption")]
 use crate::crypto::{decrypt_chk, EncryptionKey};
 
 /// Tree entry for directory listings
@@ -103,7 +102,6 @@ impl<S: Store> TreeReader<S> {
     }
 
     /// Read encrypted content by hash and key (internal)
-    #[cfg(feature = "encryption")]
     async fn get_encrypted(
         &self,
         hash: &Hash,
@@ -129,17 +127,7 @@ impl<S: Store> TreeReader<S> {
         Ok(Some(decrypted))
     }
 
-    #[cfg(not(feature = "encryption"))]
-    async fn get_encrypted(
-        &self,
-        _hash: &Hash,
-        _key: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>, ReaderError> {
-        Err(ReaderError::Decryption("encryption feature not enabled".to_string()))
-    }
-
     /// Assemble encrypted chunks from tree
-    #[cfg(feature = "encryption")]
     async fn assemble_encrypted_chunks(&self, node: &TreeNode) -> Result<Vec<u8>, ReaderError> {
         let mut parts: Vec<Vec<u8>> = Vec::new();
 

@@ -154,7 +154,6 @@ impl NostrRootResolver {
     }
 
     /// Extract Cid from event with encrypted_key decryption
-    #[cfg(feature = "encryption")]
     fn cid_from_event_shared(event: &Event, share_secret: &[u8; 32]) -> Option<Cid> {
         let mut hash_hex: Option<String> = None;
         let mut encrypted_key_hex: Option<String> = None;
@@ -268,7 +267,6 @@ impl RootResolver for NostrRootResolver {
         }
     }
 
-    #[cfg(feature = "encryption")]
     async fn resolve_shared(&self, key: &str, share_secret: &[u8; 32]) -> Result<Option<Cid>, ResolverError> {
         let (pubkey, tree_name) = Self::parse_key(key)?;
 
@@ -453,7 +451,6 @@ impl RootResolver for NostrRootResolver {
         Ok(!output.failed.is_empty() || !output.success.is_empty())
     }
 
-    #[cfg(feature = "encryption")]
     async fn publish_shared(&self, key: &str, cid: &Cid, share_secret: &[u8; 32]) -> Result<bool, ResolverError> {
         let (pubkey, tree_name) = Self::parse_key(key)?;
 

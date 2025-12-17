@@ -19,6 +19,7 @@ mod relay;
 mod sequential;
 mod simulation;
 mod store;
+pub mod ws_relay;
 
 pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};
 pub use channel::{ChannelError, LatencyChannel, MockChannel, PeerChannel};
@@ -41,6 +42,7 @@ pub use simulation::{
     BenchmarkResults, RequestResult, SimConfig, SimEvent, SimStats, Simulation, TopologyStats,
 };
 pub use store::{NetworkStore, SimStore};
+pub use ws_relay::WsRelay;
 
 /// Node identifier
 pub type NodeId = u64;

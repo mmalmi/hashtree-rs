@@ -179,7 +179,7 @@ pub fn root_page() -> Html<&'static str> {
 <body>
     <div class="container">
         <h1>Hashtree</h1>
-        <p class="subtitle">Content-Addressed Storage with Scionic Merkle Trees</p>
+        <p class="subtitle">Like Blossom, but with directories and chunking</p>
 
         <div class="card">
             <h2>Upload File</h2>

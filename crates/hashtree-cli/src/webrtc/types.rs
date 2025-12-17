@@ -68,10 +68,14 @@ pub fn should_forward(htl: u8) -> bool {
     htl > 0
 }
 
-/// Event kind for WebRTC signaling (same as iris-client's KIND_APP_DATA)
-pub const WEBRTC_KIND: u64 = 30078;
+/// Event kind for WebRTC signaling (ephemeral kind 25050)
+/// All signaling uses this kind - hellos use #l tag, directed use gift wrap
+pub const WEBRTC_KIND: u64 = 25050;
 
-/// Tag for WebRTC signaling messages
+/// Tag for hello messages (broadcast discovery)
+pub const HELLO_TAG: &str = "hello";
+
+/// Legacy tag for WebRTC signaling messages (kept for compatibility)
 pub const WEBRTC_TAG: &str = "webrtc";
 
 /// Generate a UUID for peer identification
@@ -438,8 +442,9 @@ fn is_max_htl(htl: &u8) -> bool {
 }
 
 /// Encode a request to wire format: [0x00][msgpack body]
+/// Uses named fields for cross-language compatibility with TypeScript
 pub fn encode_request(req: &DataRequest) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let body = rmp_serde::to_vec(req)?;
+    let body = rmp_serde::to_vec_named(req)?;
     let mut result = Vec::with_capacity(1 + body.len());
     result.push(MSG_TYPE_REQUEST);
     result.extend(body);
@@ -447,8 +452,9 @@ pub fn encode_request(req: &DataRequest) -> Result<Vec<u8>, rmp_serde::encode::E
 }
 
 /// Encode a response to wire format: [0x01][msgpack body]
+/// Uses named fields for cross-language compatibility with TypeScript
 pub fn encode_response(res: &DataResponse) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let body = rmp_serde::to_vec(res)?;
+    let body = rmp_serde::to_vec_named(res)?;
     let mut result = Vec::with_capacity(1 + body.len());
     result.push(MSG_TYPE_RESPONSE);
     result.extend(body);

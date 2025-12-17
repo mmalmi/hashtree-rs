@@ -24,7 +24,11 @@ rmp-serde = "1"
 serde_bytes = "0.11"
 
 # Async runtime
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
+
+# WebSocket relay for testing
+axum = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }

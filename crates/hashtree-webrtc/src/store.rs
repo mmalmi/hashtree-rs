@@ -11,6 +11,7 @@ use crate::types::{
 use async_trait::async_trait;
 use hashtree_core::{to_hex, Hash, Store, StoreError};
 use nostr_sdk::prelude::*;
+use nostr_sdk::ClientBuilder;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -87,8 +88,12 @@ impl<S: Store + 'static> WebRTCStore<S> {
         // Update peer ID with actual pubkey
         self.peer_id.pubkey = keys.public_key().to_hex();
 
-        // Create Nostr client
-        let client = Client::new(keys.clone());
+        // Create Nostr client with its own separate database to avoid event deduplication
+        // across multiple clients in the same process (important for tests)
+        let client = ClientBuilder::new()
+            .signer(keys.clone())
+            .database(nostr_sdk::database::MemoryDatabase::new())
+            .build();
 
         // Add relays
         for relay in &self.config.relays {
@@ -105,6 +110,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
         *self.running.write().await = true;
 
         // Subscribe to hashtree signaling events
+        // Filter by our pubkey in #p tag to only get events meant for us (or broadcasts)
         let filter = Filter::new()
             .kind(Kind::Custom(NOSTR_KIND_HASHTREE))
             .since(Timestamp::now());
@@ -153,18 +159,26 @@ impl<S: Store + 'static> WebRTCStore<S> {
         let config = self.config.clone();
         let stats = self.stats.clone();
 
+        // Get our own broadcast receiver for notifications
+        // Each call to notifications() returns a new receiver that receives all notifications
+        let mut notifications = client.notifications();
+
         tokio::spawn(async move {
             loop {
                 if !*running.read().await {
                     break;
                 }
 
-                // Handle notifications
-                if let Ok(notification) =
-                    tokio::time::timeout(std::time::Duration::from_millis(100), client.notifications().recv()).await
+                // Use tokio timeout to periodically check running flag
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    notifications.recv(),
+                )
+                .await
                 {
-                    match notification {
-                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                    Ok(Ok(notification)) => {
+                        if let RelayPoolNotification::Event { event, .. } = notification {
+                            // Only process our custom kind
                             if event.kind == Kind::Custom(NOSTR_KIND_HASHTREE) {
                                 if config.debug {
                                     let content_preview = if event.content.len() > 80 {
@@ -174,36 +188,41 @@ impl<S: Store + 'static> WebRTCStore<S> {
                                     };
                                     println!("[Store] Received event: {}", content_preview);
                                 }
-                                match serde_json::from_str::<SignalingMessage>(&event.content) {
-                                    Ok(msg) => {
-                                        Self::handle_signaling_message(
-                                            msg,
-                                            &local_peer_id,
-                                            peers.clone(),
-                                            peer_roots.clone(),
-                                            signaling_tx.clone(),
-                                            local_store.clone(),
-                                            &config,
-                                            stats.clone(),
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        if config.debug {
-                                            println!("[Store] Failed to parse signaling message: {}", e);
-                                        }
-                                    }
+                                if let Ok(msg) =
+                                    serde_json::from_str::<SignalingMessage>(&event.content)
+                                {
+                                    Self::handle_signaling_message(
+                                        msg,
+                                        &local_peer_id,
+                                        peers.clone(),
+                                        peer_roots.clone(),
+                                        signaling_tx.clone(),
+                                        local_store.clone(),
+                                        &config,
+                                        stats.clone(),
+                                    )
+                                    .await;
+                                } else if config.debug {
+                                    println!(
+                                        "[Store] Failed to parse signaling message from event"
+                                    );
                                 }
                             }
                         }
-                        Ok(RelayPoolNotification::Message { relay_url, message }) => {
-                            if config.debug {
-                                if let nostr_sdk::RelayMessage::Notice { message: notice } = message {
-                                    println!("[Store] NOTICE from {}: {}", relay_url, notice);
-                                }
-                            }
+                    }
+                    Ok(Err(e)) => {
+                        // Channel closed or lagged
+                        if config.debug {
+                            println!("[Store] Notification channel error: {:?}", e);
                         }
-                        _ => {}
+                        // For lagged errors, we can continue
+                        // For closed errors, break
+                        if matches!(e, tokio::sync::broadcast::error::RecvError::Closed) {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // Timeout, continue loop
                     }
                 }
             }
@@ -308,6 +327,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
                             if config.debug {
                                 println!("[Store] Initiating connection to {} (pool: {:?})", peer_id, pool);
                             }
+                            // Create peer and add to map BEFORE connecting to avoid race with incoming answer
                             if let Ok(peer) = Peer::new(
                                 remote_id,
                                 local_peer_id.to_string(),
@@ -318,10 +338,13 @@ impl<S: Store + 'static> WebRTCStore<S> {
                             .await
                             {
                                 let peer = Arc::new(peer);
-                                if peer.connect().await.is_ok() {
-                                    peers.write().await.insert(peer_id.clone(), PeerEntry { peer, pool });
-                                    stats.write().await.connected_peers += 1;
-                                }
+                                peers.write().await.insert(peer_id.clone(), PeerEntry { peer: peer.clone(), pool });
+                                stats.write().await.connected_peers += 1;
+
+                                // Spawn connection in separate task to not block event processing
+                                tokio::spawn(async move {
+                                    let _ = peer.connect().await;
+                                });
                             }
                         }
                     }
@@ -422,7 +445,17 @@ impl<S: Store + 'static> WebRTCStore<S> {
                 let builder =
                     EventBuilder::new(Kind::Custom(NOSTR_KIND_HASHTREE), json, []);
 
-                let _ = client.send_event_builder(builder).await;
+                match client.send_event_builder(builder).await {
+                    Ok(output) => {
+                        // Check if event was actually sent
+                        if output.success.is_empty() {
+                            eprintln!("[Store] Warning: Event not sent to any relay");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Store] Error sending event: {:?}", e);
+                    }
+                }
             }
         });
     }

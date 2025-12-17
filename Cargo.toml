@@ -32,6 +32,11 @@ hashtree-core = { path = "crates/hashtree", version = "0.1.0" }
 hashtree-lmdb = { path = "crates/hashtree-lmdb", version = "0.1.0" }
 hashtree-nostr = { path = "crates/hashtree-nostr", version = "0.1.0" }
 hashtree-git = { path = "crates/hashtree-git", version = "0.1.0" }
+hashtree-s3 = { path = "crates/hashtree-s3", version = "0.1.0" }
+
+# AWS S3
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
 
 # Storage
 heed = "0.20"

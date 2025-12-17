@@ -199,17 +199,7 @@ pub fn resolve_identity(identifier: &str) -> Result<(String, Option<String>)> {
     )
 }
 
-/// Default blossom servers for blob storage
-pub const DEFAULT_BLOSSOM_SERVERS: &[&str] =
-    &["https://blossom.primal.net", "https://nostr.download"];
-
-/// Default nostr relays
-pub const DEFAULT_RELAYS: &[&str] = &[
-    "wss://relay.damus.io",
-    "wss://relay.snort.social",
-    "wss://nos.lol",
-    "wss://temp.iris.to",
-];
+use crate::config::Config;
 
 /// Nostr client for git operations
 pub struct NostrClient {
@@ -226,16 +216,16 @@ pub struct NostrClient {
 }
 
 impl NostrClient {
-    /// Create a new client with pubkey and optional secret key
-    pub fn new(pubkey: &str, secret_key: Option<String>) -> Result<Self> {
+    /// Create a new client with pubkey, optional secret key, and config
+    pub fn new(pubkey: &str, secret_key: Option<String>, config: &Config) -> Result<Self> {
         // Use provided secret, or try environment variable
         let secret_key = secret_key.or_else(|| std::env::var("NOSTR_SECRET_KEY").ok());
 
         Ok(Self {
             pubkey: pubkey.to_string(),
             secret_key,
-            relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
-            blossom_servers: DEFAULT_BLOSSOM_SERVERS.iter().map(|s| s.to_string()).collect(),
+            relays: config.nostr.relays.clone(),
+            blossom_servers: config.blossom.all_read_servers(),
             cached_refs: HashMap::new(),
             cached_roots: HashMap::new(),
         })
@@ -326,12 +316,6 @@ impl NostrClient {
 
         info!("Published repo event to {} relays", self.relays.len());
         Ok(())
-    }
-
-    /// Fetch objects for a repository starting from root hash
-    pub fn fetch_objects(&self, _repo_name: &str, _sha: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        // TODO: Fetch from blossom servers using hashtree traversal
-        Ok(vec![])
     }
 
     /// Create a nostr event (unsigned)
@@ -459,31 +443,39 @@ mod tests {
 
     const TEST_PUBKEY: &str = "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0";
 
+    fn test_config() -> Config {
+        Config::default()
+    }
+
     #[test]
     fn test_new_client() {
-        let client = NostrClient::new(TEST_PUBKEY, None).unwrap();
-        assert_eq!(client.relays.len(), 4);
-        assert_eq!(client.blossom_servers.len(), 2);
+        let config = test_config();
+        let client = NostrClient::new(TEST_PUBKEY, None, &config).unwrap();
+        assert!(!client.relays.is_empty());
+        assert!(!client.blossom_servers.is_empty());
         assert!(!client.can_sign());
     }
 
     #[test]
     fn test_new_client_with_secret() {
+        let config = test_config();
         let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let client = NostrClient::new(TEST_PUBKEY, Some(secret.to_string())).unwrap();
+        let client = NostrClient::new(TEST_PUBKEY, Some(secret.to_string()), &config).unwrap();
         assert!(client.can_sign());
     }
 
     #[test]
     fn test_fetch_refs_empty() {
-        let mut client = NostrClient::new(TEST_PUBKEY, None).unwrap();
+        let config = test_config();
+        let mut client = NostrClient::new(TEST_PUBKEY, None, &config).unwrap();
         let refs = client.fetch_refs("new-repo").unwrap();
         assert!(refs.is_empty());
     }
 
     #[test]
     fn test_update_ref() {
-        let mut client = NostrClient::new(TEST_PUBKEY, None).unwrap();
+        let config = test_config();
+        let mut client = NostrClient::new(TEST_PUBKEY, None, &config).unwrap();
 
         client
             .update_ref("repo", "refs/heads/main", "abc123")
@@ -495,7 +487,8 @@ mod tests {
 
     #[test]
     fn test_event_format() {
-        let client = NostrClient::new(TEST_PUBKEY, None).unwrap();
+        let config = test_config();
+        let client = NostrClient::new(TEST_PUBKEY, None, &config).unwrap();
 
         let tags = vec![
             vec!["d".to_string(), "myrepo".to_string()],

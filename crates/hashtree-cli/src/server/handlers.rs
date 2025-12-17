@@ -528,10 +528,12 @@ pub async fn webrtc_peers(State(state): State<AppState>) -> impl IntoResponse {
 
     let peers = webrtc_state.peers.read().await;
     let peer_list: Vec<_> = peers.iter().map(|(id, entry)| {
+        let rtc_state = entry.peer.as_ref().map(|p| format!("{:?}", p.state()));
         json!({
             "id": id,
             "pubkey": entry.peer_id.pubkey,
             "state": format!("{:?}", entry.state),
+            "rtc_state": rtc_state,
             "pool": format!("{:?}", entry.pool),
             "connected": entry.state == ConnectionState::Connected,
             "has_data_channel": entry.peer.as_ref().map(|p| p.has_data_channel()).unwrap_or(false),

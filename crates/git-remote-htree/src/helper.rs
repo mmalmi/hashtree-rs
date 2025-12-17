@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::{debug, info, warn};
 
+use crate::config::Config;
 use crate::nostr_client::NostrClient;
 
 /// Get the shared hashtree data directory
@@ -33,6 +34,8 @@ pub struct RemoteHelper {
     repo_name: String,
     storage: GitStorage,
     nostr: NostrClient,
+    #[allow(dead_code)]
+    config: Config,
     should_exit: bool,
     /// Refs advertised by remote
     remote_refs: HashMap<String, String>,
@@ -56,16 +59,17 @@ struct FetchSpec {
 }
 
 impl RemoteHelper {
-    pub fn new(pubkey: &str, repo_name: &str, secret_key: Option<String>) -> Result<Self> {
+    pub fn new(pubkey: &str, repo_name: &str, secret_key: Option<String>, config: Config) -> Result<Self> {
         // Use shared hashtree storage at ~/.hashtree/data
         let storage = GitStorage::open(get_hashtree_data_dir())?;
-        let nostr = NostrClient::new(pubkey, secret_key)?;
+        let nostr = NostrClient::new(pubkey, secret_key, &config)?;
 
         Ok(Self {
             pubkey: pubkey.to_string(),
             repo_name: repo_name.to_string(),
             storage,
             nostr,
+            config,
             should_exit: false,
             remote_refs: HashMap::new(),
             push_specs: Vec::new(),
@@ -191,8 +195,8 @@ impl RemoteHelper {
         for spec in &self.fetch_specs {
             debug!("Fetching {} ({})", spec.name, spec.sha);
 
-            // Fetch objects from nostr/blossom
-            let objects = self.nostr.fetch_objects(&self.repo_name, &spec.sha)?;
+            // Use htree get to fetch objects (includes file server fallback)
+            let objects = self.fetch_objects_via_htree(&spec.sha)?;
 
             // Store in local git
             for (oid, data) in objects {
@@ -202,6 +206,40 @@ impl RemoteHelper {
 
         self.fetch_specs.clear();
         Ok(())
+    }
+
+    /// Fetch objects using htree CLI (which has file server fallback)
+    fn fetch_objects_via_htree(&self, root_hash: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        // First, try to get the root hash content via htree get
+        let output = Command::new("htree")
+            .args(["get", root_hash])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                // htree get outputs raw content - for git repos this is the tree structure
+                // Parse and recursively fetch git objects
+                let content = out.stdout;
+                debug!("Fetched {} bytes for {}", content.len(), root_hash);
+
+                // The hashtree stores git objects - return them for unpacking
+                // TODO: Parse the hashtree structure to get individual git objects
+                // For now, return empty - needs full implementation
+                Ok(vec![])
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                debug!("htree get failed for {}: {}", root_hash, stderr);
+                // Not found locally or on file servers
+                Ok(vec![])
+            }
+            Err(e) => {
+                warn!("Failed to run htree get: {}", e);
+                Ok(vec![])
+            }
+        }
     }
 
     /// Write object to local git object store
@@ -327,7 +365,36 @@ impl RemoteHelper {
         // Publish to nostr (kind 30078 with hashtree label)
         self.nostr.publish_repo(&self.repo_name, &root_hash)?;
 
+        // Push to file servers (blossom) in background
+        // This makes content available even without P2P connection
+        self.push_to_file_servers(&root_hash);
+
         Ok(())
+    }
+
+    /// Push content to file servers (blossom) - fire and forget
+    fn push_to_file_servers(&self, root_hash: &str) {
+        use std::process::Command;
+
+        // Use htree push command which handles auth and config
+        let result = Command::new("htree")
+            .args(["push", root_hash])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                // Don't wait - let it run in background
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                info!("Started file server push for {}", root_hash);
+            }
+            Err(e) => {
+                warn!("Failed to start file server push: {}", e);
+            }
+        }
     }
 
     /// List objects that need to be pushed (not on remote)
@@ -386,7 +453,8 @@ mod tests {
     const TEST_PUBKEY: &str = "4523be58d395b1b196a9b8c82b038b6895cb02b683d0c253a955068dba1facd0";
 
     fn create_test_helper() -> Option<RemoteHelper> {
-        RemoteHelper::new(TEST_PUBKEY, "test-repo", None).ok()
+        let config = Config::default();
+        RemoteHelper::new(TEST_PUBKEY, "test-repo", None, config).ok()
     }
 
     #[test]

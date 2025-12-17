@@ -29,7 +29,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "htree")]
-#[command(about = "Content-addressed storage with Scionic Merkle Trees", long_about = None)]
+#[command(about = "Like Blossom, but with directories and chunking", long_about = None)]
 struct Cli {
     #[arg(long, default_value = "./hashtree-data", global = true, env = "HTREE_DATA_DIR")]
     data_dir: PathBuf,
@@ -44,6 +44,9 @@ enum Commands {
     Start {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+        /// Override Nostr relays (comma-separated)
+        #[arg(long)]
+        relays: Option<String>,
     },
     /// Add file or directory to hashtree (like ipfs add)
     Add {
@@ -61,6 +64,9 @@ enum Commands {
         /// Publish to Nostr under this ref name (e.g., "mydata" -> npub.../mydata)
         #[arg(long)]
         publish: Option<String>,
+        /// Don't push to file servers (local only)
+        #[arg(long)]
+        local: bool,
     },
     /// Get/download content by CID
     Get {
@@ -123,27 +129,51 @@ enum Commands {
     },
     /// List users you follow
     Following,
-    /// Push content to Blossom servers
+    /// Push content to file servers (Blossom)
     Push {
         /// CID (hash or hash:key) to push
         cid: String,
-        /// Blossom server URL (overrides config)
+        /// File server URL (overrides config)
         #[arg(long, short)]
         server: Option<String>,
     },
+    /// Manage storage limits and eviction
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageCommands {
+    /// Show storage usage statistics by priority tier
+    Stats,
+    /// List all indexed trees
+    Trees,
+    /// Manually trigger eviction
+    Evict,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls crypto provider (required for TLS connections)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize tracing (respects RUST_LOG env var)
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { addr } => {
+        Commands::Start { addr, relays: relays_override } => {
             // Load or create config
-            let config = Config::load()?;
+            let mut config = Config::load()?;
+
+            // Override relays if specified on command line
+            if let Some(relays_str) = relays_override {
+                config.nostr.relays = relays_str.split(',').map(|s| s.trim().to_string()).collect();
+                println!("Using relays from CLI: {:?}", config.nostr.relays);
+            }
 
             // Use data dir from config if not overridden by CLI
             let data_dir = if cli.data_dir.to_str() == Some("./hashtree-data") {
@@ -152,7 +182,9 @@ async fn main() -> Result<()> {
                 cli.data_dir.clone()
             };
 
-            let store = Arc::new(HashtreeStore::new(&data_dir)?);
+            // Convert max_size_gb to bytes
+            let max_size_bytes = config.storage.max_size_gb * 1024 * 1024 * 1024;
+            let store = Arc::new(HashtreeStore::with_options(&data_dir, config.storage.s3.as_ref(), max_size_bytes)?);
 
             // Initialize nostrdb for event storage
             let nostrdb_path = data_dir.join("nostrdb");
@@ -268,6 +300,9 @@ async fn main() -> Result<()> {
             // Set up server with ndb query sender for social graph
             let mut server = HashtreeServer::new(Arc::clone(&store), addr.clone())
                 .with_ndb_query(relay_handle.query.clone())
+                .with_max_write_distance(config.nostr.max_write_distance)
+                .with_max_upload_bytes((config.blossom.max_upload_mb as usize) * 1024 * 1024)
+                .with_public_writes(config.server.public_writes)
                 .with_git(git_storage, hex::encode(pk_bytes));
 
             // Add WebRTC peer state for P2P queries from HTTP handler
@@ -277,10 +312,13 @@ async fn main() -> Result<()> {
 
             // Start background sync service if enabled
             let sync_handle = if config.sync.enabled {
+                // Combine legacy servers with read_servers for sync (reading)
+                let mut blossom_read_servers = config.blossom.servers.clone();
+                blossom_read_servers.extend(config.blossom.read_servers.clone());
                 let sync_config = hashtree_cli::sync::SyncConfig {
                     sync_own: config.sync.sync_own,
                     sync_followed: config.sync.sync_followed,
-                    blossom_servers: config.blossom.servers.clone(),
+                    blossom_servers: blossom_read_servers,
                     relays: config.nostr.relays.clone(),
                     max_concurrent: config.sync.max_concurrent,
                     webrtc_timeout_ms: config.sync.webrtc_timeout_ms,
@@ -312,6 +350,25 @@ async fn main() -> Result<()> {
                 None
             };
 
+            // Start background eviction task (runs every 5 minutes)
+            let eviction_store = Arc::clone(&store);
+            let eviction_handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
+                loop {
+                    interval.tick().await;
+                    match eviction_store.evict_if_needed() {
+                        Ok(freed) => {
+                            if freed > 0 {
+                                tracing::info!("Background eviction freed {} bytes", freed);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Background eviction error: {}", e);
+                        }
+                    }
+                }
+            });
+
             // Print startup info
             println!("Starting hashtree daemon on {}", addr);
             println!("Data directory: {}", data_dir.display());
@@ -339,6 +396,7 @@ async fn main() -> Result<()> {
             if config.server.enable_webrtc {
                 println!("WebRTC: enabled (P2P connections)");
             }
+            println!("Storage limit: {} GB", config.storage.max_size_gb);
             if config.sync.enabled {
                 let mut sync_features = Vec::new();
                 if config.sync.sync_own {
@@ -362,6 +420,9 @@ async fn main() -> Result<()> {
 
             server.run().await?;
 
+            // Shutdown background eviction
+            eviction_handle.abort();
+
             // Shutdown background sync
             if let Some(handle) = sync_handle {
                 handle.abort();
@@ -380,7 +441,7 @@ async fn main() -> Result<()> {
             // Shutdown relay thread
             relay_handle.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        Commands::Add { path, only_hash, public, no_ignore, publish } => {
+        Commands::Add { path, only_hash, public, no_ignore, publish, local } => {
             let is_dir = path.is_dir();
 
             if only_hash {
@@ -469,6 +530,32 @@ async fn main() -> Result<()> {
                     (hash_hex, key_hex)
                 };
 
+                // Index tree for eviction tracking (own content = highest priority)
+                // Get user's npub as owner
+                let (nsec_str, _) = ensure_nsec_string()?;
+                let keys = NostrKeys::parse(&nsec_str)
+                    .context("Failed to parse nsec")?;
+                let npub = NostrToBech32::to_bech32(&keys.public_key())
+                    .context("Failed to encode npub")?;
+
+                let tree_name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string());
+
+                // Build ref_key: "npub/filename"
+                let ref_key = tree_name.as_ref()
+                    .map(|name| format!("{}/{}", npub, name));
+
+                let hash_bytes = from_hex(&hash_hex).context("Invalid hash")?;
+                if let Err(e) = store.index_tree(
+                    &hash_bytes,
+                    &npub,
+                    tree_name.as_deref(),
+                    hashtree_cli::PRIORITY_OWN,
+                    ref_key.as_deref(),
+                ) {
+                    tracing::warn!("Failed to index tree: {}", e);
+                }
+
                 // Publish to Nostr if --publish was specified
                 if let Some(ref_name) = publish {
                     // Load config for relay list
@@ -519,6 +606,23 @@ async fn main() -> Result<()> {
 
                     // Clean up
                     let _ = resolver.stop().await;
+                }
+
+                // Background push to Blossom (unless --local)
+                if !local {
+                    let config = Config::load()?;
+                    // Combine legacy servers with write_servers for pushing
+                    let mut write_servers = config.blossom.servers.clone();
+                    write_servers.extend(config.blossom.write_servers.clone());
+                    if !write_servers.is_empty() {
+                        let data_dir = cli.data_dir.clone();
+                        let hash_for_push = hash_hex.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = background_blossom_push(&data_dir, &hash_for_push, &write_servers).await {
+                                eprintln!("  file server push failed: {}", e);
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -823,9 +927,113 @@ async fn main() -> Result<()> {
         Commands::Push { cid, server } => {
             push_to_blossom(&cli.data_dir, &cid, server).await?;
         }
+        Commands::Storage { command } => {
+            // Load config
+            let config = Config::load()?;
+
+            // Use data dir from config if not overridden by CLI
+            let data_dir = if cli.data_dir.to_str() == Some("./hashtree-data") {
+                PathBuf::from(&config.storage.data_dir)
+            } else {
+                cli.data_dir.clone()
+            };
+
+            let max_size_bytes = config.storage.max_size_gb * 1024 * 1024 * 1024;
+            let store = HashtreeStore::with_options(&data_dir, config.storage.s3.as_ref(), max_size_bytes)?;
+
+            match command {
+                StorageCommands::Stats => {
+                    let stats = store.get_storage_stats()?;
+                    let by_priority = store.storage_by_priority()?;
+                    let tracked = store.tracked_size()?;
+                    let trees = store.list_indexed_trees()?;
+
+                    println!("Storage Statistics:");
+                    println!("  Max size:     {} GB ({} bytes)", config.storage.max_size_gb, max_size_bytes);
+                    println!("  Total bytes:  {} ({:.2} GB)", stats.total_bytes, stats.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+                    println!("  Tracked:      {} ({:.2} GB)", tracked, tracked as f64 / 1024.0 / 1024.0 / 1024.0);
+                    println!("  Total DAGs:   {}", stats.total_dags);
+                    println!("  Pinned DAGs:  {}", stats.pinned_dags);
+                    println!("  Indexed trees: {}", trees.len());
+                    println!();
+                    println!("Usage by priority:");
+                    println!("  Own (255):      {} ({:.2} MB)", by_priority.own, by_priority.own as f64 / 1024.0 / 1024.0);
+                    println!("  Followed (128): {} ({:.2} MB)", by_priority.followed, by_priority.followed as f64 / 1024.0 / 1024.0);
+                    println!("  Other (64):     {} ({:.2} MB)", by_priority.other, by_priority.other as f64 / 1024.0 / 1024.0);
+
+                    let utilization = if max_size_bytes > 0 {
+                        (tracked as f64 / max_size_bytes as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!();
+                    println!("Utilization: {:.1}%", utilization);
+                }
+                StorageCommands::Trees => {
+                    use hashtree::to_hex;
+                    let trees = store.list_indexed_trees()?;
+
+                    if trees.is_empty() {
+                        println!("No indexed trees");
+                    } else {
+                        println!("Indexed trees ({}):", trees.len());
+                        for (root_hash, meta) in trees {
+                            let root_hex = to_hex(&root_hash);
+                            let priority_str = match meta.priority {
+                                255 => "own",
+                                128 => "followed",
+                                _ => "other",
+                            };
+                            let name = meta.name.as_deref().unwrap_or("<unnamed>");
+                            let synced = chrono_humanize_timestamp(meta.synced_at);
+                            println!(
+                                "  {}... {} ({}) - {} - {} bytes - {}",
+                                &root_hex[..12],
+                                name,
+                                priority_str,
+                                &meta.owner[..12.min(meta.owner.len())],
+                                meta.total_size,
+                                synced
+                            );
+                        }
+                    }
+                }
+                StorageCommands::Evict => {
+                    println!("Running eviction...");
+                    let freed = store.evict_if_needed()?;
+                    if freed > 0 {
+                        println!("Evicted {} bytes ({:.2} MB)", freed, freed as f64 / 1024.0 / 1024.0);
+                    } else {
+                        println!("No eviction needed (storage under limit)");
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Convert unix timestamp to human-readable string
+fn chrono_humanize_timestamp(ts: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH, Duration};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+
+    let diff = now.saturating_sub(ts);
+
+    if diff < 60 {
+        format!("{}s ago", diff)
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
 }
 
 /// Follow or unfollow a user by publishing an updated kind 3 contact list
@@ -953,15 +1161,18 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
     // Load config
     let config = Config::load()?;
 
-    // Get servers (override or from config)
+    // Get servers (override or from config - use write_servers for push)
     let servers = if let Some(s) = server_override {
         vec![s]
     } else {
-        config.blossom.servers.clone()
+        // Combine legacy servers with write_servers
+        let mut write_servers = config.blossom.servers.clone();
+        write_servers.extend(config.blossom.write_servers.clone());
+        write_servers
     };
 
     if servers.is_empty() {
-        anyhow::bail!("No Blossom servers configured. Use --server or add servers to config.toml");
+        anyhow::bail!("No file servers configured. Use --server or add write_servers to config.toml");
     }
 
     // Ensure nsec exists for signing
@@ -1112,6 +1323,231 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
     }
 
     println!("\nDone!");
+    Ok(())
+}
+
+/// Fetch a blob from blossom read servers (fallback when not available locally)
+/// Returns None if not found on any server
+async fn fetch_from_blossom(hash_hex: &str, servers: &[String]) -> Option<Vec<u8>> {
+    use sha2::{Sha256, Digest};
+
+    if servers.is_empty() {
+        return None;
+    }
+
+    let client = reqwest::Client::new();
+
+    for server in servers {
+        let url = format!("{}/{}", server.trim_end_matches('/'), hash_hex);
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    // Verify hash
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    let computed = hex::encode(hasher.finalize());
+                    if computed == hash_hex {
+                        return Some(bytes.to_vec());
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    None
+}
+
+/// Background push to Blossom - fire and forget with server-level backoff
+/// Tries up to MAX_ATTEMPTS total, gives up and drops if still failing
+async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[String]) -> Result<()> {
+    use hashtree::to_hex;
+    use sha2::{Sha256, Digest};
+    use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    const MAX_ATTEMPTS: u32 = 3;
+    const BASE_BACKOFF_MS: u64 = 1000;
+    const MAX_BACKOFF_MS: u64 = 30000;
+
+    // Track server health for backoff
+    struct ServerHealth {
+        last_error: Instant,
+        consecutive_errors: u32,
+    }
+    let mut server_health: HashMap<String, ServerHealth> = HashMap::new();
+
+    // Check if server is in backoff
+    let is_in_backoff = |health: &HashMap<String, ServerHealth>, server: &str| -> bool {
+        if let Some(h) = health.get(server) {
+            if h.consecutive_errors == 0 {
+                return false;
+            }
+            let backoff_ms = std::cmp::min(
+                BASE_BACKOFF_MS * 2_u64.pow(h.consecutive_errors - 1),
+                MAX_BACKOFF_MS,
+            );
+            h.last_error.elapsed().as_millis() < backoff_ms as u128
+        } else {
+            false
+        }
+    };
+
+    // Ensure nsec exists for signing
+    let (nsec_str, _) = ensure_nsec_string()?;
+    let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
+
+    // Open local store
+    let store = HashtreeStore::new(data_dir)?;
+
+    // Parse CID (hash or hash:key)
+    let (hash_hex, _key_hex) = if let Some((h, k)) = cid_str.split_once(':') {
+        (h.to_string(), Some(k.to_string()))
+    } else {
+        (cid_str.to_string(), None)
+    };
+
+    // Collect all blocks to push (walk the DAG)
+    let mut blocks_to_push: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = vec![hash_hex.clone()];
+
+    while let Some(hash) = queue.pop() {
+        if visited.contains(&hash) {
+            continue;
+        }
+        visited.insert(hash.clone());
+
+        // Try to get as tree node first (for directories/internal nodes)
+        if let Ok(Some(node)) = store.get_tree_node(&hash) {
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash.clone(), data));
+            }
+            for link in &node.links {
+                let child_hash = to_hex(&link.hash);
+                if !visited.contains(&child_hash) {
+                    queue.push(child_hash);
+                }
+            }
+        } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
+            if metadata.is_chunked {
+                for chunk_cid in &metadata.chunk_cids {
+                    if !visited.contains(chunk_cid) {
+                        if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
+                            blocks_to_push.push((chunk_cid.clone(), chunk_data));
+                            visited.insert(chunk_cid.clone());
+                        }
+                    }
+                }
+            }
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash.clone(), data));
+            }
+        } else if let Ok(Some(data)) = store.get_blob(&hash) {
+            blocks_to_push.push((hash.clone(), data));
+        }
+    }
+
+    if blocks_to_push.is_empty() {
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+    let mut total_uploaded = 0;
+    let mut total_skipped = 0;
+
+    // Try each block with limited retries
+    for (hash, data) in &blocks_to_push {
+        let mut attempts = 0;
+        let mut uploaded = false;
+
+        while attempts < MAX_ATTEMPTS && !uploaded {
+            attempts += 1;
+
+            // Find a server not in backoff
+            let available_server = servers.iter().find(|s| !is_in_backoff(&server_health, s));
+            let server = match available_server {
+                Some(s) => s,
+                None => {
+                    // All servers in backoff, wait a bit and retry
+                    tokio::time::sleep(tokio::time::Duration::from_millis(BASE_BACKOFF_MS)).await;
+                    continue;
+                }
+            };
+
+            // Check if already exists (HEAD request)
+            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
+            if let Ok(resp) = client.head(&url).send().await {
+                if resp.status().is_success() {
+                    total_skipped += 1;
+                    uploaded = true;
+                    continue;
+                }
+            }
+
+            // Create Blossom auth event
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let expiration = now + 300;
+
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let computed_hash = hex::encode(hasher.finalize());
+
+            let auth_event = match EventBuilder::new(Kind::Custom(24242), "Upload")
+                .tags(vec![
+                    Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
+                    Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
+                    Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
+                ])
+                .sign(&keys)
+                .await
+            {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let auth_json = auth_event.as_json();
+            let auth_header = format!("Nostr {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth_json));
+
+            let upload_url = format!("{}/upload", server.trim_end_matches('/'));
+            let resp = client.put(&upload_url)
+                .header("Authorization", auth_header)
+                .header("Content-Type", "application/octet-stream")
+                .header("X-SHA-256", &computed_hash)
+                .body(data.clone())
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
+                    // Success - reset server health
+                    server_health.remove(server);
+                    total_uploaded += 1;
+                    uploaded = true;
+                }
+                Ok(_) | Err(_) => {
+                    // Error - record backoff
+                    let health = server_health.entry(server.clone()).or_insert(ServerHealth {
+                        last_error: Instant::now(),
+                        consecutive_errors: 0,
+                    });
+                    health.last_error = Instant::now();
+                    health.consecutive_errors += 1;
+                }
+            }
+        }
+
+        // If still not uploaded after MAX_ATTEMPTS, just drop it (no memory accumulation)
+    }
+
+    if total_uploaded > 0 || total_skipped > 0 {
+        println!("  file servers: {} uploaded, {} already exist", total_uploaded, total_skipped);
+    }
+
     Ok(())
 }
 

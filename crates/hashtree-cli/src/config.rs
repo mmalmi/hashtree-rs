@@ -31,6 +31,14 @@ pub struct ServerConfig {
     /// Enable WebRTC P2P connections
     #[serde(default = "default_enable_webrtc")]
     pub enable_webrtc: bool,
+    /// Allow anyone with valid Nostr auth to write (default: true)
+    /// When false, only social graph members can write
+    #[serde(default = "default_public_writes")]
+    pub public_writes: bool,
+}
+
+fn default_public_writes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +47,37 @@ pub struct StorageConfig {
     pub data_dir: String,
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
+    /// Optional S3/R2 backend for blob storage
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+}
+
+/// S3-compatible storage configuration (works with AWS S3, Cloudflare R2, MinIO, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    /// S3 endpoint URL (e.g., "https://<account_id>.r2.cloudflarestorage.com" for R2)
+    pub endpoint: String,
+    /// S3 bucket name
+    pub bucket: String,
+    /// Optional key prefix for all blobs (e.g., "blobs/")
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// AWS region (use "auto" for R2)
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+    /// Access key ID (can also be set via AWS_ACCESS_KEY_ID env var)
+    #[serde(default)]
+    pub access_key: Option<String>,
+    /// Secret access key (can also be set via AWS_SECRET_ACCESS_KEY env var)
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Public URL for serving blobs (optional, for generating public URLs)
+    #[serde(default)]
+    pub public_url: Option<String>,
+}
+
+fn default_s3_region() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,9 +98,30 @@ pub struct NostrConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlossomConfig {
-    /// Blossom servers for push/pull
-    #[serde(default = "default_blossom_servers")]
+    /// File servers for push/pull (legacy, both read and write)
+    #[serde(default)]
     pub servers: Vec<String>,
+    /// Read-only file servers (fallback for fetching content)
+    #[serde(default = "default_read_servers")]
+    pub read_servers: Vec<String>,
+    /// Write-enabled file servers (for uploading)
+    #[serde(default = "default_write_servers")]
+    pub write_servers: Vec<String>,
+    /// Maximum upload size in MB (default: 5)
+    #[serde(default = "default_max_upload_mb")]
+    pub max_upload_mb: u64,
+}
+
+fn default_read_servers() -> Vec<String> {
+    vec!["https://files.iris.to".to_string()]
+}
+
+fn default_write_servers() -> Vec<String> {
+    vec!["https://hashtree.iris.to".to_string()]
+}
+
+fn default_max_upload_mb() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,11 +146,6 @@ pub struct SyncConfig {
     pub blossom_timeout_ms: u64,
 }
 
-fn default_blossom_servers() -> Vec<String> {
-    vec![
-        "https://blossom.iris.to".to_string(),
-    ]
-}
 
 fn default_sync_enabled() -> bool {
     true
@@ -163,6 +218,7 @@ impl Default for ServerConfig {
             enable_auth: default_enable_auth(),
             stun_port: default_stun_port(),
             enable_webrtc: default_enable_webrtc(),
+            public_writes: default_public_writes(),
         }
     }
 }
@@ -172,6 +228,7 @@ impl Default for StorageConfig {
         Self {
             data_dir: default_data_dir(),
             max_size_gb: default_max_size_gb(),
+            s3: None,
         }
     }
 }
@@ -190,7 +247,10 @@ impl Default for NostrConfig {
 impl Default for BlossomConfig {
     fn default() -> Self {
         Self {
-            servers: default_blossom_servers(),
+            servers: Vec::new(),
+            read_servers: default_read_servers(),
+            write_servers: default_write_servers(),
+            max_upload_mb: default_max_upload_mb(),
         }
     }
 }
