@@ -71,3 +71,55 @@ fn test_peer_direction_display() {
     assert_eq!(PeerDirection::Inbound.to_string(), "inbound");
     assert_eq!(PeerDirection::Outbound.to_string(), "outbound");
 }
+
+// Wire format tests for hashtree-ts interop
+#[test]
+fn test_wire_format_request_encode_decode() {
+    let req = DataRequest {
+        h: vec![0xab; 32],
+        htl: 10,
+    };
+    let encoded = encode_request(&req).unwrap();
+
+    // First byte should be request type
+    assert_eq!(encoded[0], MSG_TYPE_REQUEST);
+
+    // Should round-trip
+    let parsed = parse_message(&encoded).unwrap();
+    match parsed {
+        DataMessage::Request(r) => {
+            assert_eq!(r.h, vec![0xab; 32]);
+            assert_eq!(r.htl, 10);
+        }
+        _ => panic!("Expected request"),
+    }
+}
+
+#[test]
+fn test_wire_format_response_encode_decode() {
+    let res = DataResponse {
+        h: vec![0xcd; 32],
+        d: vec![1, 2, 3, 4, 5],
+    };
+    let encoded = encode_response(&res).unwrap();
+
+    // First byte should be response type
+    assert_eq!(encoded[0], MSG_TYPE_RESPONSE);
+
+    // Should round-trip
+    let parsed = parse_message(&encoded).unwrap();
+    match parsed {
+        DataMessage::Response(r) => {
+            assert_eq!(r.h, vec![0xcd; 32]);
+            assert_eq!(r.d, vec![1, 2, 3, 4, 5]);
+        }
+        _ => panic!("Expected response"),
+    }
+}
+
+#[test]
+fn test_wire_format_constants() {
+    // These must match hashtree-ts constants
+    assert_eq!(MSG_TYPE_REQUEST, 0x00);
+    assert_eq!(MSG_TYPE_RESPONSE, 0x01);
+}

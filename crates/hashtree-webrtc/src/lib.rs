@@ -37,14 +37,20 @@
 //! ```
 
 pub mod peer;
+pub mod protocol;
 pub mod store;
 pub mod types;
 
 pub use peer::{ForwardRequestCallback, Peer, PeerError};
+pub use protocol::{
+    bytes_to_hash, create_fragment_response, create_request, create_response, encode_request,
+    encode_response, hash_to_bytes, hash_to_key, is_fragmented, parse_message, DataMessage,
+    DataRequest, DataResponse, FRAGMENT_SIZE, MSG_TYPE_REQUEST, MSG_TYPE_RESPONSE,
+};
 pub use store::{WebRTCStore, WebRTCStoreError};
 pub use types::{
     classifier_channel, should_forward, ClassifierRx, ClassifierTx, ClassifyRequest,
-    DataMessage, ForwardRequest, ForwardRx, ForwardTx, IceCandidate, PeerId, PeerHTLConfig,
-    PeerPool, PeerState, PoolConfig, PoolSettings, SignalingMessage, WebRTCStats,
-    WebRTCStoreConfig, DATA_CHANNEL_LABEL, MAX_HTL, NOSTR_KIND_HASHTREE,
+    ForwardRequest, ForwardRx, ForwardTx, IceCandidate, PeerId, PeerHTLConfig, PeerPool,
+    PeerState, PoolConfig, PoolSettings, SignalingMessage, WebRTCStats, WebRTCStoreConfig,
+    DATA_CHANNEL_LABEL, MAX_HTL, NOSTR_KIND_HASHTREE,
 };

@@ -1,8 +1,10 @@
 //! Tests for WebRTC types
 
 use hashtree_webrtc::{
-    should_forward, DataMessage, PeerHTLConfig, PeerId, PeerState, SignalingMessage, WebRTCStats,
-    WebRTCStoreConfig, MAX_HTL,
+    bytes_to_hash, create_fragment_response, create_request, create_response, encode_request,
+    encode_response, is_fragmented, parse_message, should_forward, DataMessage, PeerHTLConfig,
+    PeerId, PeerState, SignalingMessage, WebRTCStats, WebRTCStoreConfig, MSG_TYPE_REQUEST,
+    MSG_TYPE_RESPONSE, MAX_HTL,
 };
 
 #[test]
@@ -74,77 +76,88 @@ fn test_signaling_message_roundtrip() {
     }
 }
 
+// Binary MessagePack protocol tests
+
 #[test]
-fn test_data_message_request_serialize() {
-    let msg = DataMessage::Request {
-        id: 42,
-        hash: "abcd1234".to_string(),
-        htl: Some(10),
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"req\""));
-    assert!(json.contains("\"id\":42"));
-    assert!(json.contains("\"hash\":\"abcd1234\""));
-    assert!(json.contains("\"htl\":10"));
+fn test_encode_decode_request() {
+    let hash = [0xab; 32];
+    let req = create_request(&hash, 10);
+    let encoded = encode_request(&req);
+
+    // First byte should be request type marker
+    assert_eq!(encoded[0], MSG_TYPE_REQUEST);
+
+    let parsed = parse_message(&encoded).unwrap();
+    match parsed {
+        DataMessage::Request(r) => {
+            assert_eq!(r.h, hash.to_vec());
+            assert_eq!(r.htl, Some(10));
+        }
+        _ => panic!("Expected request"),
+    }
 }
 
 #[test]
-fn test_data_message_request_without_htl() {
-    let msg = DataMessage::Request {
-        id: 42,
-        hash: "abcd1234".to_string(),
-        htl: None,
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    // htl should be omitted when None
-    assert!(!json.contains("htl"));
+fn test_encode_decode_response() {
+    let hash = [0xcd; 32];
+    let data = vec![1, 2, 3, 4, 5];
+    let res = create_response(&hash, data.clone());
+    let encoded = encode_response(&res);
+
+    // First byte should be response type marker
+    assert_eq!(encoded[0], MSG_TYPE_RESPONSE);
+
+    let parsed = parse_message(&encoded).unwrap();
+    match parsed {
+        DataMessage::Response(r) => {
+            assert_eq!(r.h, hash.to_vec());
+            assert_eq!(r.d, data);
+            assert!(!is_fragmented(&r));
+        }
+        _ => panic!("Expected response"),
+    }
 }
 
 #[test]
-fn test_data_message_response_serialize() {
-    let msg = DataMessage::Response {
-        id: 42,
-        hash: "abcd1234".to_string(),
-        found: true,
-        size: Some(1024),
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"res\""));
-    assert!(json.contains("\"found\":true"));
-    assert!(json.contains("\"size\":1024"));
+fn test_encode_decode_fragment_response() {
+    let hash = [0xef; 32];
+    let data = vec![10, 20, 30];
+    let res = create_fragment_response(&hash, data.clone(), 2, 5);
+    let encoded = encode_response(&res);
+
+    let parsed = parse_message(&encoded).unwrap();
+    match parsed {
+        DataMessage::Response(r) => {
+            assert_eq!(r.h, hash.to_vec());
+            assert_eq!(r.d, data);
+            assert!(is_fragmented(&r));
+            assert_eq!(r.i, Some(2));
+            assert_eq!(r.n, Some(5));
+        }
+        _ => panic!("Expected response"),
+    }
 }
 
 #[test]
-fn test_data_message_response_not_found() {
-    let msg = DataMessage::Response {
-        id: 42,
-        hash: "abcd1234".to_string(),
-        found: false,
-        size: None,
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"found\":false"));
-    assert!(!json.contains("\"size\":")); // size should be omitted when None
+fn test_bytes_to_hash() {
+    let valid = vec![0x12u8; 32];
+    assert!(bytes_to_hash(&valid).is_some());
+
+    let too_short = vec![0x12u8; 16];
+    assert!(bytes_to_hash(&too_short).is_none());
+
+    let too_long = vec![0x12u8; 64];
+    assert!(bytes_to_hash(&too_long).is_none());
 }
 
 #[test]
-fn test_data_message_have() {
-    let msg = DataMessage::Have {
-        hashes: vec!["hash1".to_string(), "hash2".to_string()],
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"have\""));
-    assert!(json.contains("\"hashes\":[\"hash1\",\"hash2\"]"));
-}
+fn test_parse_invalid_message() {
+    // Too short
+    assert!(parse_message(&[]).is_none());
+    assert!(parse_message(&[0x00]).is_none());
 
-#[test]
-fn test_data_message_root_update() {
-    let msg = DataMessage::RootUpdate {
-        hash: "newhash".to_string(),
-        size: Some(2048),
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"root\""));
+    // Invalid type
+    assert!(parse_message(&[0xFF, 0x00]).is_none());
 }
 
 #[test]
