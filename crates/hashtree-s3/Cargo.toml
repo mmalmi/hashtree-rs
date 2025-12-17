@@ -1,9 +1,11 @@
 [package]
 name = "hashtree-s3"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "S3 storage backend for hashtree with non-blocking uploads"
-license = "MIT"
 
 [dependencies]
 hashtree-core.workspace = true

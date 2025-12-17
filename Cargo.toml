@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/irislib/hashtree-rs"
@@ -28,11 +28,11 @@ futures = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 
 # Internal (path for local dev, version for publishing)
-hashtree-core = { path = "crates/hashtree", version = "0.1.0" }
-hashtree-lmdb = { path = "crates/hashtree-lmdb", version = "0.1.0" }
-hashtree-git = { path = "crates/hashtree-git", version = "0.1.0" }
-hashtree-s3 = { path = "crates/hashtree-s3", version = "0.1.0" }
-hashtree-blossom = { path = "crates/hashtree-blossom", version = "0.1.0" }
+hashtree-core = { path = "crates/hashtree", version = "0.1.1" }
+hashtree-lmdb = { path = "crates/hashtree-lmdb", version = "0.1.1" }
+hashtree-git = { path = "crates/hashtree-git", version = "0.1.1" }
+hashtree-s3 = { path = "crates/hashtree-s3", version = "0.1.1" }
+hashtree-blossom = { path = "crates/hashtree-blossom", version = "0.1.1" }
 
 # AWS S3
 aws-sdk-s3 = "1"
