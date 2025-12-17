@@ -4,9 +4,11 @@
 //! WebRTC connections between peers.
 
 use hashtree_core::MemoryStore;
-use hashtree_webrtc::{WebRTCStore, WebRTCStoreConfig};
+use hashtree_webrtc::{classifier_channel, ClassifyRequest, PeerPool, PoolConfig, PoolSettings, WebRTCStore, WebRTCStoreConfig};
 use nostr_sdk::prelude::*;
+use std::collections::HashSet;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Default relays for signaling
 const TEST_RELAYS: &[&str] = &[
@@ -15,6 +17,15 @@ const TEST_RELAYS: &[&str] = &[
     "wss://nos.lol",
     "wss://temp.iris.to",
 ];
+
+/// Helper to run classifier that treats specific pubkeys as "follows"
+async fn run_classifier(mut rx: hashtree_webrtc::ClassifierRx, follows: Arc<RwLock<HashSet<String>>>) {
+    while let Some(req) = rx.recv().await {
+        let is_follow = follows.read().await.contains(&req.pubkey);
+        let pool = if is_follow { PeerPool::Follows } else { PeerPool::Other };
+        let _ = req.response.send(pool);
+    }
+}
 
 #[tokio::test]
 async fn test_connect_to_relays() {
@@ -49,7 +60,7 @@ async fn test_peer_discovery() {
     let store1_local = Arc::new(MemoryStore::new());
     let store2_local = Arc::new(MemoryStore::new());
 
-    // Generate keys first so we can set allowed_pubkeys
+    // Generate keys first so we can set up the classifier
     let keys1 = Keys::generate();
     let keys2 = Keys::generate();
     let pubkey1 = keys1.public_key().to_hex();
@@ -57,13 +68,37 @@ async fn test_peer_discovery() {
     println!("Store1 pubkey: {}", pubkey1);
     println!("Store2 pubkey: {}", pubkey2);
 
-    // Each store only allows the other peer (ignores random people on the relay)
+    // Set up classifiers - each store treats the other as a "follow"
+    let (classifier_tx1, classifier_rx1) = classifier_channel(10);
+    let (classifier_tx2, classifier_rx2) = classifier_channel(10);
+
+    // Store1 follows store2
+    let follows1: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::from([pubkey2.clone()])));
+    // Store2 follows store1
+    let follows2: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::from([pubkey1.clone()])));
+
+    // Start classifier tasks
+    tokio::spawn(run_classifier(classifier_rx1, follows1));
+    tokio::spawn(run_classifier(classifier_rx2, follows2));
+
+    // Configure pools: only connect to follows (other pool has 0 max)
+    let pools = PoolSettings {
+        follows: PoolConfig {
+            max_connections: 10,
+            satisfied_connections: 1,
+        },
+        other: PoolConfig {
+            max_connections: 0, // Don't connect to non-follows
+            satisfied_connections: 0,
+        },
+    };
+
     let config1 = WebRTCStoreConfig {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
         hello_interval_ms: 2000, // More frequent hellos
-        satisfied_connections: 1,
-        allowed_pubkeys: vec![pubkey2.clone()], // Only connect to store2
+        pools: pools.clone(),
+        classifier_tx: Some(classifier_tx1),
         ..Default::default()
     };
 
@@ -71,8 +106,8 @@ async fn test_peer_discovery() {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
         hello_interval_ms: 2000,
-        satisfied_connections: 1,
-        allowed_pubkeys: vec![pubkey1.clone()], // Only connect to store1
+        pools: pools.clone(),
+        classifier_tx: Some(classifier_tx2),
         ..Default::default()
     };
 
@@ -124,19 +159,40 @@ async fn test_data_transfer_between_peers() {
     let hash = sha256(test_data);
     store1_local.put(hash, test_data.to_vec()).await.unwrap();
 
-    // Generate keys first so we can set allowed_pubkeys
+    // Generate keys first so we can set up the classifier
     let keys1 = Keys::generate();
     let keys2 = Keys::generate();
     let pubkey1 = keys1.public_key().to_hex();
     let pubkey2 = keys2.public_key().to_hex();
 
-    // Each store only allows the other peer
+    // Set up classifiers - each store treats the other as a "follow"
+    let (classifier_tx1, classifier_rx1) = classifier_channel(10);
+    let (classifier_tx2, classifier_rx2) = classifier_channel(10);
+
+    let follows1: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::from([pubkey2.clone()])));
+    let follows2: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::from([pubkey1.clone()])));
+
+    tokio::spawn(run_classifier(classifier_rx1, follows1));
+    tokio::spawn(run_classifier(classifier_rx2, follows2));
+
+    // Configure pools: only connect to follows
+    let pools = PoolSettings {
+        follows: PoolConfig {
+            max_connections: 10,
+            satisfied_connections: 1,
+        },
+        other: PoolConfig {
+            max_connections: 0,
+            satisfied_connections: 0,
+        },
+    };
+
     let config1 = WebRTCStoreConfig {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
         hello_interval_ms: 3000,
-        satisfied_connections: 1,
-        allowed_pubkeys: vec![pubkey2.clone()],
+        pools: pools.clone(),
+        classifier_tx: Some(classifier_tx1),
         ..Default::default()
     };
 
@@ -144,20 +200,20 @@ async fn test_data_transfer_between_peers() {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
         hello_interval_ms: 3000,
-        satisfied_connections: 1,
-        allowed_pubkeys: vec![pubkey1.clone()],
+        pools: pools.clone(),
+        classifier_tx: Some(classifier_tx2),
         ..Default::default()
     };
 
     let mut store1 = WebRTCStore::new(store1_local.clone(), config1);
     let mut store2 = WebRTCStore::new(store2_local.clone(), config2);
 
-    // Start both stores (same timing as peer_discovery test)
+    // Start both stores
     store1.start(keys1).await.expect("Store1 failed to start");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     store2.start(keys2).await.expect("Store2 failed to start");
 
-    // Wait for peer connection (same timing as peer_discovery test)
+    // Wait for peer connection
     let mut connected = false;
     for _ in 0..5 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -179,7 +235,6 @@ async fn test_data_transfer_between_peers() {
     println!("Peers connected, attempting data transfer...");
 
     // Store2 should be able to fetch data from store1
-    // (store2 doesn't have it locally, so it asks peers)
     let result = store2.get(&hash).await;
 
     store1.stop().await;
@@ -198,4 +253,3 @@ async fn test_data_transfer_between_peers() {
         }
     }
 }
-

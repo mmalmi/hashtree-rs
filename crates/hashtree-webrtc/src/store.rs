@@ -14,7 +14,7 @@ use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -210,11 +210,57 @@ impl<S: Store + 'static> WebRTCStore<S> {
         });
     }
 
+    /// Classify a peer using the classifier channel
+    async fn classify_peer(pubkey: &str, config: &WebRTCStoreConfig) -> PeerPool {
+        if let Some(ref classifier_tx) = config.classifier_tx {
+            let (response_tx, response_rx) = oneshot::channel();
+            let request = ClassifyRequest {
+                pubkey: pubkey.to_string(),
+                response: response_tx,
+            };
+            if classifier_tx.send(request).await.is_ok() {
+                if let Ok(pool) = response_rx.await {
+                    return pool;
+                }
+            }
+        }
+        PeerPool::Other
+    }
+
+    /// Count peers by pool
+    async fn count_pools(peers: &HashMap<String, PeerEntry<S>>) -> (usize, usize) {
+        let mut follows = 0;
+        let mut other = 0;
+        for entry in peers.values() {
+            match entry.pool {
+                PeerPool::Follows => follows += 1,
+                PeerPool::Other => other += 1,
+            }
+        }
+        (follows, other)
+    }
+
+    /// Check if we can accept a new peer in a given pool
+    fn can_accept_peer(pool: PeerPool, follows_count: usize, other_count: usize, config: &WebRTCStoreConfig) -> bool {
+        match pool {
+            PeerPool::Follows => follows_count < config.pools.follows.max_connections,
+            PeerPool::Other => other_count < config.pools.other.max_connections,
+        }
+    }
+
+    /// Check if a pool needs more connections
+    fn pool_needs_peers(pool: PeerPool, follows_count: usize, other_count: usize, config: &WebRTCStoreConfig) -> bool {
+        match pool {
+            PeerPool::Follows => follows_count < config.pools.follows.satisfied_connections,
+            PeerPool::Other => other_count < config.pools.other.satisfied_connections,
+        }
+    }
+
     /// Handle incoming signaling message
     async fn handle_signaling_message(
         msg: SignalingMessage,
         local_peer_id: &str,
-        peers: Arc<RwLock<HashMap<String, Arc<Peer<S>>>>>,
+        peers: Arc<RwLock<HashMap<String, PeerEntry<S>>>>,
         peer_roots: Arc<RwLock<HashMap<String, Vec<String>>>>,
         signaling_tx: mpsc::Sender<SignalingMessage>,
         local_store: Arc<S>,
@@ -230,33 +276,37 @@ impl<S: Store + 'static> WebRTCStore<S> {
                 // Extract pubkey from peer_id (format: "pubkey:uuid")
                 let peer_pubkey = peer_id.split(':').next().unwrap_or("");
 
-                // Check allowed_pubkeys filter
-                if !config.allowed_pubkeys.is_empty()
-                    && !config.allowed_pubkeys.iter().any(|pk| pk == peer_pubkey)
-                {
+                // Classify the peer
+                let pool = Self::classify_peer(peer_pubkey, config).await;
+
+                // Check pool limits
+                let peers_read = peers.read().await;
+                let (follows_count, other_count) = Self::count_pools(&peers_read).await;
+                drop(peers_read);
+
+                if !Self::can_accept_peer(pool, follows_count, other_count, config) {
                     if config.debug {
-                        println!("[Store] Ignoring hello from {} (not in allowed_pubkeys)", peer_id);
+                        println!("[Store] Ignoring hello from {} - {:?} pool full", peer_id, pool);
                     }
                     return;
                 }
 
                 if config.debug {
-                    println!("[Store] Received hello from {}", peer_id);
+                    println!("[Store] Received hello from {} (pool: {:?})", peer_id, pool);
                 }
 
                 // Store peer roots
                 peer_roots.write().await.insert(peer_id.clone(), roots.clone());
 
-                // Initiate connection if we need more peers
+                // Initiate connection if we need more peers in this pool
                 // Use deterministic tie-breaker: lower peer_id initiates connection
-                let peer_count = peers.read().await.len();
                 let should_initiate = local_peer_id < peer_id.as_str();
 
-                if peer_count < config.satisfied_connections && should_initiate {
+                if Self::pool_needs_peers(pool, follows_count, other_count, config) && should_initiate {
                     if let Some(remote_id) = PeerId::from_peer_string(peer_id) {
                         if !peers.read().await.contains_key(peer_id) {
                             if config.debug {
-                                println!("[Store] Initiating connection to {}", peer_id);
+                                println!("[Store] Initiating connection to {} (pool: {:?})", peer_id, pool);
                             }
                             if let Ok(peer) = Peer::new(
                                 remote_id,
@@ -269,7 +319,7 @@ impl<S: Store + 'static> WebRTCStore<S> {
                             {
                                 let peer = Arc::new(peer);
                                 if peer.connect().await.is_ok() {
-                                    peers.write().await.insert(peer_id.clone(), peer);
+                                    peers.write().await.insert(peer_id.clone(), PeerEntry { peer, pool });
                                     stats.write().await.connected_peers += 1;
                                 }
                             }
@@ -301,13 +351,20 @@ impl<S: Store + 'static> WebRTCStore<S> {
                     return; // Not for us
                 }
 
-                // Extract pubkey from peer_id and check allowed_pubkeys filter
+                // Extract pubkey from peer_id
                 let peer_pubkey = peer_id.split(':').next().unwrap_or("");
-                if !config.allowed_pubkeys.is_empty()
-                    && !config.allowed_pubkeys.iter().any(|pk| pk == peer_pubkey)
-                {
+
+                // Classify the peer
+                let pool = Self::classify_peer(peer_pubkey, config).await;
+
+                // Check pool limits
+                let peers_read = peers.read().await;
+                let (follows_count, other_count) = Self::count_pools(&peers_read).await;
+                drop(peers_read);
+
+                if !Self::can_accept_peer(pool, follows_count, other_count, config) {
                     if config.debug {
-                        println!("[Store] Ignoring signaling from {} (not in allowed_pubkeys)", peer_id);
+                        println!("[Store] Ignoring signaling from {} - {:?} pool full", peer_id, pool);
                     }
                     return;
                 }
@@ -315,30 +372,26 @@ impl<S: Store + 'static> WebRTCStore<S> {
                 // Get or create peer
                 let peer = {
                     let peers_read = peers.read().await;
-                    peers_read.get(peer_id).cloned()
+                    peers_read.get(peer_id).map(|e| e.peer.clone())
                 };
 
                 let peer = match peer {
                     Some(p) => p,
                     None => {
                         if let Some(remote_id) = PeerId::from_peer_string(peer_id) {
-                            if peers.read().await.len() < config.max_connections {
-                                if let Ok(p) = Peer::new(
-                                    remote_id,
-                                    local_peer_id.to_string(),
-                                    signaling_tx.clone(),
-                                    local_store.clone(),
-                                    config.debug,
-                                )
-                                .await
-                                {
-                                    let p = Arc::new(p);
-                                    peers.write().await.insert(peer_id.clone(), p.clone());
-                                    stats.write().await.connected_peers += 1;
-                                    p
-                                } else {
-                                    return;
-                                }
+                            if let Ok(p) = Peer::new(
+                                remote_id,
+                                local_peer_id.to_string(),
+                                signaling_tx.clone(),
+                                local_store.clone(),
+                                config.debug,
+                            )
+                            .await
+                            {
+                                let p = Arc::new(p);
+                                peers.write().await.insert(peer_id.clone(), PeerEntry { peer: p.clone(), pool });
+                                stats.write().await.connected_peers += 1;
+                                p
                             } else {
                                 return;
                             }
@@ -409,8 +462,8 @@ impl<S: Store + 'static> WebRTCStore<S> {
 
         // Close all peer connections
         let peers = self.peers.read().await;
-        for peer in peers.values() {
-            let _ = peer.close().await;
+        for entry in peers.values() {
+            let _ = entry.peer.close().await;
         }
 
         // Disconnect from relays
@@ -428,8 +481,8 @@ impl<S: Store + 'static> WebRTCStore<S> {
     pub async fn peer_count(&self) -> usize {
         let peers = self.peers.read().await;
         let mut count = 0;
-        for peer in peers.values() {
-            if peer.state().await == PeerState::Ready {
+        for entry in peers.values() {
+            if entry.peer.state().await == PeerState::Ready {
                 count += 1;
             }
         }
@@ -440,24 +493,36 @@ impl<S: Store + 'static> WebRTCStore<S> {
     async fn request_from_peers(&self, hash: &Hash) -> Result<Option<Vec<u8>>, WebRTCStoreError> {
         let peers = self.peers.read().await;
 
-        // Try each ready peer
-        for peer in peers.values() {
-            if peer.state().await == PeerState::Ready {
-                match peer.request(hash).await {
-                    Ok(Some(data)) => {
-                        // Verify hash
-                        if hashtree_core::sha256(&data) == *hash {
-                            // Store locally for future requests
-                            let _ = self.local_store.put(*hash, data.clone()).await;
-                            let mut stats = self.stats.write().await;
-                            stats.requests_fulfilled += 1;
-                            stats.bytes_received += data.len() as u64;
-                            return Ok(Some(data));
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(_) => continue,
+        // Try each ready peer (prioritize follows pool)
+        let mut follows_peers = Vec::new();
+        let mut other_peers = Vec::new();
+
+        for entry in peers.values() {
+            if entry.peer.state().await == PeerState::Ready {
+                match entry.pool {
+                    PeerPool::Follows => follows_peers.push(entry.peer.clone()),
+                    PeerPool::Other => other_peers.push(entry.peer.clone()),
                 }
+            }
+        }
+        drop(peers);
+
+        // Try follows first, then others
+        for peer in follows_peers.into_iter().chain(other_peers.into_iter()) {
+            match peer.request(hash).await {
+                Ok(Some(data)) => {
+                    // Verify hash
+                    if hashtree_core::sha256(&data) == *hash {
+                        // Store locally for future requests
+                        let _ = self.local_store.put(*hash, data.clone()).await;
+                        let mut stats = self.stats.write().await;
+                        stats.requests_fulfilled += 1;
+                        stats.bytes_received += data.len() as u64;
+                        return Ok(Some(data));
+                    }
+                }
+                Ok(None) => continue,
+                Err(_) => continue,
             }
         }
 
