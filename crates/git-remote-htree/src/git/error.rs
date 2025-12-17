@@ -1,4 +1,4 @@
-//! Error types for hashtree-git
+//! Error types for git module
 
 use thiserror::Error;
 
@@ -18,12 +18,6 @@ pub enum Error {
 
     #[error("Invalid ref name: {0}")]
     InvalidRefName(String),
-
-    #[error("Pack error: {0}")]
-    PackError(String),
-
-    #[error("Protocol error: {0}")]
-    ProtocolError(String),
 
     #[error("Storage error: {0}")]
     StorageError(String),

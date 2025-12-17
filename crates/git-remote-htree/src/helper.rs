@@ -577,7 +577,7 @@ impl RemoteHelper {
     /// Uploads all blobs from local LMDB store to Blossom servers
     fn push_to_file_servers(&self, _root_hash: &str) {
         let store = self.storage.store();
-        let blossom = self.nostr.blossom().clone();
+        let blossom = self.nostr.blossom();
 
         // Get all hashes from LMDB
         let hashes = match store.list() {

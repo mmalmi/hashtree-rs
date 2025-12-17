@@ -3,8 +3,8 @@
 //! Git has four object types: blob, tree, commit, and tag.
 //! Each is content-addressed by SHA-1 hash of: "{type} {size}\0{content}"
 
-use sha1::{Sha1, Digest};
 use super::{Error, Result};
+use sha1::{Digest, Sha1};
 use std::fmt;
 
 /// The four git object types
@@ -48,8 +48,6 @@ impl fmt::Display for ObjectType {
 pub struct ObjectId([u8; 20]);
 
 impl ObjectId {
-    pub const ZERO: ObjectId = ObjectId([0u8; 20]);
-
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() == 20 {
             let mut arr = [0u8; 20];
@@ -66,10 +64,6 @@ impl ObjectId {
         }
         let bytes = hex::decode(hex).ok()?;
         Self::from_bytes(&bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 20] {
-        &self.0
     }
 
     pub fn to_hex(&self) -> String {
@@ -113,10 +107,6 @@ impl GitObject {
         Self { obj_type, content }
     }
 
-    pub fn blob(content: Vec<u8>) -> Self {
-        Self::new(ObjectType::Blob, content)
-    }
-
     pub fn id(&self) -> ObjectId {
         ObjectId::hash_object(self.obj_type, &self.content)
     }
@@ -131,28 +121,35 @@ impl GitObject {
 
     /// Parse from loose object format
     pub fn from_loose_format(data: &[u8]) -> Result<Self> {
-        let null_pos = data.iter().position(|&b| b == 0)
+        let null_pos = data
+            .iter()
+            .position(|&b| b == 0)
             .ok_or_else(|| Error::InvalidObjectFormat("missing null byte".into()))?;
 
         let header = std::str::from_utf8(&data[..null_pos])
             .map_err(|_| Error::InvalidObjectFormat("invalid header".into()))?;
 
         let mut parts = header.split(' ');
-        let type_str = parts.next()
+        let type_str = parts
+            .next()
             .ok_or_else(|| Error::InvalidObjectFormat("missing type".into()))?;
-        let size_str = parts.next()
+        let size_str = parts
+            .next()
             .ok_or_else(|| Error::InvalidObjectFormat("missing size".into()))?;
 
         let obj_type = ObjectType::from_str(type_str)
             .ok_or_else(|| Error::InvalidObjectType(type_str.into()))?;
-        let size: usize = size_str.parse()
+        let size: usize = size_str
+            .parse()
             .map_err(|_| Error::InvalidObjectFormat("invalid size".into()))?;
 
         let content = data[null_pos + 1..].to_vec();
         if content.len() != size {
-            return Err(Error::InvalidObjectFormat(
-                format!("size mismatch: expected {}, got {}", size, content.len())
-            ));
+            return Err(Error::InvalidObjectFormat(format!(
+                "size mismatch: expected {}, got {}",
+                size,
+                content.len()
+            )));
         }
 
         Ok(Self { obj_type, content })
@@ -168,21 +165,8 @@ pub struct TreeEntry {
 }
 
 impl TreeEntry {
-    pub fn new(mode: u32, name: String, oid: ObjectId) -> Self {
-        Self { mode, name, oid }
-    }
-
-    /// Parse mode from octal string
-    pub fn mode_str(&self) -> String {
-        format!("{:o}", self.mode)
-    }
-
     pub fn is_tree(&self) -> bool {
         self.mode == 0o40000
-    }
-
-    pub fn is_blob(&self) -> bool {
-        self.mode == 0o100644 || self.mode == 0o100755
     }
 }
 
@@ -192,8 +176,9 @@ pub fn parse_tree(content: &[u8]) -> Result<Vec<TreeEntry>> {
     let mut pos = 0;
 
     while pos < content.len() {
-        // Find space after mode
-        let space_pos = content[pos..].iter().position(|&b| b == b' ')
+        let space_pos = content[pos..]
+            .iter()
+            .position(|&b| b == b' ')
             .ok_or_else(|| Error::InvalidObjectFormat("tree: missing space".into()))?;
         let mode_str = std::str::from_utf8(&content[pos..pos + space_pos])
             .map_err(|_| Error::InvalidObjectFormat("tree: invalid mode".into()))?;
@@ -201,15 +186,15 @@ pub fn parse_tree(content: &[u8]) -> Result<Vec<TreeEntry>> {
             .map_err(|_| Error::InvalidObjectFormat("tree: invalid mode octal".into()))?;
         pos += space_pos + 1;
 
-        // Find null after name
-        let null_pos = content[pos..].iter().position(|&b| b == 0)
+        let null_pos = content[pos..]
+            .iter()
+            .position(|&b| b == 0)
             .ok_or_else(|| Error::InvalidObjectFormat("tree: missing null".into()))?;
         let name = std::str::from_utf8(&content[pos..pos + null_pos])
             .map_err(|_| Error::InvalidObjectFormat("tree: invalid name".into()))?
             .to_string();
         pos += null_pos + 1;
 
-        // Read 20-byte SHA
         if pos + 20 > content.len() {
             return Err(Error::InvalidObjectFormat("tree: truncated sha".into()));
         }
@@ -223,17 +208,31 @@ pub fn parse_tree(content: &[u8]) -> Result<Vec<TreeEntry>> {
     Ok(entries)
 }
 
-/// Serialize tree entries to content
-pub fn serialize_tree(entries: &[TreeEntry]) -> Vec<u8> {
-    let mut content = Vec::new();
-    for entry in entries {
-        content.extend_from_slice(entry.mode_str().as_bytes());
-        content.push(b' ');
-        content.extend_from_slice(entry.name.as_bytes());
-        content.push(0);
-        content.extend_from_slice(entry.oid.as_bytes());
+// Test helpers
+#[cfg(test)]
+pub use test_helpers::*;
+
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
+
+    impl TreeEntry {
+        pub fn new(mode: u32, name: String, oid: ObjectId) -> Self {
+            Self { mode, name, oid }
+        }
     }
-    content
+
+    pub fn serialize_tree(entries: &[TreeEntry]) -> Vec<u8> {
+        let mut content = Vec::new();
+        for entry in entries {
+            content.extend_from_slice(format!("{:o}", entry.mode).as_bytes());
+            content.push(b' ');
+            content.extend_from_slice(entry.name.as_bytes());
+            content.push(0);
+            content.extend_from_slice(&entry.oid.0);
+        }
+        content
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +248,6 @@ mod tests {
 
     #[test]
     fn test_blob_hash() {
-        // Empty blob has known hash
         let empty_blob_hash = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
         let oid = ObjectId::hash_object(ObjectType::Blob, &[]);
         assert_eq!(oid.to_hex(), empty_blob_hash);
@@ -257,7 +255,6 @@ mod tests {
 
     #[test]
     fn test_hello_world_blob() {
-        // "hello world\n" has known hash
         let content = b"hello world\n";
         let expected = "3b18e512dba79e4c8300dd08aeb37f8e728b8dad";
         let oid = ObjectId::hash_object(ObjectType::Blob, content);
@@ -266,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_loose_format_roundtrip() {
-        let obj = GitObject::blob(b"test content".to_vec());
+        let obj = GitObject::new(ObjectType::Blob, b"test content".to_vec());
         let loose = obj.to_loose_format();
         let parsed = GitObject::from_loose_format(&loose).unwrap();
         assert_eq!(parsed.obj_type, ObjectType::Blob);
