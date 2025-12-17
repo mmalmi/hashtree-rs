@@ -8,7 +8,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
@@ -104,9 +106,16 @@ impl Peer {
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut m)?;
 
+        // Disable mDNS to prevent CPU spin from orphaned mDNS agents.
+        // See: https://github.com/webrtc-rs/webrtc/issues/616
+        // mDNS is only useful for LAN peer discovery which we don't need.
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+
         let api = APIBuilder::new()
             .with_media_engine(m)
             .with_interceptor_registry(registry)
+            .with_setting_engine(setting_engine)
             .build();
 
         // Configure ICE servers
