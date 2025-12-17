@@ -19,6 +19,7 @@ use std::io::{BufRead, Write};
 use tracing::{debug, info, warn};
 
 mod config;
+mod git;
 mod helper;
 mod nostr_client;
 
@@ -37,11 +38,11 @@ fn main() -> Result<()> {
         }
     }
 
-    // Initialize logging - default to error, override with RUST_LOG=git_remote_htree=debug
+    // Initialize logging - default to info for testing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("git_remote_htree=error".parse().unwrap()),
+                .add_directive("git_remote_htree=info".parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .init();

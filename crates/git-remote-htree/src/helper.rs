@@ -4,9 +4,9 @@
 //! See: https://git-scm.com/docs/gitremote-helpers
 
 use anyhow::{bail, Context, Result};
-use hashtree_git::object::ObjectType;
-use hashtree_git::refs::Ref;
-use hashtree_git::storage::GitStorage;
+use crate::git::object::ObjectType;
+use crate::git::refs::Ref;
+use crate::git::storage::GitStorage;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -555,8 +555,8 @@ impl RemoteHelper {
             self.storage.write_raw_object(obj_type, &content)?;
         }
 
-        // Update ref in storage using hashtree-git's Ref type
-        let oid = hashtree_git::object::ObjectId::from_hex(sha)
+        // Update ref in storage
+        let oid = crate::git::object::ObjectId::from_hex(sha)
             .ok_or_else(|| anyhow::anyhow!("Invalid object id: {}", sha))?;
         self.storage.write_ref(dst_ref, &Ref::Direct(oid))?;
 
@@ -573,29 +573,68 @@ impl RemoteHelper {
         Ok(())
     }
 
-    /// Push content to file servers (blossom) - fire and forget
-    fn push_to_file_servers(&self, root_hash: &str) {
-        use std::process::Command;
+    /// Push content to file servers (blossom)
+    /// Uploads all blobs from local LMDB store to Blossom servers
+    fn push_to_file_servers(&self, _root_hash: &str) {
+        let store = self.storage.store();
+        let blossom = self.nostr.blossom().clone();
 
-        // Use htree push command which handles auth and config
-        let result = Command::new("htree")
-            .args(["push", root_hash])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn();
-
-        match result {
-            Ok(mut child) => {
-                // Don't wait - let it run in background
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                info!("Started file server push for {}", root_hash);
-            }
+        // Get all hashes from LMDB
+        let hashes = match store.list() {
+            Ok(h) => h,
             Err(e) => {
-                warn!("Failed to start file server push: {}", e);
+                warn!("Failed to list blobs for upload: {}", e);
+                return;
             }
-        }
+        };
+
+        info!("Uploading {} blobs to file servers", hashes.len());
+
+        // Create runtime for async uploads
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!("Failed to create runtime for blossom upload: {}", e);
+                return;
+            }
+        };
+
+        rt.block_on(async {
+            let mut uploaded = 0;
+            let mut skipped = 0;
+            let mut failed = 0;
+
+            for hash in hashes {
+                // Get blob data from LMDB
+                let data = match store.get_sync(&hash) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        debug!("Failed to read blob {}: {}", hex::encode(hash), e);
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                // Upload to Blossom (skip if already exists)
+                match blossom.upload_if_missing(&data).await {
+                    Ok((_, true)) => uploaded += 1,
+                    Ok((_, false)) => skipped += 1,
+                    Err(e) => {
+                        debug!("Failed to upload blob {}: {}", hex::encode(hash), e);
+                        failed += 1;
+                    }
+                }
+            }
+
+            info!(
+                "Blossom upload complete: {} uploaded, {} already existed, {} failed",
+                uploaded, skipped, failed
+            );
+        });
     }
 
     /// List objects that need to be pushed (not on remote)
