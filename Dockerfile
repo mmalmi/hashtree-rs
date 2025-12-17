@@ -1,14 +1,6 @@
-FROM rustlang/rust:nightly-bookworm AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /app
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    libclang-dev \
-    clang \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
@@ -21,7 +13,6 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/htree /usr/local/bin/htree
