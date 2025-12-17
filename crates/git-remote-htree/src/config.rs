@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Default read-only file servers
-pub const DEFAULT_READ_SERVERS: &[&str] = &["https://files.iris.to", "https://hashtree.iris.to"];
+pub const DEFAULT_READ_SERVERS: &[&str] = &["https://cdn.iris.to", "https://hashtree.iris.to"];
 
 /// Default write-enabled file servers
 pub const DEFAULT_WRITE_SERVERS: &[&str] = &["https://hashtree.iris.to"];

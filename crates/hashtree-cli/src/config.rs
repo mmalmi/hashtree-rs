@@ -106,7 +106,7 @@ pub struct BlossomConfig {
 }
 
 fn default_read_servers() -> Vec<String> {
-    vec!["https://files.iris.to".to_string()]
+    vec!["https://cdn.iris.to".to_string(), "https://hashtree.iris.to".to_string()]
 }
 
 fn default_write_servers() -> Vec<String> {
