@@ -277,8 +277,8 @@ pub struct WebRTCStats {
     pub requests_fulfilled: u64,
 }
 
-/// Nostr event kind for hashtree signaling
-pub const NOSTR_KIND_HASHTREE: u16 = 29333;
+/// Nostr event kind for WebRTC signaling (ephemeral, NIP-17 style)
+pub const NOSTR_KIND_HASHTREE: u16 = 25050;
 
 /// Data channel label
 pub const DATA_CHANNEL_LABEL: &str = "hashtree";

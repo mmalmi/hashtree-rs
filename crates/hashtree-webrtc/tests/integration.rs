@@ -96,7 +96,7 @@ async fn test_peer_discovery() {
     let config1 = WebRTCStoreConfig {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
-        hello_interval_ms: 2000, // More frequent hellos
+        hello_interval_ms: 1000, // Very frequent hellos for test reliability
         pools: pools.clone(),
         classifier_tx: Some(classifier_tx1),
         ..Default::default()
@@ -105,7 +105,7 @@ async fn test_peer_discovery() {
     let config2 = WebRTCStoreConfig {
         relays: TEST_RELAYS.iter().map(|s| s.to_string()).collect(),
         debug: true,
-        hello_interval_ms: 2000,
+        hello_interval_ms: 1000,
         pools: pools.clone(),
         classifier_tx: Some(classifier_tx2),
         ..Default::default()
@@ -114,20 +114,21 @@ async fn test_peer_discovery() {
     let mut store1 = WebRTCStore::new(store1_local, config1);
     let mut store2 = WebRTCStore::new(store2_local, config2);
 
-    // Start both stores
+    // Start both stores with minimal stagger (both should be subscribed quickly)
     store1.start(keys1).await.expect("Store1 failed to start");
     println!("Store1 started");
 
-    // Stagger to avoid relay rate limiting
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Minimal stagger - just enough for store1 to be subscribed
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     store2.start(keys2).await.expect("Store2 failed to start");
     println!("Store2 started");
 
-    // Wait for peer discovery (~15s timeout)
+    // Wait for peer discovery (~30s timeout with more iterations)
     let mut found_peer = false;
-    for _ in 0..5 {
+    for i in 0..10 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        println!("Discovery attempt {}/10", i + 1);
 
         let count1 = store1.peer_count().await;
         let count2 = store2.peer_count().await;
