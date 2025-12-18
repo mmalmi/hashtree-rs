@@ -63,10 +63,7 @@ publish_crate "hashtree-s3"
 publish_crate "hashtree-resolver"
 # hashtree-sim excluded - internal testing only
 
-# Tier 3: Depends on hashtree-core + hashtree-lmdb
-publish_crate "hashtree-git"
-
-# Tier 4: Depends on hashtree-core only (hashtree-sim is dev-dependency)
+# Tier 3: Depends on hashtree-core only (hashtree-sim is dev-dependency)
 publish_crate "hashtree-webrtc"
 
 # Tier 5: Depends on multiple crates
