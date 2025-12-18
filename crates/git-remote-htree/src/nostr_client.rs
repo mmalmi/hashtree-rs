@@ -690,11 +690,20 @@ impl NostrClient {
         client.connect().await;
 
         // Build event with tags
-        let tags = vec![
+        let mut tags = vec![
             Tag::custom(TagKind::custom("d"), vec![repo_name.to_string()]),
             Tag::custom(TagKind::custom("l"), vec![LABEL_HASHTREE.to_string()]),
             Tag::custom(TagKind::custom("hash"), vec![root_hash.to_string()]),
         ];
+
+        // Add directory prefix labels for discoverability
+        // e.g. "docs/travel/doc1" -> ["l", "docs"], ["l", "docs/travel"]
+        let parts: Vec<&str> = repo_name.split('/').collect();
+        for i in 1..parts.len() {
+            let prefix = parts[..i].join("/");
+            tags.push(Tag::custom(TagKind::custom("l"), vec![prefix]));
+        }
+
         let event = EventBuilder::new(Kind::Custom(KIND_APP_DATA), root_hash, tags);
 
         // Sign and publish
