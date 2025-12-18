@@ -12,7 +12,7 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use hashtree_core::{sha256, DirEntry, HashTree, HashTreeConfig, Store};
+use hashtree_core::{sha256, DirEntry, HashTree, HashTreeConfig, LinkType, Store};
 use hashtree_lmdb::LmdbBlobStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -243,8 +243,8 @@ impl GitStorage {
             // Build .git directory
             let mut git_entries = vec![
                 DirEntry::new("HEAD", head_hash).with_size(head_content.len() as u64),
-                DirEntry::new("objects", objects_hash),
-                DirEntry::new("refs", refs_hash),
+                DirEntry::new("objects", objects_hash).with_link_type(LinkType::Dir),
+                DirEntry::new("refs", refs_hash).with_link_type(LinkType::Dir),
             ];
 
             // Add config if we have a default branch
@@ -262,9 +262,16 @@ impl GitStorage {
                 .map_err(|e| Error::StorageError(format!("put .git: {}", e)))?;
 
             // Build root with just .git
-            let root_entries = vec![DirEntry::new(".git", git_cid.hash)];
+            let root_entries = vec![DirEntry::new(".git", git_cid.hash).with_link_type(LinkType::Dir)];
             let root_cid = self.tree.put_directory(root_entries).await
                 .map_err(|e| Error::StorageError(format!("put root: {}", e)))?;
+
+            info!("Built hashtree root: {} (.git dir: {})", hex::encode(root_cid.hash), hex::encode(git_cid.hash));
+
+            // Verify the root is stored correctly
+            if let Ok(Some(data)) = self.store.get(&root_cid.hash).await {
+                info!("Root blob stored: {} bytes, starts with: {:?}", data.len(), &data[..data.len().min(20)]);
+            }
 
             Ok::<[u8; 32], Error>(root_cid.hash)
         })?;
@@ -334,7 +341,7 @@ impl GitStorage {
             let cat_cid = self.tree.put_directory(cat_entries).await
                 .map_err(|e| Error::StorageError(format!("put {} dir: {}", category, e)))?;
             debug!("refs/{} dir -> {}", category, hex::encode(cat_cid.hash));
-            ref_entries.push(DirEntry::new(category, cat_cid.hash));
+            ref_entries.push(DirEntry::new(category, cat_cid.hash).with_link_type(LinkType::Dir));
         }
 
         if ref_entries.is_empty() {

@@ -240,6 +240,8 @@ impl NostrClient {
         let blossom = BlossomClient::new(blossom_keys)
             .with_timeout(Duration::from_secs(30));
 
+        tracing::info!("BlossomClient created with read_servers: {:?}", blossom.read_servers());
+
         Ok(Self {
             pubkey: pubkey.to_string(),
             keys,

@@ -143,13 +143,20 @@ impl RemoteHelper {
         for (name, sha) in &refs {
             self.remote_refs.insert(name.clone(), sha.clone());
             if name == "HEAD" {
-                // HEAD is a symref
-                if let Some(target) = refs
+                // HEAD is a symref - check for actual target branch
+                if let Some(target_branch) = sha.strip_prefix("ref: ") {
+                    // Symbolic ref (e.g., "ref: refs/heads/main")
+                    if let Some(target_sha) = refs.get(target_branch) {
+                        lines.push(format!("@{} HEAD", target_branch));
+                        lines.push(format!("{} HEAD", target_sha));
+                    }
+                } else if let Some((branch, target)) = refs
                     .get("refs/heads/main")
-                    .or_else(|| refs.get("refs/heads/master"))
+                    .map(|t| ("refs/heads/main", t))
+                    .or_else(|| refs.get("refs/heads/master").map(|t| ("refs/heads/master", t)))
                 {
-                    lines.push("@refs/heads/main HEAD".to_string());
-                    // Also list the actual sha
+                    // Direct SHA in HEAD, find the matching branch
+                    lines.push(format!("@{} HEAD", branch));
                     lines.push(format!("{} HEAD", target));
                 }
             } else {
@@ -254,11 +261,15 @@ impl RemoteHelper {
         let blossom = self.nostr.blossom();
         let mut objects = Vec::new();
 
+        // Log the servers being used
+        let servers = blossom.read_servers().to_vec();
+        info!("Creating BlossomStore with servers: {:?}", servers);
+
         // Create a BlossomStore-backed HashTree for reading
         // Use the same read servers from the existing blossom client
         let store = BlossomStore::with_servers(
             nostr::Keys::generate(), // Temporary keys for read-only ops
-            blossom.read_servers().to_vec(),
+            servers,
         );
         let tree = HashTree::new(HashTreeConfig::new(std::sync::Arc::new(store)));
 
@@ -676,8 +687,10 @@ impl RemoteHelper {
             _ => bail!("Unknown object type: {}", type_str),
         };
 
-        // Get object content
-        let content_output = Command::new("git").args(["cat-file", "-p", oid]).output()?;
+        // Get raw object content (NOT pretty-printed!)
+        // Use "git cat-file <type> <sha>" for raw binary format
+        // Using "-p" would pretty-print trees which breaks the binary format
+        let content_output = Command::new("git").args(["cat-file", &type_str, oid]).output()?;
         if !content_output.status.success() {
             bail!("Failed to read object: {}", oid);
         }
