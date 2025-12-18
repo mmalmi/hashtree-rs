@@ -53,6 +53,7 @@ fi
 
 # Tier 1: No internal dependencies
 publish_crate "hashtree-core"
+publish_crate "hashtree-config"
 publish_crate "hashtree-blossom"
 # hashtree-bep52 excluded - internal testing only
 
