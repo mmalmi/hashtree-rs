@@ -1053,34 +1053,37 @@ impl<S: Store> HashTree<S> {
             return Ok(Some(cid.clone()));
         }
 
-        let mut current_hash = cid.hash;
-        let mut current_link: Option<Link> = None;
+        let mut current_cid = cid.clone();
 
         for part in parts {
-            let node = match self.get_tree_node(&current_hash).await? {
+            // Use get_node which handles decryption when key is present
+            let node = match self.get_node(&current_cid).await? {
                 Some(n) => n,
                 None => return Ok(None),
             };
 
             if let Some(link) = self.find_link(&node, part) {
-                current_hash = link.hash;
-                current_link = Some(link);
+                current_cid = Cid {
+                    hash: link.hash,
+                    key: link.key,
+                    size: link.size,
+                };
             } else {
                 // Check internal nodes
-                match self.find_link_in_subtrees(&node, part).await? {
+                match self.find_link_in_subtrees_cid(&node, part, &current_cid).await? {
                     Some(link) => {
-                        current_hash = link.hash;
-                        current_link = Some(link);
+                        current_cid = Cid {
+                            hash: link.hash,
+                            key: link.key,
+                            size: link.size,
+                        };
                     }
                     None => return Ok(None),
                 }
             }
         }
 
-        // Build Cid from final link
-        let size = current_link.as_ref().map(|l| l.size).unwrap_or(0);
-        let key = current_link.and_then(|l| l.key);
-        Ok(Some(Cid { hash: current_hash, key, size }))
+        Ok(Some(current_cid))
     }
 
     /// Resolve a path within a tree using Cid (with decryption if key present)
@@ -1111,6 +1114,37 @@ impl<S: Store> HashTree<S> {
             }
 
             if let Some(deep_found) = Box::pin(self.find_link_in_subtrees(&sub_node, name)).await? {
+                return Ok(Some(deep_found));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Find a link in subtrees using Cid (with decryption support)
+    async fn find_link_in_subtrees_cid(&self, node: &TreeNode, name: &str, _parent_cid: &Cid) -> Result<Option<Link>, HashTreeError> {
+        for link in &node.links {
+            if !link.name.as_ref().map(|n| n.starts_with('_')).unwrap_or(false) {
+                continue;
+            }
+
+            // Internal nodes inherit encryption from parent context
+            let sub_cid = Cid {
+                hash: link.hash,
+                key: link.key.clone(),
+                size: link.size,
+            };
+
+            let sub_node = match self.get_node(&sub_cid).await? {
+                Some(n) => n,
+                None => continue,
+            };
+
+            if let Some(found) = self.find_link(&sub_node, name) {
+                return Ok(Some(found));
+            }
+
+            if let Some(deep_found) = Box::pin(self.find_link_in_subtrees_cid(&sub_node, name, &sub_cid)).await? {
                 return Ok(Some(deep_found));
             }
         }
