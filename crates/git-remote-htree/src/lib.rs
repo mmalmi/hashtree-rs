@@ -10,6 +10,7 @@
 //!   git pull origin main
 
 use anyhow::{bail, Context, Result};
+use nostr_sdk::ToBech32;
 use std::io::{BufRead, Write};
 use tracing::{debug, info, warn};
 
@@ -68,12 +69,32 @@ fn run() -> Result<()> {
     let (identifier, repo_name) = parse_htree_url(url)?;
 
     // Resolve identifier to pubkey
-    let (pubkey, secret_key) = resolve_identity(&identifier)?;
+    // If "self" is used and no keys exist, auto-generate
+    let (pubkey, secret_key) = match resolve_identity(&identifier) {
+        Ok(result) => result,
+        Err(e) => {
+            // If resolution failed and user intended "self", suggest using htree://self/repo
+            warn!("Failed to resolve identity '{}': {}", identifier, e);
+            info!("Tip: Use htree://self/<repo> to auto-generate identity on first use");
+            return Err(e);
+        }
+    };
 
     if secret_key.is_some() {
         debug!("Found signing key for {}", identifier);
     } else {
         warn!("No signing key for {} - push will fail", identifier);
+    }
+
+    // Print npub for reference
+    if let Ok(pk_bytes) = hex::decode(&pubkey) {
+        if pk_bytes.len() == 32 {
+            if let Ok(pk) = nostr_sdk::PublicKey::from_slice(&pk_bytes) {
+                if let Ok(npub) = pk.to_bech32() {
+                    info!("Using identity: {}", npub);
+                }
+            }
+        }
     }
 
     // Load config
@@ -190,6 +211,13 @@ mod tests {
         let (id, repo) = parse_htree_url("htree://alice/project").unwrap();
         assert_eq!(id, "alice");
         assert_eq!(repo, "project");
+    }
+
+    #[test]
+    fn test_parse_htree_url_self() {
+        let (id, repo) = parse_htree_url("htree://self/myrepo").unwrap();
+        assert_eq!(id, "self");
+        assert_eq!(repo, "myrepo");
     }
 
     #[test]

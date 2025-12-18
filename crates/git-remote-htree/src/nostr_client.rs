@@ -156,11 +156,32 @@ pub fn load_keys() -> Vec<StoredKey> {
 
 /// Resolve an identifier to (pubkey_hex, secret_hex)
 /// Identifier can be:
+/// - "self" (uses default key, auto-generates if needed)
 /// - petname (e.g., "work", "default")
 /// - pubkey hex (64 chars)
 /// - npub bech32
 pub fn resolve_identity(identifier: &str) -> Result<(String, Option<String>)> {
     let keys = load_keys();
+
+    // Special "self" alias - use default key or first available, auto-generate if none
+    if identifier == "self" {
+        // First try to find a key with "self" petname
+        if let Some(key) = keys.iter().find(|k| k.petname.as_deref() == Some("self")) {
+            return Ok((key.pubkey_hex.clone(), Some(key.secret_hex.clone())));
+        }
+        // Then try "default"
+        if let Some(key) = keys.iter().find(|k| k.petname.as_deref() == Some("default")) {
+            return Ok((key.pubkey_hex.clone(), Some(key.secret_hex.clone())));
+        }
+        // Then use first available key
+        if let Some(key) = keys.first() {
+            return Ok((key.pubkey_hex.clone(), Some(key.secret_hex.clone())));
+        }
+        // No keys - auto-generate one with "self" petname
+        let new_key = generate_and_save_key("self")?;
+        info!("Generated new identity: npub1{}", &new_key.pubkey_hex[..12]);
+        return Ok((new_key.pubkey_hex, Some(new_key.secret_hex)));
+    }
 
     // Check if it's a petname
     for key in &keys {
@@ -199,6 +220,42 @@ pub fn resolve_identity(identifier: &str) -> Result<(String, Option<String>)> {
         "Unknown identity '{}'. Add it to ~/.hashtree/keys or use a pubkey/npub.",
         identifier
     )
+}
+
+/// Generate a new key and save it to ~/.hashtree/keys with the given petname
+fn generate_and_save_key(petname: &str) -> Result<StoredKey> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+
+    // Generate new key
+    let keys = nostr_sdk::Keys::generate();
+    let secret_hex = hex::encode(keys.secret_key().to_secret_bytes());
+    let pubkey_hex = hex::encode(keys.public_key().to_bytes());
+
+    // Ensure directory exists
+    let keys_path = hashtree_config::get_keys_path();
+    if let Some(parent) = keys_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Append to keys file
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&keys_path)?;
+
+    // Write as nsec with petname
+    let nsec = keys.secret_key().to_bech32()
+        .map_err(|e| anyhow::anyhow!("Failed to encode nsec: {}", e))?;
+    writeln!(file, "{} {}", nsec, petname)?;
+
+    info!("Saved new key to {:?} with petname '{}'", keys_path, petname);
+
+    Ok(StoredKey {
+        secret_hex,
+        pubkey_hex,
+        petname: Some(petname.to_string()),
+    })
 }
 
 use hashtree_config::Config;
@@ -240,7 +297,8 @@ impl NostrClient {
         let blossom = BlossomClient::new(blossom_keys)
             .with_timeout(Duration::from_secs(30));
 
-        tracing::info!("BlossomClient created with read_servers: {:?}", blossom.read_servers());
+        tracing::info!("BlossomClient created with read_servers: {:?}, write_servers: {:?}",
+            blossom.read_servers(), blossom.write_servers());
 
         Ok(Self {
             pubkey: pubkey.to_string(),

@@ -561,20 +561,17 @@ async fn main() -> Result<()> {
                     let _ = resolver.stop().await;
                 }
 
-                // Background push to Blossom (unless --local)
+                // Push to Blossom (unless --local)
                 if !local {
                     let config = Config::load()?;
                     // Combine legacy servers with write_servers for pushing
                     let mut write_servers = config.blossom.servers.clone();
                     write_servers.extend(config.blossom.write_servers.clone());
                     if !write_servers.is_empty() {
-                        let data_dir = cli.data_dir.clone();
-                        let hash_for_push = hash_hex.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = background_blossom_push(&data_dir, &hash_for_push, &write_servers).await {
-                                eprintln!("  file server push failed: {}", e);
-                            }
-                        });
+                        // Await the upload to ensure it completes before exiting
+                        if let Err(e) = background_blossom_push(&cli.data_dir, &hash_hex, &write_servers).await {
+                            eprintln!("  file server push failed: {}", e);
+                        }
                     }
                 }
             }
