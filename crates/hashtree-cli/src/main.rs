@@ -153,6 +153,15 @@ enum StorageCommands {
     Trees,
     /// Manually trigger eviction
     Evict,
+    /// Verify blob integrity and delete corrupted entries
+    Verify {
+        /// Actually delete corrupted entries (default: dry-run)
+        #[arg(long)]
+        delete: bool,
+        /// Also verify R2/S3 storage (slower)
+        #[arg(long)]
+        r2: bool,
+    },
 }
 
 #[tokio::main]
@@ -945,6 +954,55 @@ async fn main() -> Result<()> {
                         println!("Evicted {} bytes ({:.2} MB)", freed, freed as f64 / 1024.0 / 1024.0);
                     } else {
                         println!("No eviction needed (storage under limit)");
+                    }
+                }
+                StorageCommands::Verify { delete, r2 } => {
+                    println!("Verifying blob integrity...");
+                    if !delete {
+                        println!("(dry-run mode - use --delete to actually remove corrupted entries)");
+                    }
+                    println!();
+
+                    // Verify LMDB
+                    let lmdb_result = store.verify_lmdb_integrity(delete)?;
+                    println!("LMDB verification:");
+                    println!("  Total blobs:     {}", lmdb_result.total);
+                    println!("  Valid:           {}", lmdb_result.valid);
+                    println!("  Corrupted:       {}", lmdb_result.corrupted);
+                    if delete {
+                        println!("  Deleted:         {}", lmdb_result.deleted);
+                    }
+                    println!();
+
+                    // Verify R2 if requested
+                    if r2 {
+                        println!("Verifying R2 storage (this may take a while)...");
+                        match store.verify_r2_integrity(delete).await {
+                            Ok(r2_result) => {
+                                println!("R2 verification:");
+                                println!("  Total objects:   {}", r2_result.total);
+                                println!("  Valid:           {}", r2_result.valid);
+                                println!("  Corrupted:       {}", r2_result.corrupted);
+                                if delete {
+                                    println!("  Deleted:         {}", r2_result.deleted);
+                                }
+                            }
+                            Err(e) => {
+                                println!("R2 verification failed: {}", e);
+                            }
+                        }
+                    }
+
+                    let total_corrupted = lmdb_result.corrupted;
+                    if total_corrupted > 0 {
+                        println!();
+                        if delete {
+                            println!("Cleanup complete. Removed {} corrupted entries.", total_corrupted);
+                        } else {
+                            println!("Found {} corrupted entries. Run with --delete to remove them.", total_corrupted);
+                        }
+                    } else {
+                        println!("All blobs verified successfully!");
                     }
                 }
             }
