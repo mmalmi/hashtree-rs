@@ -20,6 +20,9 @@ use super::mime::get_mime_type;
 /// Blossom authorization event kind (NIP-98 style)
 const BLOSSOM_AUTH_KIND: u16 = 24242;
 
+/// Cache-Control header for immutable content-addressed data (1 year)
+const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
 /// Default maximum upload size in bytes (5 MB)
 pub const DEFAULT_MAX_UPLOAD_SIZE: usize = 5 * 1024 * 1024;
 
@@ -321,6 +324,7 @@ pub async fn head_blob(
                 .header(header::CONTENT_TYPE, mime_type)
                 .header(header::CONTENT_LENGTH, size)
                 .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL)
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(Body::empty())
                 .unwrap()

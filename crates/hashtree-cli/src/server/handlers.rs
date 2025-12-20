@@ -20,11 +20,19 @@ pub async fn serve_root() -> impl IntoResponse {
     root_page()
 }
 
+/// Cache-Control header for immutable content-addressed data (1 year)
+const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
 /// Internal content serving (shared by CID and blossom routes)
+///
+/// `is_immutable`: if true, adds Cache-Control: immutable header.
+/// Use true for content-addressed routes (hash, nhash, blossom SHA256).
+/// Use false for mutable routes (npub/ref_name) where the reference can change.
 async fn serve_content_internal(
     state: &AppState,
     cid: &str,
     headers: axum::http::HeaderMap,
+    is_immutable: bool,
 ) -> Response<Body> {
     let store = &state.store;
 
@@ -76,13 +84,17 @@ async fn serve_content_internal(
                                         let stream = stream::iter(chunks_iter)
                                             .map(|result| result.map(Bytes::from));
 
-                                        return Response::builder()
+                                        let mut builder = Response::builder()
                                             .status(StatusCode::PARTIAL_CONTENT)
                                             .header(header::CONTENT_TYPE, content_type)
                                             .header(header::CONTENT_LENGTH, content_length)
                                             .header(header::CONTENT_RANGE, content_range)
                                             .header(header::ACCEPT_RANGES, "bytes")
-                                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+                                        if is_immutable {
+                                            builder = builder.header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL);
+                                        }
+                                        return builder
                                             .body(Body::from_stream(stream))
                                             .unwrap()
                                             .into_response();
@@ -108,13 +120,17 @@ async fn serve_content_internal(
                                 // For small non-chunked files, use buffered approach
                                 match store.get_file_range(cid, start, Some(end_actual)) {
                                     Ok(Some((range_content, _))) => {
-                                        return Response::builder()
+                                        let mut builder = Response::builder()
                                             .status(StatusCode::PARTIAL_CONTENT)
                                             .header(header::CONTENT_TYPE, content_type)
                                             .header(header::CONTENT_LENGTH, range_content.len())
                                             .header(header::CONTENT_RANGE, content_range)
                                             .header(header::ACCEPT_RANGES, "bytes")
-                                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+                                        if is_immutable {
+                                            builder = builder.header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL);
+                                        }
+                                        return builder
                                             .body(Body::from(range_content))
                                             .unwrap()
                                             .into_response();
@@ -166,12 +182,16 @@ async fn serve_content_internal(
             // Content type - hashtree doesn't store filenames, so default to octet-stream
             let content_type = "application/octet-stream";
 
-            Response::builder()
+            let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::CONTENT_LENGTH, content.len())
                 .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+            if is_immutable {
+                builder = builder.header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL);
+            }
+            builder
                 .body(Body::from(content))
                 .unwrap()
                 .into_response()
@@ -219,14 +239,14 @@ pub async fn serve_content_or_blob(
     // Always try direct CID/hash lookup first
     // (hashtree hashes are 64 hex chars, same as blossom SHA256)
     if state.store.get_file_chunk_metadata(&id).ok().flatten().is_some() {
-        return serve_content_internal(&state, &id, headers).await;
+        return serve_content_internal(&state, &id, headers, true).await;
     }
 
     // Try blossom SHA256 lookup (content hash -> root hash mapping)
     if is_sha256 {
         let sha256_hex = hash_part.to_lowercase();
         if let Ok(Some(cid)) = state.store.get_cid_by_sha256(&sha256_hex) {
-            return serve_content_internal(&state, &cid, headers).await;
+            return serve_content_internal(&state, &cid, headers, true).await;
         }
     }
 
@@ -248,6 +268,7 @@ pub async fn serve_content_or_blob(
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .header(header::CONTENT_LENGTH, data.len())
+                    .header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL)
                     .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .body(Body::from(data))
                     .unwrap()
@@ -279,7 +300,7 @@ pub async fn serve_nhash(
         Ok(nhash_data) => {
             let hash_hex = to_hex(&nhash_data.hash);
             // TODO: handle decryption key if present in nhash_data.decrypt_key
-            serve_content_internal(&state, &hash_hex, headers).await
+            serve_content_internal(&state, &hash_hex, headers, true).await
         }
         Err(e) => {
             Response::builder()
@@ -324,11 +345,12 @@ pub async fn serve_npub(
         }
     };
 
+    // npub routes are mutable - the reference can change over time
     match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
         Ok(Ok(cid)) => {
             let hash_hex = to_hex(&cid.hash);
             let _ = resolver.stop().await;
-            serve_content_internal(&state, &hash_hex, headers).await
+            serve_content_internal(&state, &hash_hex, headers, false).await
         }
         Ok(Err(e)) => {
             let _ = resolver.stop().await;
@@ -591,11 +613,12 @@ pub async fn resolve_and_serve(
     };
 
     // Use resolve_wait with timeout - waits for key to appear
+    // This is a mutable route (npub/treename can change over time)
     match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
         Ok(Ok(cid)) => {
             let hash_hex = to_hex(&cid.hash);
             let _ = resolver.stop().await;
-            serve_content_internal(&state, &hash_hex, headers).await
+            serve_content_internal(&state, &hash_hex, headers, false).await
         }
         Ok(Err(e)) => {
             let _ = resolver.stop().await;

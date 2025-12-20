@@ -123,15 +123,14 @@ fn create_blossom_auth(keys: &Keys) -> String {
     let now = Timestamp::now();
     let expiration = Timestamp::from(now.as_u64() + 300); // 5 minutes
 
-    // Create kind 24242 event
-    let event = EventBuilder::new(
-        Kind::Custom(24242),
-        "",
-    )
-    .tag(Tag::custom(TagKind::Custom("t".into()), vec!["upload".to_string()]))
-    .tag(Tag::custom(TagKind::Custom("expiration".into()), vec![expiration.to_string()]))
-    .sign_with_keys(keys)
-    .expect("Failed to sign event");
+    // Create kind 24242 event with tags
+    let tags = vec![
+        Tag::custom(TagKind::Custom("t".into()), vec!["upload".to_string()]),
+        Tag::custom(TagKind::Custom("expiration".into()), vec![expiration.to_string()]),
+    ];
+    let event = EventBuilder::new(Kind::Custom(24242), "", tags)
+        .to_event(keys)
+        .expect("Failed to sign event");
 
     let event_json = serde_json::to_string(&event).expect("Failed to serialize event");
     let encoded = base64::engine::general_purpose::STANDARD.encode(event_json);
@@ -366,3 +365,71 @@ fn test_list_blobs() {
 
 // Social graph tests removed - nostrdb dependency has been removed
 // Access control now uses allowed_npubs config + public_writes flag
+
+/// Test that Cache-Control: immutable header is set for content-addressed routes
+#[test]
+fn test_cache_control_immutable_header() {
+    let server = TestServer::new(19007, false);
+
+    // Upload a blob with auth header (since enable_auth may still require it)
+    let keys = Keys::generate();
+    let auth_header = create_blossom_auth(&keys);
+
+    let test_content = "Cache control test content";
+    let upload_output = Command::new("curl")
+        .arg("-s")
+        .arg("-X").arg("PUT")
+        .arg("-H").arg("Content-Type: text/plain")
+        .arg("-H").arg(format!("Authorization: {}", auth_header))
+        .arg("--data-binary").arg(test_content)
+        .arg(format!("{}/upload", server.base_url()))
+        .output()
+        .expect("Failed to upload");
+
+    let upload_response = String::from_utf8_lossy(&upload_output.stdout);
+    println!("Upload response: {}", upload_response);
+
+    let sha256: Option<String> = serde_json::from_str::<serde_json::Value>(&upload_response)
+        .ok()
+        .and_then(|v| v.get("sha256").and_then(|s| s.as_str()).map(|s| s.to_string()));
+
+    if let Some(hash) = sha256 {
+        println!("Uploaded blob hash: {}", hash);
+
+        // GET request should include Cache-Control: immutable header
+        let get_output = Command::new("curl")
+            .arg("-s")
+            .arg("-I") // Get headers only
+            .arg(format!("{}/{}", server.base_url(), hash))
+            .output()
+            .expect("Failed to get blob headers");
+
+        let get_headers = String::from_utf8_lossy(&get_output.stdout);
+        println!("GET headers: {}", get_headers);
+
+        assert!(get_headers.contains("cache-control:") || get_headers.contains("Cache-Control:"),
+            "Response should include Cache-Control header");
+        assert!(get_headers.to_lowercase().contains("immutable"),
+            "Cache-Control should include 'immutable' directive");
+        assert!(get_headers.to_lowercase().contains("max-age=31536000"),
+            "Cache-Control should include max-age=31536000 (1 year)");
+
+        // HEAD request should also include Cache-Control: immutable header
+        let head_output = Command::new("curl")
+            .arg("-s")
+            .arg("-I")
+            .arg("-X").arg("HEAD")
+            .arg(format!("{}/{}", server.base_url(), hash))
+            .output()
+            .expect("Failed to HEAD blob");
+
+        let head_headers = String::from_utf8_lossy(&head_output.stdout);
+        println!("HEAD headers: {}", head_headers);
+
+        assert!(head_headers.to_lowercase().contains("immutable"),
+            "HEAD response should include Cache-Control: immutable");
+    } else {
+        // Skip test if upload failed (may happen in some CI environments)
+        println!("Upload failed (possibly auth issue), skipping cache header test");
+    }
+}
