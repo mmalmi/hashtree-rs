@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use heed::{Database, EnvOpenOptions};
 use heed::types::*;
 use hashtree_lmdb::LmdbBlobStore;
@@ -301,6 +302,27 @@ impl StorageRouter {
     }
 }
 
+// Implement async Store trait for StorageRouter so it can be used directly with HashTree
+// This ensures all writes go through S3 sync
+#[async_trait]
+impl Store for StorageRouter {
+    async fn put(&self, hash: Hash, data: Vec<u8>) -> Result<bool, StoreError> {
+        self.put_sync(hash, &data)
+    }
+
+    async fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+        self.get_sync(hash)
+    }
+
+    async fn has(&self, hash: &Hash) -> Result<bool, StoreError> {
+        self.exists(hash)
+    }
+
+    async fn delete(&self, hash: &Hash) -> Result<bool, StoreError> {
+        self.delete_sync(hash)
+    }
+}
+
 pub struct HashtreeStore {
     env: heed::Env,
     /// Set of pinned hashes (hex strings, prevents garbage collection)
@@ -319,8 +341,8 @@ pub struct HashtreeStore {
     tree_refs: Database<Str, Bytes>,
     /// Cached roots from Nostr: "pubkey_hex/tree_name" -> CachedRoot (msgpack)
     cached_roots: Database<Str, Bytes>,
-    /// Storage router - handles LMDB + optional S3
-    router: StorageRouter,
+    /// Storage router - handles LMDB + optional S3 (Arc for sharing with HashTree)
+    router: Arc<StorageRouter>,
     /// Maximum storage size in bytes (from config)
     max_size_bytes: u64,
 }
@@ -365,7 +387,7 @@ impl HashtreeStore {
 
         // Create storage router with optional S3
         #[cfg(feature = "s3")]
-        let router = if let Some(s3_cfg) = s3_config {
+        let router = Arc::new(if let Some(s3_cfg) = s3_config {
             tracing::info!("Initializing S3 storage backend: bucket={}, endpoint={}",
                 s3_cfg.bucket, s3_cfg.endpoint);
 
@@ -374,15 +396,15 @@ impl HashtreeStore {
             })?
         } else {
             StorageRouter::new(lmdb_store)
-        };
+        });
 
         #[cfg(not(feature = "s3"))]
-        let router = {
+        let router = Arc::new({
             if s3_config.is_some() {
                 tracing::warn!("S3 config provided but S3 feature not enabled. Using local storage only.");
             }
             StorageRouter::new(lmdb_store)
-        };
+        });
 
         Ok(Self {
             env,
@@ -404,9 +426,10 @@ impl HashtreeStore {
         &self.router
     }
 
-    /// Get the underlying LMDB store for HashTree operations
-    pub fn blob_store_arc(&self) -> Arc<LmdbBlobStore> {
-        self.router.local_store()
+    /// Get the storage router as Arc (for use with HashTree which needs Arc<dyn Store>)
+    /// All writes through this go to both LMDB and S3
+    pub fn store_arc(&self) -> Arc<StorageRouter> {
+        Arc::clone(&self.router)
     }
 
     /// Upload a file and return its CID (public/unencrypted), with auto-pin
@@ -428,7 +451,7 @@ impl HashtreeStore {
         let sha256_hex = to_hex(&content_sha256);
 
         // Use hashtree to store the file (public mode - no encryption)
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let cid = sync_block_on(async {
@@ -471,7 +494,7 @@ impl HashtreeStore {
         let sha256_hex = to_hex(&content_sha256);
 
         // Use HashTree.put for upload (public mode for blossom)
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let cid = sync_block_on(async {
@@ -504,7 +527,7 @@ impl HashtreeStore {
     pub fn upload_dir_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
 
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let root_cid = sync_block_on(async {
@@ -634,7 +657,7 @@ impl HashtreeStore {
         let file_content = std::fs::read(file_path)?;
 
         // Use unified API with encryption enabled (default)
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store));
 
         let cid = sync_block_on(async {
@@ -660,7 +683,7 @@ impl HashtreeStore {
     /// Returns CID as "hash:key" format for encrypted directories
     pub fn upload_dir_encrypted_with_options<P: AsRef<Path>>(&self, dir_path: P, respect_gitignore: bool) -> Result<String> {
         let dir_path = dir_path.as_ref();
-        let store = self.router.local_store();
+        let store = self.store_arc();
 
         // Use unified API with encryption enabled (default)
         let tree = HashTree::new(HashTreeConfig::new(store));
@@ -684,7 +707,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
@@ -930,7 +953,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
@@ -944,7 +967,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
 
         sync_block_on(async {
@@ -1106,7 +1129,7 @@ impl HashtreeStore {
         let hash = from_hex(hash_hex)
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
 
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
@@ -1175,7 +1198,7 @@ impl HashtreeStore {
     /// List all pinned hashes with names
     pub fn list_pins_with_names(&self) -> Result<Vec<PinnedItem>> {
         let rtxn = self.env.read_txn()?;
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
         let mut pins = Vec::new();
 
@@ -1233,7 +1256,7 @@ impl HashtreeStore {
             }
         }
 
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         // Walk tree and collect all blob hashes + compute total size
@@ -1327,7 +1350,7 @@ impl HashtreeStore {
     pub fn unindex_tree(&self, root_hash: &Hash) -> Result<u64> {
         let root_hex = to_hex(root_hash);
 
-        let store = self.router.local_store();
+        let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         // Walk tree and collect all blob hashes
