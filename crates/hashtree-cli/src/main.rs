@@ -22,7 +22,6 @@ use hashtree_cli::{
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RootResolver,
     WebRTCConfig, WebRTCManager,
 };
-use nostr::nips::nip19::ToBech32;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1378,38 +1377,6 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
 
     println!("\nDone!");
     Ok(())
-}
-
-/// Fetch a blob from blossom read servers (fallback when not available locally)
-/// Returns None if not found on any server
-async fn fetch_from_blossom(hash_hex: &str, servers: &[String]) -> Option<Vec<u8>> {
-    use sha2::{Sha256, Digest};
-
-    if servers.is_empty() {
-        return None;
-    }
-
-    let client = reqwest::Client::new();
-
-    for server in servers {
-        let url = format!("{}/{}", server.trim_end_matches('/'), hash_hex);
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(bytes) = resp.bytes().await {
-                    // Verify hash
-                    let mut hasher = Sha256::new();
-                    hasher.update(&bytes);
-                    let computed = hex::encode(hasher.finalize());
-                    if computed == hash_hex {
-                        return Some(bytes.to_vec());
-                    }
-                }
-            }
-            _ => continue,
-        }
-    }
-
-    None
 }
 
 /// Background push to Blossom - fire and forget with server-level backoff

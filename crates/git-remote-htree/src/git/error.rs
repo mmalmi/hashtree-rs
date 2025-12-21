@@ -13,9 +13,6 @@ pub enum Error {
     #[error("Invalid object format: {0}")]
     InvalidObjectFormat(String),
 
-    #[error("Ref not found: {0}")]
-    RefNotFound(String),
-
     #[error("Invalid ref name: {0}")]
     InvalidRefName(String),
 

@@ -14,6 +14,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use hashtree_core::{sha256, DirEntry, HashTree, HashTreeConfig, LinkType, Store};
 use hashtree_lmdb::LmdbBlobStore;
+use sha1::{Sha1, Digest};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -113,6 +114,7 @@ impl GitStorage {
     }
 
     /// Read an object by ID from in-memory cache
+    #[allow(dead_code)]
     fn read_object(&self, oid: &ObjectId) -> Result<GitObject> {
         let key = oid.to_hex();
         let objects = self.objects.read()
@@ -150,6 +152,7 @@ impl GitStorage {
     }
 
     /// Read a ref
+    #[allow(dead_code)]
     pub fn read_ref(&self, name: &str) -> Result<Option<Ref>> {
         let refs = self.refs.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
@@ -169,6 +172,7 @@ impl GitStorage {
     }
 
     /// List all refs
+    #[allow(dead_code)]
     pub fn list_refs(&self) -> Result<HashMap<String, String>> {
         let refs = self.refs.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
@@ -190,6 +194,7 @@ impl GitStorage {
     }
 
     /// Get the cached root hash (returns None if tree hasn't been built)
+    #[allow(dead_code)]
     pub fn get_root_hash(&self) -> Result<Option<[u8; 32]>> {
         let root = self.root_hash.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
@@ -197,6 +202,7 @@ impl GitStorage {
     }
 
     /// Get the default branch name
+    #[allow(dead_code)]
     pub fn default_branch(&self) -> Result<Option<String>> {
         let refs = self.refs.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
@@ -332,6 +338,21 @@ impl GitStorage {
                 let config_hash = self.tree.put_blob(config.as_bytes()).await
                     .map_err(|e| Error::StorageError(format!("put config: {}", e)))?;
                 git_entries.push(DirEntry::new("config", config_hash).with_size(config.len() as u64));
+            }
+
+            // Build and add index file if we have a tree SHA
+            if let Some(ref tree_oid) = tree_sha {
+                match self.build_index_file(tree_oid, &objects_clone) {
+                    Ok(index_data) => {
+                        let index_hash = self.tree.put_blob(&index_data).await
+                            .map_err(|e| Error::StorageError(format!("put index: {}", e)))?;
+                        git_entries.push(DirEntry::new("index", index_hash).with_size(index_data.len() as u64));
+                        info!("Added git index file ({} bytes)", index_data.len());
+                    }
+                    Err(e) => {
+                        debug!("Failed to build git index file: {} - continuing without index", e);
+                    }
+                }
             }
 
             let git_cid = self.tree.put_directory(git_entries).await
@@ -525,17 +546,148 @@ impl GitStorage {
         Ok(refs_cid.hash)
     }
 
+    /// Build git index file from tree entries
+    /// Returns the raw binary content of the index file
+    fn build_index_file(
+        &self,
+        tree_oid: &str,
+        objects: &HashMap<String, Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        // Collect all file entries from the tree (recursively)
+        let mut entries: Vec<(String, [u8; 20], u32, u32)> = Vec::new(); // (path, sha1, mode, size)
+        self.collect_tree_entries_for_index(tree_oid, objects, "", &mut entries)?;
+
+        // Sort entries by path (git index requirement)
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let entry_count = entries.len() as u32;
+        debug!("Building git index with {} entries", entry_count);
+
+        // Build index content
+        let mut index_data = Vec::new();
+
+        // Header: DIRC + version 2 + entry count
+        index_data.extend_from_slice(b"DIRC");
+        index_data.extend_from_slice(&2u32.to_be_bytes()); // version 2
+        index_data.extend_from_slice(&entry_count.to_be_bytes());
+
+        // Current time for ctime/mtime (doesn't matter much for our use case)
+        let now_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+
+        for (path, sha1, mode, size) in &entries {
+            let entry_start = index_data.len();
+
+            // ctime sec, nsec
+            index_data.extend_from_slice(&now_sec.to_be_bytes());
+            index_data.extend_from_slice(&0u32.to_be_bytes());
+            // mtime sec, nsec
+            index_data.extend_from_slice(&now_sec.to_be_bytes());
+            index_data.extend_from_slice(&0u32.to_be_bytes());
+            // dev, ino (use 0)
+            index_data.extend_from_slice(&0u32.to_be_bytes());
+            index_data.extend_from_slice(&0u32.to_be_bytes());
+            // mode
+            index_data.extend_from_slice(&mode.to_be_bytes());
+            // uid, gid (use 0)
+            index_data.extend_from_slice(&0u32.to_be_bytes());
+            index_data.extend_from_slice(&0u32.to_be_bytes());
+            // file size
+            index_data.extend_from_slice(&size.to_be_bytes());
+            // SHA-1
+            index_data.extend_from_slice(sha1);
+            // flags: path length (max 0xFFF) in low 12 bits
+            let path_len = std::cmp::min(path.len(), 0xFFF) as u16;
+            index_data.extend_from_slice(&path_len.to_be_bytes());
+            // path (NUL-terminated)
+            index_data.extend_from_slice(path.as_bytes());
+            index_data.push(0); // NUL terminator
+
+            // Pad to 8-byte boundary relative to entry start
+            let entry_len = index_data.len() - entry_start;
+            let padding = (8 - (entry_len % 8)) % 8;
+            for _ in 0..padding {
+                index_data.push(0);
+            }
+        }
+
+        // Calculate SHA-1 checksum of everything and append
+        let mut hasher = Sha1::new();
+        hasher.update(&index_data);
+        let checksum = hasher.finalize();
+        index_data.extend_from_slice(&checksum);
+
+        debug!("Built git index: {} bytes, {} entries", index_data.len(), entry_count);
+        Ok(index_data)
+    }
+
+    /// Collect file entries from a git tree for building the index
+    fn collect_tree_entries_for_index(
+        &self,
+        tree_oid: &str,
+        objects: &HashMap<String, Vec<u8>>,
+        prefix: &str,
+        entries: &mut Vec<(String, [u8; 20], u32, u32)>,
+    ) -> Result<()> {
+        let (obj_type, content) = self.get_object_content(tree_oid, objects)
+            .ok_or_else(|| Error::ObjectNotFound(tree_oid.to_string()))?;
+
+        if obj_type != ObjectType::Tree {
+            return Err(Error::InvalidObjectType(format!("expected tree, got {:?}", obj_type)));
+        }
+
+        let tree_entries = parse_tree(&content)?;
+
+        for entry in tree_entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", prefix, entry.name)
+            };
+
+            let oid_hex = entry.oid.to_hex();
+
+            if entry.is_tree() {
+                // Recursively process subdirectory
+                self.collect_tree_entries_for_index(&oid_hex, objects, &path, entries)?;
+            } else {
+                // Get blob content for size and SHA-1
+                if let Some((ObjectType::Blob, blob_content)) = self.get_object_content(&oid_hex, objects) {
+                    // Convert hex SHA to bytes
+                    let mut sha1_bytes = [0u8; 20];
+                    if let Ok(bytes) = hex::decode(&oid_hex) {
+                        if bytes.len() == 20 {
+                            sha1_bytes.copy_from_slice(&bytes);
+                        }
+                    }
+
+                    // Mode: use entry.mode or default to regular file
+                    let mode = entry.mode;
+                    let size = blob_content.len() as u32;
+
+                    entries.push((path, sha1_bytes, mode, size));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the underlying store
     pub fn store(&self) -> &Arc<LmdbBlobStore> {
         &self.store
     }
 
     /// Get the HashTree for direct access
+    #[allow(dead_code)]
     pub fn hashtree(&self) -> &HashTree<LmdbBlobStore> {
         &self.tree
     }
 
     /// Push all blobs to file servers
+    #[allow(dead_code)]
     pub fn push_to_file_servers(
         &self,
         blossom: &hashtree_blossom::BlossomClient,
@@ -576,6 +728,7 @@ impl GitStorage {
     }
 
     /// Clear all state (for testing or re-initialization)
+    #[allow(dead_code)]
     pub fn clear(&self) -> Result<()> {
         let mut objects = self.objects.write()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;

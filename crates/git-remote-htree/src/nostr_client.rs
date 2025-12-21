@@ -327,6 +327,7 @@ impl NostrClient {
 
     /// Fetch refs with a quick timeout (3s) for push operations
     /// Returns empty if timeout - allows push to proceed
+    #[allow(dead_code)]
     pub fn fetch_refs_quick(&mut self, repo_name: &str) -> Result<HashMap<String, String>> {
         let (refs, _, _) = self.fetch_refs_with_timeout(repo_name, 3)?;
         Ok(refs)
@@ -334,6 +335,7 @@ impl NostrClient {
 
     /// Fetch refs and root hash info from nostr
     /// Returns (refs, root_hash, encryption_key)
+    #[allow(dead_code)]
     pub fn fetch_refs_with_root(&mut self, repo_name: &str) -> Result<(HashMap<String, String>, Option<String>, Option<[u8; 32]>)> {
         self.fetch_refs_with_timeout(repo_name, 10)
     }
@@ -724,6 +726,7 @@ impl NostrClient {
     }
 
     /// Get the public key (hex)
+    #[allow(dead_code)]
     pub fn pubkey(&self) -> &str {
         &self.pubkey
     }
@@ -840,6 +843,7 @@ impl NostrClient {
     }
 
     /// Upload blob to blossom server
+    #[allow(dead_code)]
     pub async fn upload_blob(&self, _hash: &str, data: &[u8]) -> Result<String> {
         let hash = self
             .blossom
@@ -850,6 +854,7 @@ impl NostrClient {
     }
 
     /// Upload blob only if it doesn't exist
+    #[allow(dead_code)]
     pub async fn upload_blob_if_missing(&self, data: &[u8]) -> Result<(String, bool)> {
         self.blossom
             .upload_if_missing(data)
@@ -858,6 +863,7 @@ impl NostrClient {
     }
 
     /// Download blob from blossom server
+    #[allow(dead_code)]
     pub async fn download_blob(&self, hash: &str) -> Result<Vec<u8>> {
         self.blossom
             .download(hash)
@@ -866,6 +872,7 @@ impl NostrClient {
     }
 
     /// Try to download blob, returns None if not found
+    #[allow(dead_code)]
     pub async fn try_download_blob(&self, hash: &str) -> Option<Vec<u8>> {
         self.blossom.try_download(hash).await
     }

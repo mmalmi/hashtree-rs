@@ -135,13 +135,17 @@ impl RemoteHelper {
 
     /// List refs available on remote
     fn list_refs(&mut self, for_push: bool) -> Result<Option<Vec<String>>> {
-        // For push, do a quick check (3s timeout) to detect conflicts
-        // For clone/pull, use the full timeout (10s)
-        let refs = if for_push {
-            self.nostr.fetch_refs_quick(&self.repo_name)?
-        } else {
-            self.nostr.fetch_refs(&self.repo_name)?
-        };
+        // For push, always return empty refs to force re-push
+        // This ensures content is always re-uploaded to blossom servers
+        // and we regenerate the index file each time
+        if for_push {
+            debug!("Returning empty refs for push to force re-upload");
+            self.remote_refs.clear();
+            return Ok(Some(vec![String::new()]));
+        }
+
+        // For clone/pull, fetch actual refs from nostr
+        let refs = self.nostr.fetch_refs(&self.repo_name)?;
 
         let mut lines = Vec::new();
         self.remote_refs.clear();

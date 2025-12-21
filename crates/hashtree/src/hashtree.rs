@@ -1098,29 +1098,6 @@ impl<S: Store> HashTree<S> {
             .cloned()
     }
 
-    async fn find_link_in_subtrees(&self, node: &TreeNode, name: &str) -> Result<Option<Link>, HashTreeError> {
-        for link in &node.links {
-            if !link.name.as_ref().map(|n| n.starts_with('_')).unwrap_or(false) {
-                continue;
-            }
-
-            let sub_node = match self.get_tree_node(&link.hash).await? {
-                Some(n) => n,
-                None => continue,
-            };
-
-            if let Some(found) = self.find_link(&sub_node, name) {
-                return Ok(Some(found));
-            }
-
-            if let Some(deep_found) = Box::pin(self.find_link_in_subtrees(&sub_node, name)).await? {
-                return Ok(Some(deep_found));
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Find a link in subtrees using Cid (with decryption support)
     async fn find_link_in_subtrees_cid(&self, node: &TreeNode, name: &str, _parent_cid: &Cid) -> Result<Option<Link>, HashTreeError> {
         for link in &node.links {

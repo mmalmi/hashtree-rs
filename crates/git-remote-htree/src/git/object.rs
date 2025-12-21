@@ -26,6 +26,7 @@ impl ObjectType {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "blob" => Some(ObjectType::Blob),
@@ -120,6 +121,7 @@ impl GitObject {
     }
 
     /// Parse from loose object format
+    #[allow(dead_code)]
     pub fn from_loose_format(data: &[u8]) -> Result<Self> {
         let null_pos = data
             .iter()
