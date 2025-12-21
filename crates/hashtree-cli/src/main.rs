@@ -30,6 +30,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "htree")]
+#[command(version)]
 #[command(about = "Like Blossom, but with directories and chunking", long_about = None)]
 struct Cli {
     #[arg(long, default_value = "./hashtree-data", global = true, env = "HTREE_DATA_DIR")]

@@ -713,9 +713,10 @@ impl NostrClient {
     ///   tags: [["d", repo_name], ["l", "hashtree"], ["hash", root_hash]]
     ///   content: <merkle-root-hash>
     pub fn publish_repo(&self, repo_name: &str, root_hash: &str) -> Result<()> {
-        let keys = self.keys.as_ref().context(
-            "No secret key configured. Set NOSTR_SECRET_KEY or create ~/.hashtree/keys",
-        )?;
+        let keys = self.keys.as_ref().context(format!(
+            "Cannot push: no secret key for {}. You can only push to your own repos.",
+            &self.pubkey[..16]
+        ))?;
 
         info!("Publishing repo {} with root hash {}", repo_name, root_hash);
 
@@ -775,6 +776,11 @@ impl NostrClient {
             output.id(),
             output.success.len()
         );
+
+        // Display the full htree:// URL with npub
+        if let Ok(npub) = keys.public_key().to_bech32() {
+            eprintln!("Published to: htree://{}/{}", npub, repo_name);
+        }
 
         if output.success.is_empty() {
             warn!("Event was not accepted by any relay");

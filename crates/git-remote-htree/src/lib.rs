@@ -47,7 +47,7 @@ fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("git_remote_htree=info".parse().unwrap()),
+                .add_directive("git_remote_htree=warn".parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -83,7 +83,7 @@ fn run() -> Result<()> {
     if secret_key.is_some() {
         debug!("Found signing key for {}", identifier);
     } else {
-        warn!("No signing key for {} - push will fail", identifier);
+        debug!("No signing key for {} (read-only)", identifier);
     }
 
     // Print npub for reference

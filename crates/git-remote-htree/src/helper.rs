@@ -7,7 +7,8 @@ use anyhow::{bail, Context, Result};
 use crate::git::object::ObjectType;
 use crate::git::refs::Ref;
 use crate::git::storage::GitStorage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::{debug, info, warn};
@@ -585,16 +586,16 @@ impl RemoteHelper {
     }
 
     /// Push content to file servers (blossom)
-    /// Uploads all blobs from local LMDB store to Blossom servers
-    fn push_to_file_servers(&self, _root_hash: &str) {
+    /// Walks the merkle tree from root_hash and uploads only blobs belonging to this tree
+    fn push_to_file_servers(&self, root_hash: &str) {
         let store = self.storage.store();
         let blossom = self.nostr.blossom();
 
-        // Get all hashes from LMDB
-        let hashes = match store.list() {
+        // Collect all hashes reachable from the root (tree walk)
+        let hashes = match self.collect_tree_hashes(root_hash) {
             Ok(h) => h,
             Err(e) => {
-                warn!("Failed to list blobs for upload: {}", e);
+                warn!("Failed to collect tree hashes: {}", e);
                 return;
             }
         };
@@ -617,10 +618,19 @@ impl RemoteHelper {
             let mut uploaded = 0;
             let mut skipped = 0;
             let mut failed = 0;
+            let total = hashes.len();
 
-            for hash in hashes {
+            for (i, hash) in hashes.iter().enumerate() {
+                // Progress indicator (update every blob for small sets, every 10 for large)
+                let update_interval = if total < 50 { 1 } else { 10 };
+                if i % update_interval == 0 || i == total - 1 {
+                    eprint!("\r  Uploading: {}/{} ({} new, {} exist)",
+                        i + 1, total, uploaded, skipped);
+                    let _ = std::io::stderr().flush();
+                }
+
                 // Get blob data from LMDB
-                let data = match store.get_sync(&hash) {
+                let data = match store.get_sync(hash) {
                     Ok(Some(d)) => d,
                     Ok(None) => continue,
                     Err(e) => {
@@ -641,11 +651,57 @@ impl RemoteHelper {
                 }
             }
 
+            eprintln!(); // Newline after progress
             info!(
                 "Blossom upload complete: {} uploaded, {} already existed, {} failed",
                 uploaded, skipped, failed
             );
         });
+    }
+
+    /// Collect all hashes reachable from a root hash by walking the merkle tree
+    fn collect_tree_hashes(&self, root_hash: &str) -> Result<Vec<[u8; 32]>> {
+        use hashtree_core::try_decode_tree_node;
+
+        let store = self.storage.store();
+        let mut hashes = Vec::new();
+        let mut visited: HashSet<[u8; 32]> = HashSet::new();
+
+        // Parse root hash
+        let root_bytes = hex::decode(root_hash)
+            .context("Invalid root hash hex")?;
+        if root_bytes.len() != 32 {
+            bail!("Root hash must be 32 bytes");
+        }
+        let mut root: [u8; 32] = [0u8; 32];
+        root.copy_from_slice(&root_bytes);
+
+        let mut queue = vec![root];
+
+        while let Some(hash) = queue.pop() {
+            if visited.contains(&hash) {
+                continue;
+            }
+            visited.insert(hash);
+            hashes.push(hash);
+
+            // Get blob data and check if it's a tree node
+            if let Ok(Some(data)) = store.get_sync(&hash) {
+                // Try to decode as tree node
+                if let Some(node) = try_decode_tree_node(&data) {
+                    // Queue all child hashes
+                    for link in node.links {
+                        if !visited.contains(&link.hash) {
+                            queue.push(link.hash);
+                        }
+                    }
+                }
+                // If not a tree node, it's a leaf blob - already added to hashes
+            }
+        }
+
+        debug!("Collected {} hashes from tree {}", hashes.len(), &root_hash[..12]);
+        Ok(hashes)
     }
 
     /// List objects that need to be pushed (not on remote)
