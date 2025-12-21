@@ -184,6 +184,9 @@ impl BlossomClient {
 
     /// Upload data only if it doesn't already exist
     /// Returns (hash, was_uploaded) tuple
+    ///
+    /// For small files (<256KB), skips existence check and relies on server returning 409.
+    /// For large files (>=256KB), does HEAD check first to save bandwidth.
     pub async fn upload_if_missing(&self, data: &[u8]) -> Result<(String, bool), BlossomError> {
         if self.write_servers.is_empty() {
             return Err(BlossomError::NoServers);
@@ -196,15 +199,34 @@ impl BlossomClient {
             warn!("Attempting to upload empty blob with hash {}", hash);
         }
 
-        // Check if exists on any read server
-        if self.exists(&hash).await {
+        // For large files, check existence first to save bandwidth
+        const HEAD_CHECK_THRESHOLD: usize = 256 * 1024; // 256KB
+        if data.len() >= HEAD_CHECK_THRESHOLD && self.exists(&hash).await {
+            debug!("Large blob {} already exists (skipped upload)", &hash[..12]);
             return Ok((hash, false));
         }
 
-        // Upload
-        debug!("Uploading {} bytes with hash {}", data.len(), &hash[..12]);
-        self.upload(data).await?;
-        Ok((hash, true))
+        // Try to upload directly - server returns 409 if already exists
+        let auth_header = self.create_upload_auth(&hash).await?;
+
+        for server in &self.write_servers {
+            match self.upload_to_server(server, data, &hash, &auth_header).await {
+                Ok(was_new) => {
+                    if was_new {
+                        debug!("Uploaded {} to {}", &hash[..12], server);
+                    } else {
+                        debug!("Blob {} already exists on {}", &hash[..12], server);
+                    }
+                    return Ok((hash, was_new));
+                }
+                Err(e) => {
+                    warn!("Upload to {} failed: {}", server, e);
+                    continue;
+                }
+            }
+        }
+
+        Err(BlossomError::UploadFailed("all servers failed".to_string()))
     }
 
     /// Check if a blob exists on any read server
@@ -288,13 +310,15 @@ impl BlossomClient {
         self.download(hash).await.ok()
     }
 
+    /// Upload to a single server
+    /// Returns Ok(true) if uploaded, Ok(false) if already exists (409)
     async fn upload_to_server(
         &self,
         server: &str,
         data: &[u8],
         hash: &str,
         auth_header: &str,
-    ) -> Result<(), BlossomError> {
+    ) -> Result<bool, BlossomError> {
         let url = format!("{}/upload", server.trim_end_matches('/'));
 
         let resp = self
@@ -307,11 +331,12 @@ impl BlossomClient {
             .send()
             .await?;
 
-        // 200 OK or 409 Conflict (already exists) are both success
-        if resp.status().is_success() || resp.status().as_u16() == 409 {
-            Ok(())
+        let status = resp.status();
+        if status.is_success() {
+            Ok(true) // Actually uploaded
+        } else if status.as_u16() == 409 {
+            Ok(false) // Already exists
         } else {
-            let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             Err(BlossomError::UploadFailed(format!("{}: {}", status, text)))
         }

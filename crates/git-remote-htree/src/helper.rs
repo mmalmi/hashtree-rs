@@ -662,50 +662,73 @@ impl RemoteHelper {
         };
 
         let success = rt.block_on(async {
-            let mut uploaded = 0;
-            let mut skipped = 0;
-            let mut failed = 0;
-            let total = hashes.len();
+            use futures::stream::{self, StreamExt};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc as StdArc;
 
-            for (i, hash) in hashes.iter().enumerate() {
-                // Progress indicator (update every blob for small sets, every 10 for large)
-                let update_interval = if total < 50 { 1 } else { 10 };
-                if i % update_interval == 0 || i == total - 1 {
-                    eprint!("\r  Uploading: {}/{} ({} new, {} exist)",
-                        i + 1, total, uploaded, skipped);
-                    let _ = std::io::stderr().flush();
-                }
+            let uploaded = StdArc::new(AtomicUsize::new(0));
+            let skipped = StdArc::new(AtomicUsize::new(0));
+            let failed = StdArc::new(AtomicUsize::new(0));
+            let processed = StdArc::new(AtomicUsize::new(0));
 
-                // Get blob data from LMDB
-                let data = match store.get_sync(hash) {
-                    Ok(Some(d)) => d,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        debug!("Failed to read blob {}: {}", hex::encode(hash), e);
-                        failed += 1;
-                        continue;
+            // Pre-load all blob data from LMDB (sync operation)
+            let blobs: Vec<_> = hashes
+                .iter()
+                .filter_map(|hash| {
+                    match store.get_sync(hash) {
+                        Ok(Some(data)) => Some((hash.clone(), data)),
+                        _ => None,
                     }
-                };
+                })
+                .collect();
 
-                // Upload to Blossom (skip if already exists)
-                match blossom.upload_if_missing(&data).await {
-                    Ok((_, true)) => uploaded += 1,
-                    Ok((_, false)) => skipped += 1,
-                    Err(e) => {
-                        debug!("Failed to upload blob {}: {}", hex::encode(hash), e);
-                        failed += 1;
+            let blob_count = blobs.len();
+            eprintln!("  Uploading {} blobs...", blob_count);
+
+            // Parallel upload with concurrency limit
+            const UPLOAD_CONCURRENCY: usize = 10;
+            let _results: Vec<()> = stream::iter(blobs)
+                .map(|(hash, data)| {
+                    let blossom = &blossom;
+                    let uploaded = StdArc::clone(&uploaded);
+                    let skipped = StdArc::clone(&skipped);
+                    let failed = StdArc::clone(&failed);
+                    let processed = StdArc::clone(&processed);
+                    async move {
+                        match blossom.upload_if_missing(&data).await {
+                            Ok((_, true)) => { uploaded.fetch_add(1, Ordering::Relaxed); }
+                            Ok((_, false)) => { skipped.fetch_add(1, Ordering::Relaxed); }
+                            Err(e) => {
+                                debug!("Failed to upload blob {}: {}", hex::encode(&hash), e);
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        let count = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count % 10 == 0 || count == blob_count {
+                            eprint!("\r  Uploading: {}/{} ({} new, {} exist)",
+                                count, blob_count,
+                                uploaded.load(Ordering::Relaxed),
+                                skipped.load(Ordering::Relaxed));
+                            let _ = std::io::stderr().flush();
+                        }
                     }
-                }
-            }
+                })
+                .buffer_unordered(UPLOAD_CONCURRENCY)
+                .collect()
+                .await;
+
+            let final_uploaded = uploaded.load(Ordering::Relaxed);
+            let final_skipped = skipped.load(Ordering::Relaxed);
+            let final_failed = failed.load(Ordering::Relaxed);
 
             eprintln!(); // Newline after progress
             info!(
                 "Blossom upload complete: {} uploaded, {} already existed, {} failed",
-                uploaded, skipped, failed
+                final_uploaded, final_skipped, final_failed
             );
 
             // Return true if we had any success
-            uploaded > 0 || skipped > 0
+            final_uploaded > 0 || final_skipped > 0
         });
 
         if success { blossom_server_count } else { 0 }
