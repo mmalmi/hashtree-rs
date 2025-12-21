@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 # Core hashtree crate
-hashtree-core = { path = "../hashtree" }
+hashtree-core.workspace = true
 
 # Core
 async-trait.workspace = true
