@@ -319,70 +319,83 @@ impl RemoteHelper {
             }
         };
 
-        info!("Objects directory has {} entries", entries.len());
+        use futures::stream::{self, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
 
-        // Check if prefix-based or flat layout
+        // Collect all objects to fetch (oid, cid) pairs
         let is_prefix_layout = entries.iter().any(|e| e.name.len() == 2);
+        let mut fetch_tasks: Vec<(String, Cid)> = Vec::new();
 
         if is_prefix_layout {
-            info!("Detected prefix-based object layout (objects/XX/...)");
             for entry in &entries {
-                // Skip non-hex prefixes (pack, info, etc)
                 if entry.name.len() != 2 || hex::decode(&entry.name).is_err() {
                     continue;
                 }
-
-                let prefix = &entry.name;
+                let prefix = entry.name.clone();
                 let prefix_cid = Cid {
                     hash: entry.hash,
                     key: entry.key,
                     size: entry.size,
                 };
-
-                // List objects in prefix directory
-                let sub_entries = match tree.list_directory(&prefix_cid).await {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                for obj_entry in sub_entries {
-                    // Object names should be 38 chars (remaining SHA1 after prefix)
-                    if obj_entry.name.len() != 38 || hex::decode(&obj_entry.name).is_err() {
-                        continue;
-                    }
-
-                    let oid = format!("{}{}", prefix, obj_entry.name);
-                    let obj_cid = Cid {
-                        hash: obj_entry.hash,
-                        key: obj_entry.key,
-                        size: obj_entry.size,
-                    };
-
-                    // Read the object content
-                    if let Ok(Some(content)) = tree.get(&obj_cid).await {
-                        objects.push((oid, content));
+                if let Ok(sub_entries) = tree.list_directory(&prefix_cid).await {
+                    for obj_entry in sub_entries {
+                        if obj_entry.name.len() != 38 || hex::decode(&obj_entry.name).is_err() {
+                            continue;
+                        }
+                        let oid = format!("{}{}", prefix, obj_entry.name);
+                        let obj_cid = Cid {
+                            hash: obj_entry.hash,
+                            key: obj_entry.key,
+                            size: obj_entry.size,
+                        };
+                        fetch_tasks.push((oid, obj_cid));
                     }
                 }
             }
         } else {
-            info!("Detected flat object layout (objects/SHA1...)");
             for entry in &entries {
-                // Skip non-SHA1 entries
                 if entry.name.len() != 40 || hex::decode(&entry.name).is_err() {
                     continue;
                 }
-
                 let oid = entry.name.clone();
                 let obj_cid = Cid {
                     hash: entry.hash,
                     key: entry.key,
                     size: entry.size,
                 };
+                fetch_tasks.push((oid, obj_cid));
+            }
+        }
 
-                // Read the object content
-                if let Ok(Some(content)) = tree.get(&obj_cid).await {
-                    objects.push((oid, content));
+        let total_objects = fetch_tasks.len();
+        eprintln!("  Downloading {} git objects...", total_objects);
+        let downloaded = StdArc::new(AtomicUsize::new(0));
+
+        // Parallel fetch with concurrency limit
+        const CONCURRENCY: usize = 20;
+        let results: Vec<Option<(String, Vec<u8>)>> = stream::iter(fetch_tasks)
+            .map(|(oid, obj_cid)| {
+                let tree = &tree;
+                let downloaded = StdArc::clone(&downloaded);
+                async move {
+                    let result = tree.get(&obj_cid).await.ok().flatten().map(|content| (oid, content));
+                    let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % 20 == 0 || count == total_objects {
+                        eprint!("\r  Downloading: {}/{}", count, total_objects);
+                    }
+                    result
                 }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await;
+
+        eprintln!(); // Newline after progress
+
+        for result in results {
+            if let Some((oid, content)) = result {
+                objects.push((oid, content));
             }
         }
 
