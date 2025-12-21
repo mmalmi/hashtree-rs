@@ -43,11 +43,12 @@ fn run() -> Result<()> {
         }
     }
 
-    // Initialize logging
+    // Initialize logging - suppress nostr relay connection errors
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("git_remote_htree=warn".parse().unwrap()),
+                .add_directive("git_remote_htree=warn".parse().unwrap())
+                .add_directive("nostr_relay_pool=off".parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .init();

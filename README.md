@@ -4,6 +4,26 @@ Content-addressed filesystem on Nostr.
 
 Basically [Blossom](https://github.com/hzrd149/blossom) with chunking and directory structure. Merkle roots can be published on Nostr to get mutable `npub/path` addresses.
 
+## Quick Start
+
+```bash
+# 1. Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 2. Install git-remote-htree
+cargo install --git https://github.com/mmalmi/hashtree-rs git-remote-htree
+
+# 3. Clone a repo
+git clone htree://npub1dxs2pygtfxsah77yuncsmu3ttqr274qr56xz3gsvetxzq2vjfnxsy6knkn/hashtree-rs
+
+# Or push your own repo
+echo "your-nsec-here" > ~/.hashtree/keys
+git remote add htree htree://self/myrepo
+git push htree master
+```
+
+View repos at [files.iris.to](https://files.iris.to)
+
 ## Design
 
 - **SHA256** hashing
@@ -78,6 +98,32 @@ nsec1abc123... work
 git remote add origin htree://work/myproject
 git push origin main
 git clone htree://npub1.../repo-name
+```
+
+## Configuration
+
+Config file: `~/.hashtree/config.toml`
+
+```toml
+[blossom]
+read_servers = ["https://cdn.iris.to", "https://hashtree.iris.to"]
+write_servers = ["https://hashtree.iris.to"]
+max_upload_mb = 100
+
+[nostr]
+relays = [
+    "wss://relay.damus.io",
+    "wss://relay.snort.social",
+    "wss://nos.lol",
+    "wss://relay.primal.net"
+]
+```
+
+Keys file: `~/.hashtree/keys`
+
+```
+nsec1abc123... default
+nsec1xyz789... work
 ```
 
 ## CLI

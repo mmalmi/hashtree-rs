@@ -134,9 +134,14 @@ impl RemoteHelper {
     }
 
     /// List refs available on remote
-    fn list_refs(&mut self, _for_push: bool) -> Result<Option<Vec<String>>> {
-        // Fetch refs from nostr
-        let refs = self.nostr.fetch_refs(&self.repo_name)?;
+    fn list_refs(&mut self, for_push: bool) -> Result<Option<Vec<String>>> {
+        // For push, do a quick check (3s timeout) to detect conflicts
+        // For clone/pull, use the full timeout (10s)
+        let refs = if for_push {
+            self.nostr.fetch_refs_quick(&self.repo_name)?
+        } else {
+            self.nostr.fetch_refs(&self.repo_name)?
+        };
 
         let mut lines = Vec::new();
         self.remote_refs.clear();
@@ -560,9 +565,10 @@ impl RemoteHelper {
 
         info!("Pushing {} objects for {}", objects.len(), sha);
 
-        // Read and store each object using hashtree-git's storage
-        for oid in &objects {
-            let (obj_type, content) = self.read_git_object_with_type(oid)?;
+        // Read all objects in batch using git cat-file --batch
+        let objects_with_content = self.read_git_objects_batch(&objects)?;
+
+        for (obj_type, content) in objects_with_content {
             self.storage.write_raw_object(obj_type, &content)?;
         }
 
@@ -571,32 +577,54 @@ impl RemoteHelper {
             .ok_or_else(|| anyhow::anyhow!("Invalid object id: {}", sha))?;
         self.storage.write_ref(dst_ref, &Ref::Direct(oid))?;
 
+        // Set HEAD to point to this branch if it's a branch ref
+        // This is needed for wasm-git to detect the current branch
+        if dst_ref.starts_with("refs/heads/") {
+            self.storage.write_ref("HEAD", &Ref::Symbolic(dst_ref.to_string()))?;
+            debug!("Set HEAD -> {}", dst_ref);
+        }
+
         // Build the merkle tree
         let root_hash = self.storage.build_tree()?;
         let root_hash_hex = hex::encode(root_hash);
 
-        // Publish to nostr (kind 30078 with hashtree label)
-        self.nostr.publish_repo(&self.repo_name, &root_hash_hex)?;
+        // Push to file servers (blossom) first
+        // This makes content available before we advertise the hash
+        let blossom_count = self.push_to_file_servers(&root_hash_hex);
 
-        // Push to file servers (blossom) in background
-        // This makes content available even without P2P connection
-        self.push_to_file_servers(&root_hash_hex);
+        // Then publish to nostr (kind 30078 with hashtree label)
+        // Don't fail push if relay publish fails - it's just distribution
+        let (npub_url, relay_count) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex) {
+            Ok((url, count)) => (url, count),
+            Err(e) => {
+                warn!("Failed to publish to relays: {}", e);
+                // Construct URL anyway for display using npub
+                let url = format!("htree://{}/{}", self.nostr.npub(), &self.repo_name);
+                (url, 0)
+            }
+        };
+
+        // Print summary
+        eprintln!("Published to: {} ({} relays, {} blossom servers)",
+            npub_url, relay_count, blossom_count);
 
         Ok(())
     }
 
     /// Push content to file servers (blossom)
     /// Walks the merkle tree from root_hash and uploads only blobs belonging to this tree
-    fn push_to_file_servers(&self, root_hash: &str) {
+    /// Returns the number of blossom servers successfully used
+    fn push_to_file_servers(&self, root_hash: &str) -> usize {
         let store = self.storage.store();
         let blossom = self.nostr.blossom();
+        let blossom_server_count = blossom.write_servers().len();
 
         // Collect all hashes reachable from the root (tree walk)
         let hashes = match self.collect_tree_hashes(root_hash) {
             Ok(h) => h,
             Err(e) => {
                 warn!("Failed to collect tree hashes: {}", e);
-                return;
+                return 0;
             }
         };
 
@@ -610,11 +638,11 @@ impl RemoteHelper {
             Ok(rt) => rt,
             Err(e) => {
                 warn!("Failed to create runtime for blossom upload: {}", e);
-                return;
+                return 0;
             }
         };
 
-        rt.block_on(async {
+        let success = rt.block_on(async {
             let mut uploaded = 0;
             let mut skipped = 0;
             let mut failed = 0;
@@ -656,7 +684,12 @@ impl RemoteHelper {
                 "Blossom upload complete: {} uploaded, {} already existed, {} failed",
                 uploaded, skipped, failed
             );
+
+            // Return true if we had any success
+            uploaded > 0 || skipped > 0
         });
+
+        if success { blossom_server_count } else { 0 }
     }
 
     /// Collect all hashes reachable from a root hash by walking the merkle tree
@@ -726,32 +759,67 @@ impl RemoteHelper {
         Ok(objects)
     }
 
-    /// Read object from local git with its type
-    fn read_git_object_with_type(&self, oid: &str) -> Result<(ObjectType, Vec<u8>)> {
-        // Get object type
-        let type_output = Command::new("git").args(["cat-file", "-t", oid]).output()?;
-        if !type_output.status.success() {
-            bail!("Failed to get object type: {}", oid);
-        }
-        let type_str = String::from_utf8_lossy(&type_output.stdout).trim().to_string();
+    /// Read multiple git objects in batch using a single git process
+    /// Uses `git cat-file --batch` for efficient bulk reads
+    fn read_git_objects_batch(&self, oids: &[String]) -> Result<Vec<(ObjectType, Vec<u8>)>> {
+        use std::io::{BufRead, BufReader, Read, Write};
 
-        let obj_type = match type_str.as_str() {
-            "blob" => ObjectType::Blob,
-            "tree" => ObjectType::Tree,
-            "commit" => ObjectType::Commit,
-            "tag" => ObjectType::Tag,
-            _ => bail!("Unknown object type: {}", type_str),
-        };
-
-        // Get raw object content (NOT pretty-printed!)
-        // Use "git cat-file <type> <sha>" for raw binary format
-        // Using "-p" would pretty-print trees which breaks the binary format
-        let content_output = Command::new("git").args(["cat-file", &type_str, oid]).output()?;
-        if !content_output.status.success() {
-            bail!("Failed to read object: {}", oid);
+        if oids.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok((obj_type, content_output.stdout))
+        let mut child = Command::new("git")
+            .args(["cat-file", "--batch"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+
+        // Write all OIDs to stdin
+        let oids_input = oids.join("\n") + "\n";
+        stdin.write_all(oids_input.as_bytes())?;
+        drop(stdin);
+
+        // Read responses
+        let mut reader = BufReader::new(stdout);
+        let mut results = Vec::with_capacity(oids.len());
+
+        for oid in oids {
+            // Read header line: "<sha> <type> <size>" or "<sha> missing"
+            let mut header = String::new();
+            reader.read_line(&mut header)?;
+            let header = header.trim();
+
+            let parts: Vec<&str> = header.split_whitespace().collect();
+            if parts.len() < 3 {
+                bail!("Object not found or invalid header for {}: {}", oid, header);
+            }
+
+            let obj_type = match parts[1] {
+                "blob" => ObjectType::Blob,
+                "tree" => ObjectType::Tree,
+                "commit" => ObjectType::Commit,
+                "tag" => ObjectType::Tag,
+                _ => bail!("Unknown object type: {}", parts[1]),
+            };
+
+            let size: usize = parts[2].parse()?;
+
+            // Read content
+            let mut content = vec![0u8; size];
+            reader.read_exact(&mut content)?;
+
+            // Read trailing newline
+            let mut newline = [0u8; 1];
+            reader.read_exact(&mut newline)?;
+
+            results.push((obj_type, content));
+        }
+
+        child.wait()?;
+        Ok(results)
     }
 }
 

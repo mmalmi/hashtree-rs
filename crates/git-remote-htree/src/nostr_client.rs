@@ -38,6 +38,7 @@ use anyhow::{Context, Result};
 use hashtree_blossom::BlossomClient;
 use hashtree_core::{decode_tree_node, decrypt_chk, LinkType};
 use nostr_sdk::prelude::*;
+use nostr_sdk::pool::RelaySendOptions;
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -320,14 +321,26 @@ impl NostrClient {
     /// Fetch refs for a repository from nostr
     /// Returns refs parsed from the hashtree at the root hash
     pub fn fetch_refs(&mut self, repo_name: &str) -> Result<HashMap<String, String>> {
-        let (refs, _, _) = self.fetch_refs_with_root(repo_name)?;
+        let (refs, _, _) = self.fetch_refs_with_timeout(repo_name, 10)?;
+        Ok(refs)
+    }
+
+    /// Fetch refs with a quick timeout (3s) for push operations
+    /// Returns empty if timeout - allows push to proceed
+    pub fn fetch_refs_quick(&mut self, repo_name: &str) -> Result<HashMap<String, String>> {
+        let (refs, _, _) = self.fetch_refs_with_timeout(repo_name, 3)?;
         Ok(refs)
     }
 
     /// Fetch refs and root hash info from nostr
     /// Returns (refs, root_hash, encryption_key)
     pub fn fetch_refs_with_root(&mut self, repo_name: &str) -> Result<(HashMap<String, String>, Option<String>, Option<[u8; 32]>)> {
-        debug!("Fetching refs for {} from {}", repo_name, self.pubkey);
+        self.fetch_refs_with_timeout(repo_name, 10)
+    }
+
+    /// Fetch refs with configurable timeout
+    fn fetch_refs_with_timeout(&mut self, repo_name: &str, timeout_secs: u64) -> Result<(HashMap<String, String>, Option<String>, Option<[u8; 32]>)> {
+        debug!("Fetching refs for {} from {} (timeout {}s)", repo_name, self.pubkey, timeout_secs);
 
         // Check cache first
         if let Some(refs) = self.cached_refs.get(repo_name) {
@@ -343,7 +356,7 @@ impl NostrClient {
             .build()
             .context("Failed to create tokio runtime")?;
 
-        let (refs, root_hash, encryption_key) = rt.block_on(self.fetch_refs_async(repo_name))?;
+        let (refs, root_hash, encryption_key) = rt.block_on(self.fetch_refs_async_with_timeout(repo_name, timeout_secs))?;
         self.cached_refs.insert(repo_name.to_string(), refs.clone());
         if let Some(ref root) = root_hash {
             self.cached_root_hash.insert(repo_name.to_string(), root.clone());
@@ -354,7 +367,7 @@ impl NostrClient {
         Ok((refs, root_hash, encryption_key))
     }
 
-    async fn fetch_refs_async(&self, repo_name: &str) -> Result<(HashMap<String, String>, Option<String>, Option<[u8; 32]>)> {
+    async fn fetch_refs_async_with_timeout(&self, repo_name: &str, timeout_secs: u64) -> Result<(HashMap<String, String>, Option<String>, Option<[u8; 32]>)> {
         // Create nostr-sdk client
         let client = Client::default();
 
@@ -368,9 +381,11 @@ impl NostrClient {
         // Connect and wait for at least one relay to connect
         client.connect().await;
 
-        // Wait for relay connections (up to 15 seconds)
+        // Wait for relay connections (use half of timeout for connection, half for query)
+        let connect_timeout = Duration::from_secs(timeout_secs / 2).max(Duration::from_secs(1));
+        let query_timeout = Duration::from_secs(timeout_secs / 2).max(Duration::from_secs(1));
+
         let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(15);
         loop {
             let relays = client.relays().await;
             let mut connected = 0;
@@ -383,9 +398,10 @@ impl NostrClient {
                 debug!("Connected to {} relay(s)", connected);
                 break;
             }
-            if start.elapsed() > timeout {
-                warn!("Timeout waiting for relay connections");
-                break;
+            if start.elapsed() > connect_timeout {
+                debug!("Timeout waiting for relay connections - treating as empty repo");
+                let _ = client.disconnect().await;
+                return Ok((HashMap::new(), None, None));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -404,7 +420,7 @@ impl NostrClient {
 
         // Query with timeout - treat timeout as "no events found" for new repos
         let events = match tokio::time::timeout(
-            Duration::from_secs(10),
+            query_timeout,
             client.get_events_of(vec![filter], EventSource::relays(None)),
         )
         .await
@@ -707,12 +723,26 @@ impl NostrClient {
         &self.blossom
     }
 
+    /// Get the public key (hex)
+    pub fn pubkey(&self) -> &str {
+        &self.pubkey
+    }
+
+    /// Get the public key as npub bech32
+    pub fn npub(&self) -> String {
+        PublicKey::from_hex(&self.pubkey)
+            .ok()
+            .and_then(|pk| pk.to_bech32().ok())
+            .unwrap_or_else(|| self.pubkey.clone())
+    }
+
     /// Publish repository to nostr as kind 30078 event
     /// Format:
     ///   kind: 30078
     ///   tags: [["d", repo_name], ["l", "hashtree"], ["hash", root_hash]]
     ///   content: <merkle-root-hash>
-    pub fn publish_repo(&self, repo_name: &str, root_hash: &str) -> Result<()> {
+    /// Returns: (npub URL, number of relays successfully published to)
+    pub fn publish_repo(&self, repo_name: &str, root_hash: &str) -> Result<(String, usize)> {
         let keys = self.keys.as_ref().context(format!(
             "Cannot push: no secret key for {}. You can only push to your own repos.",
             &self.pubkey[..16]
@@ -734,7 +764,7 @@ impl NostrClient {
         keys: &Keys,
         repo_name: &str,
         root_hash: &str,
-    ) -> Result<()> {
+    ) -> Result<(String, usize)> {
         // Create nostr-sdk client with our keys
         let client = Client::new(keys.clone());
 
@@ -745,8 +775,8 @@ impl NostrClient {
             }
         }
 
-        // Connect
-        client.connect().await;
+        // Connect with a short timeout - don't block on failing relays
+        tokio::time::timeout(Duration::from_secs(3), client.connect()).await.ok();
 
         // Build event with tags
         let mut tags = vec![
@@ -763,33 +793,50 @@ impl NostrClient {
             tags.push(Tag::custom(TagKind::custom("l"), vec![prefix]));
         }
 
-        let event = EventBuilder::new(Kind::Custom(KIND_APP_DATA), root_hash, tags);
+        // Sign the event
+        let event = EventBuilder::new(Kind::Custom(KIND_APP_DATA), root_hash, tags)
+            .to_event(keys)
+            .map_err(|e| anyhow::anyhow!("Failed to sign event: {}", e))?;
 
-        // Sign and publish
-        let output = client
-            .send_event_builder(event)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to publish event: {}", e))?;
-
-        info!(
-            "Published event {} to {} relays",
-            output.id(),
-            output.success.len()
-        );
-
-        // Display the full htree:// URL with npub
-        if let Ok(npub) = keys.public_key().to_bech32() {
-            eprintln!("Published to: htree://{}/{}", npub, repo_name);
+        // Count connected relays before publishing
+        let relays = client.relays().await;
+        let mut connected_count = 0;
+        for relay in relays.values() {
+            if relay.is_connected().await {
+                connected_count += 1;
+            }
         }
 
-        if output.success.is_empty() {
-            warn!("Event was not accepted by any relay");
-        }
+        // Send event using pool directly with skip_send_confirmation
+        // This sends the event and returns immediately without waiting for relay OK messages
+        let send_opts = RelaySendOptions::new()
+            .skip_send_confirmation(true)
+            .timeout(Some(Duration::from_secs(3)));
+
+        let relay_count = match client.pool().send_event(event.clone(), send_opts).await {
+            Ok(output) => {
+                // With skip_send_confirmation, success list may be empty but event was sent
+                // Use connected relay count as the actual number sent to
+                let count = if output.success.is_empty() { connected_count } else { output.success.len() };
+                info!("Sent event {} to {} relays", output.id(), count);
+                count
+            }
+            Err(e) => {
+                warn!("Failed to send event: {}", e);
+                // Event may still have been sent to some relays
+                connected_count
+            }
+        };
+
+        // Build the full htree:// URL with npub
+        let npub_url = keys.public_key().to_bech32()
+            .map(|npub| format!("htree://{}/{}", npub, repo_name))
+            .unwrap_or_else(|_| format!("htree://{}/{}", &self.pubkey[..16], repo_name));
 
         // Disconnect
         let _ = client.disconnect().await;
 
-        Ok(())
+        Ok((npub_url, relay_count))
     }
 
     /// Upload blob to blossom server

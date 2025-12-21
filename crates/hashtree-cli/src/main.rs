@@ -165,6 +165,50 @@ enum StorageCommands {
     },
 }
 
+/// Resolve a CID input which can be:
+/// - A raw hex hash (64 chars)
+/// - An npub/repo path (e.g., "npub1.../myrepo")
+/// - An htree:// URL (e.g., "htree://npub1.../myrepo")
+/// Returns the resolved hex hash and optional path within the tree
+async fn resolve_cid_input(input: &str) -> Result<(String, Option<String>)> {
+    // Strip htree:// prefix if present
+    let input = input.strip_prefix("htree://").unwrap_or(input);
+
+    // Check if it looks like an npub path (npub1.../name or npub1.../name/path)
+    if input.starts_with("npub1") && input.contains('/') {
+        let parts: Vec<&str> = input.splitn(3, '/').collect();
+        if parts.len() >= 2 {
+            let npub = parts[0];
+            let repo = parts[1];
+            let subpath = if parts.len() > 2 { Some(parts[2].to_string()) } else { None };
+
+            // Resolve via nostr
+            let key = format!("{}/{}", npub, repo);
+            eprintln!("Resolving {}...", key);
+
+            let resolver = NostrRootResolver::new(NostrResolverConfig::default()).await
+                .context("Failed to create nostr resolver")?;
+
+            match resolver.resolve(&key).await {
+                Ok(Some(cid)) => {
+                    let hash_hex = hashtree_core::to_hex(&cid.hash);
+                    eprintln!("Resolved to: {}", hash_hex);
+                    return Ok((hash_hex, subpath));
+                }
+                Ok(None) => {
+                    anyhow::bail!("No content found for {}", key);
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to resolve {}: {}", key, e);
+                }
+            }
+        }
+    }
+
+    // Otherwise treat as raw CID
+    Ok((input.to_string(), None))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install rustls crypto provider (required for TLS connections)
@@ -586,8 +630,11 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Get { cid, output } => {
+        Commands::Get { cid: cid_input, output } => {
             use hashtree_cli::{FetchConfig, Fetcher};
+
+            // Resolve npub/repo or htree:// URLs to CID
+            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
 
             let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
 
@@ -652,8 +699,11 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Cat { cid } => {
+        Commands::Cat { cid: cid_input } => {
             use hashtree_cli::{FetchConfig, Fetcher};
+
+            // Resolve npub/repo or htree:// URLs to CID
+            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
 
             let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
 
@@ -681,17 +731,23 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Pin { cid } => {
+        Commands::Pin { cid: cid_input } => {
+            // Resolve npub/repo or htree:// URLs to CID
+            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
             let store = HashtreeStore::new(&cli.data_dir)?;
             store.pin(&cid)?;
             println!("Pinned: {}", cid);
         }
-        Commands::Unpin { cid } => {
+        Commands::Unpin { cid: cid_input } => {
+            // Resolve npub/repo or htree:// URLs to CID
+            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
             let store = HashtreeStore::new(&cli.data_dir)?;
             store.unpin(&cid)?;
             println!("Unpinned: {}", cid);
         }
-        Commands::Info { cid } => {
+        Commands::Info { cid: cid_input } => {
+            // Resolve npub/repo or htree:// URLs to CID
+            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
             let store = HashtreeStore::new(&cli.data_dir)?;
 
             // Check if content exists using file chunk metadata
@@ -874,7 +930,9 @@ async fn main() -> Result<()> {
         Commands::Following => {
             list_following(&cli.data_dir).await?;
         }
-        Commands::Push { cid, server } => {
+        Commands::Push { cid: cid_input, server } => {
+            // Resolve npub/repo or htree:// URLs to CID
+            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
             push_to_blossom(&cli.data_dir, &cid, server).await?;
         }
         Commands::Storage { command } => {

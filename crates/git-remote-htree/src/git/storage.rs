@@ -5,7 +5,7 @@
 //!     .git/
 //!       HEAD -> "ref: refs/heads/main"
 //!       refs/heads/main -> <commit-sha1>
-//!       objects/<sha1> -> zlib-compressed loose object
+//!       objects/XX/YYYY... -> zlib-compressed loose object (standard git layout)
 //!
 //! The root hash (SHA-256) is the content-addressed identifier for the entire repo state.
 
@@ -21,9 +21,12 @@ use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
 use tracing::{debug, info};
 
-use super::object::{GitObject, ObjectId, ObjectType};
+use super::object::{parse_tree, GitObject, ObjectId, ObjectType};
 use super::refs::{validate_ref_name, Ref};
 use super::{Error, Result};
+
+/// Box type for async recursion
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Runtime executor - either owns a runtime or reuses an existing one
 enum RuntimeExecutor {
@@ -206,6 +209,54 @@ impl GitStorage {
         Ok(None)
     }
 
+    /// Get the tree SHA from a commit object
+    fn get_commit_tree(&self, commit_oid: &str, objects: &HashMap<String, Vec<u8>>) -> Option<String> {
+        let compressed = objects.get(commit_oid)?;
+
+        // Decompress the object
+        let mut decoder = ZlibDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).ok()?;
+
+        // Parse git object format: "type size\0content"
+        let null_pos = decompressed.iter().position(|&b| b == 0)?;
+        let content = &decompressed[null_pos + 1..];
+
+        // Parse commit content - first line is "tree <sha>"
+        let content_str = std::str::from_utf8(content).ok()?;
+        let first_line = content_str.lines().next()?;
+        if first_line.starts_with("tree ") {
+            Some(first_line[5..].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Get git object content (decompressed, without header)
+    fn get_object_content(&self, oid: &str, objects: &HashMap<String, Vec<u8>>) -> Option<(ObjectType, Vec<u8>)> {
+        let compressed = objects.get(oid)?;
+
+        // Decompress the object
+        let mut decoder = ZlibDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).ok()?;
+
+        // Parse git object format: "type size\0content"
+        let null_pos = decompressed.iter().position(|&b| b == 0)?;
+        let header = std::str::from_utf8(&decompressed[..null_pos]).ok()?;
+        let obj_type = if header.starts_with("blob") {
+            ObjectType::Blob
+        } else if header.starts_with("tree") {
+            ObjectType::Tree
+        } else if header.starts_with("commit") {
+            ObjectType::Commit
+        } else {
+            return None;
+        };
+        let content = decompressed[null_pos + 1..].to_vec();
+        Some((obj_type, content))
+    }
+
     /// Build the hashtree and return the root hash
     pub fn build_tree(&self) -> Result<[u8; 32]> {
         // Check if we have a cached root
@@ -220,11 +271,32 @@ impl GitStorage {
         let refs = self.refs.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
 
-        let default_branch = if let Some(head) = refs.get("HEAD") {
-            head.strip_prefix("ref: ").map(String::from)
+        // Get default branch from HEAD or find first branch ref
+        let (default_branch, commit_sha) = if let Some(head) = refs.get("HEAD") {
+            let branch = head.strip_prefix("ref: ").map(String::from);
+            let sha = branch.as_ref().and_then(|b| refs.get(b)).cloned();
+            (branch, sha)
         } else {
-            None
+            // No HEAD ref - find first refs/heads/* ref directly
+            let mut branch_info: Option<(String, String)> = None;
+            for (ref_name, sha) in refs.iter() {
+                if ref_name.starts_with("refs/heads/") {
+                    branch_info = Some((ref_name.clone(), sha.clone()));
+                    break;
+                }
+            }
+            match branch_info {
+                Some((branch, sha)) => (Some(branch), Some(sha)),
+                None => (None, None),
+            }
         };
+
+        // Get tree SHA from commit
+        let tree_sha = commit_sha.as_ref()
+            .and_then(|sha| self.get_commit_tree(sha, &objects));
+
+        // Clone objects for async block
+        let objects_clone = objects.clone();
 
         let root_hash = self.runtime.block_on(async {
             // Build objects directory
@@ -233,12 +305,16 @@ impl GitStorage {
             // Build refs directory
             let refs_hash = self.build_refs_dir(&refs).await?;
 
-            // Build HEAD file
+            // Build HEAD file - use default_branch if no explicit HEAD
+            // Git expects HEAD to end with newline, so add it if missing
             let head_content = refs.get("HEAD")
-                .cloned()
-                .unwrap_or_else(|| "ref: refs/heads/main".to_string());
+                .map(|h| if h.ends_with('\n') { h.clone() } else { format!("{}\n", h) })
+                .or_else(|| default_branch.as_ref().map(|b| format!("ref: {}\n", b)))
+                .unwrap_or_else(|| "ref: refs/heads/main\n".to_string());
+            debug!("HEAD content: {:?}", head_content);
             let head_hash = self.tree.put_blob(head_content.as_bytes()).await
                 .map_err(|e| Error::StorageError(format!("put HEAD: {}", e)))?;
+            debug!("HEAD hash: {}", hex::encode(head_hash));
 
             // Build .git directory
             let mut git_entries = vec![
@@ -261,17 +337,23 @@ impl GitStorage {
             let git_cid = self.tree.put_directory(git_entries).await
                 .map_err(|e| Error::StorageError(format!("put .git: {}", e)))?;
 
-            // Build root with just .git
-            let root_entries = vec![DirEntry::new(".git", git_cid.hash).with_link_type(LinkType::Dir)];
+            // Build root entries starting with .git
+            let mut root_entries = vec![DirEntry::new(".git", git_cid.hash).with_link_type(LinkType::Dir)];
+
+            // Add working tree files if we have a tree SHA
+            if let Some(ref tree_oid) = tree_sha {
+                let working_tree_entries = self.build_working_tree_entries(tree_oid, &objects_clone).await?;
+                root_entries.extend(working_tree_entries);
+                info!("Added {} working tree entries to root", root_entries.len() - 1);
+            }
+
+            // Sort entries for deterministic ordering
+            root_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
             let root_cid = self.tree.put_directory(root_entries).await
                 .map_err(|e| Error::StorageError(format!("put root: {}", e)))?;
 
             info!("Built hashtree root: {} (.git dir: {})", hex::encode(root_cid.hash), hex::encode(git_cid.hash));
-
-            // Verify the root is stored correctly
-            if let Ok(Some(data)) = self.store.get(&root_cid.hash).await {
-                info!("Root blob stored: {} bytes, starts with: {:?}", data.len(), &data[..data.len().min(20)]);
-            }
 
             Ok::<[u8; 32], Error>(root_cid.hash)
         })?;
@@ -284,6 +366,69 @@ impl GitStorage {
         Ok(root_hash)
     }
 
+    /// Build working tree entries from a git tree object
+    async fn build_working_tree_entries(
+        &self,
+        tree_oid: &str,
+        objects: &HashMap<String, Vec<u8>>,
+    ) -> Result<Vec<DirEntry>> {
+        let mut entries = Vec::new();
+
+        // Get tree content
+        let (obj_type, content) = self.get_object_content(tree_oid, objects)
+            .ok_or_else(|| Error::ObjectNotFound(tree_oid.to_string()))?;
+
+        if obj_type != ObjectType::Tree {
+            return Err(Error::InvalidObjectType(format!("expected tree, got {:?}", obj_type)));
+        }
+
+        // Parse tree entries
+        let tree_entries = parse_tree(&content)?;
+
+        for entry in tree_entries {
+            let oid_hex = entry.oid.to_hex();
+
+            if entry.is_tree() {
+                // Recursively build subdirectory
+                let sub_entries = self.build_working_tree_entries_boxed(&oid_hex, objects).await?;
+
+                // Create subdirectory in hashtree
+                let dir_cid = self.tree.put_directory(sub_entries).await
+                    .map_err(|e| Error::StorageError(format!("put dir {}: {}", entry.name, e)))?;
+
+                entries.push(
+                    DirEntry::new(&entry.name, dir_cid.hash)
+                        .with_link_type(LinkType::Dir)
+                );
+            } else {
+                // Get blob content
+                if let Some((ObjectType::Blob, blob_content)) = self.get_object_content(&oid_hex, objects) {
+                    let blob_hash = self.tree.put_blob(&blob_content).await
+                        .map_err(|e| Error::StorageError(format!("put blob {}: {}", entry.name, e)))?;
+
+                    entries.push(
+                        DirEntry::new(&entry.name, blob_hash)
+                            .with_size(blob_content.len() as u64)
+                    );
+                }
+            }
+        }
+
+        // Sort for deterministic ordering
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(entries)
+    }
+
+    /// Boxed version for async recursion
+    fn build_working_tree_entries_boxed<'a>(
+        &'a self,
+        tree_oid: &'a str,
+        objects: &'a HashMap<String, Vec<u8>>,
+    ) -> BoxFuture<'a, Result<Vec<DirEntry>>> {
+        Box::pin(self.build_working_tree_entries(tree_oid, objects))
+    }
+
     /// Build the objects directory using HashTree
     async fn build_objects_dir(&self, objects: &HashMap<String, Vec<u8>>) -> Result<[u8; 32]> {
         if objects.is_empty() {
@@ -293,21 +438,42 @@ impl GitStorage {
             return Ok(empty_hash);
         }
 
-        // Store objects flat with full SHA1 as filename
-        let mut entries = Vec::with_capacity(objects.len());
+        // Group objects by first 2 characters of SHA (git loose object structure)
+        // Git expects objects/XX/YYYYYY... where XX is first 2 hex chars
+        let mut buckets: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
         for (oid, data) in objects {
-            let hash = self.tree.put_blob(data).await
-                .map_err(|e| Error::StorageError(format!("put object {}: {}", oid, e)))?;
-            entries.push(DirEntry::new(oid.clone(), hash).with_size(data.len() as u64));
+            let prefix = &oid[..2];
+            let suffix = &oid[2..];
+            buckets.entry(prefix.to_string())
+                .or_default()
+                .push((suffix.to_string(), data.clone()));
+        }
+
+        // Build subdirectories for each prefix
+        let mut top_entries = Vec::new();
+        for (prefix, objs) in buckets {
+            let mut sub_entries = Vec::new();
+            for (suffix, data) in objs {
+                let hash = self.tree.put_blob(&data).await
+                    .map_err(|e| Error::StorageError(format!("put object {}{}: {}", prefix, suffix, e)))?;
+                sub_entries.push(DirEntry::new(suffix, hash).with_size(data.len() as u64));
+            }
+            // Sort for deterministic ordering
+            sub_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+            let sub_cid = self.tree.put_directory(sub_entries).await
+                .map_err(|e| Error::StorageError(format!("put objects/{}: {}", prefix, e)))?;
+            top_entries.push(DirEntry::new(prefix, sub_cid.hash).with_link_type(LinkType::Dir));
         }
 
         // Sort for deterministic ordering
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        top_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let cid = self.tree.put_directory(entries).await
+        let bucket_count = top_entries.len();
+        let cid = self.tree.put_directory(top_entries).await
             .map_err(|e| Error::StorageError(format!("put objects dir: {}", e)))?;
 
-        debug!("Built objects dir with {} entries: {}", objects.len(), hex::encode(cid.hash));
+        debug!("Built objects dir with {} buckets: {}", bucket_count, hex::encode(cid.hash));
         Ok(cid.hash)
     }
 
