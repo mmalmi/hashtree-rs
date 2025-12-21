@@ -320,6 +320,7 @@ impl RemoteHelper {
         };
 
         use futures::stream::{self, StreamExt};
+        use std::io::Write;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
 
@@ -383,6 +384,7 @@ impl RemoteHelper {
                     let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
                     if count % 20 == 0 || count == total_objects {
                         eprint!("\r  Downloading: {}/{}", count, total_objects);
+                        let _ = std::io::stderr().flush();
                     }
                     result
                 }
