@@ -580,16 +580,28 @@ impl RemoteHelper {
     /// Push all objects reachable from sha
     fn push_objects(&mut self, sha: &str, dst_ref: &str) -> Result<()> {
         // Get list of objects to push
+        eprint!("  Listing objects...");
+        let _ = std::io::stderr().flush();
         let objects = self.list_objects_to_push(sha)?;
+        eprintln!(" {} objects", objects.len());
 
         info!("Pushing {} objects for {}", objects.len(), sha);
 
         // Read all objects in batch using git cat-file --batch
         let objects_with_content = self.read_git_objects_batch(&objects)?;
+        eprintln!(); // Newline after reading progress
 
-        for (obj_type, content) in objects_with_content {
+        eprint!("  Writing to store...");
+        let _ = std::io::stderr().flush();
+        let total = objects_with_content.len();
+        for (i, (obj_type, content)) in objects_with_content.into_iter().enumerate() {
             self.storage.write_raw_object(obj_type, &content)?;
+            if (i + 1) % 1000 == 0 || i + 1 == total {
+                eprint!("\r  Writing to store: {}/{}", i + 1, total);
+                let _ = std::io::stderr().flush();
+            }
         }
+        eprintln!();
 
         // Update ref in storage
         let oid = crate::git::object::ObjectId::from_hex(sha)
@@ -604,8 +616,11 @@ impl RemoteHelper {
         }
 
         // Build the merkle tree
+        eprint!("  Building merkle tree...");
+        let _ = std::io::stderr().flush();
         let root_hash = self.storage.build_tree()?;
         let root_hash_hex = hex::encode(root_hash);
+        eprintln!(" done");
 
         // Push to file servers (blossom) first
         // This makes content available before we advertise the hash
@@ -639,9 +654,15 @@ impl RemoteHelper {
         let blossom_server_count = blossom.write_servers().len();
 
         // Collect all hashes reachable from the root (tree walk)
+        eprint!("  Collecting blobs...");
+        let _ = std::io::stderr().flush();
         let hashes = match self.collect_tree_hashes(root_hash) {
-            Ok(h) => h,
+            Ok(h) => {
+                eprintln!(" {} blobs", h.len());
+                h
+            }
             Err(e) => {
+                eprintln!(" failed: {}", e);
                 warn!("Failed to collect tree hashes: {}", e);
                 return 0;
             }
@@ -672,6 +693,8 @@ impl RemoteHelper {
             let processed = StdArc::new(AtomicUsize::new(0));
 
             // Pre-load all blob data from LMDB (sync operation)
+            eprint!("  Loading blobs from store...");
+            let _ = std::io::stderr().flush();
             let blobs: Vec<_> = hashes
                 .iter()
                 .filter_map(|hash| {
@@ -683,7 +706,7 @@ impl RemoteHelper {
                 .collect();
 
             let blob_count = blobs.len();
-            eprintln!("  Uploading {} blobs...", blob_count);
+            eprintln!(" {} blobs loaded", blob_count);
 
             // Parallel upload with concurrency limit
             const UPLOAD_CONCURRENCY: usize = 10;
@@ -801,8 +824,8 @@ impl RemoteHelper {
         Ok(objects)
     }
 
-    /// Read multiple git objects in batch using a single git process
-    /// Uses `git cat-file --batch` for efficient bulk reads
+    /// Read multiple git objects using git cat-file --batch
+    /// Processes in batches to avoid pipe buffer deadlock
     fn read_git_objects_batch(&self, oids: &[String]) -> Result<Vec<(ObjectType, Vec<u8>)>> {
         use std::io::{BufRead, BufReader, Read, Write};
 
@@ -810,57 +833,70 @@ impl RemoteHelper {
             return Ok(Vec::new());
         }
 
-        let mut child = Command::new("git")
-            .args(["cat-file", "--batch"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
+        let total = oids.len();
+        let mut results = Vec::with_capacity(total);
 
-        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+        // Process in batches of 100 to avoid pipe buffer issues
+        const BATCH_SIZE: usize = 100;
 
-        // Write all OIDs to stdin
-        let oids_input = oids.join("\n") + "\n";
-        stdin.write_all(oids_input.as_bytes())?;
-        drop(stdin);
+        for (batch_idx, batch) in oids.chunks(BATCH_SIZE).enumerate() {
+            let mut child = Command::new("git")
+                .args(["cat-file", "--batch"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
 
-        // Read responses
-        let mut reader = BufReader::new(stdout);
-        let mut results = Vec::with_capacity(oids.len());
+            let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
+            let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
 
-        for oid in oids {
-            // Read header line: "<sha> <type> <size>" or "<sha> missing"
-            let mut header = String::new();
-            reader.read_line(&mut header)?;
-            let header = header.trim();
+            // Write batch OIDs to stdin
+            for oid in batch {
+                writeln!(stdin, "{}", oid)?;
+            }
+            drop(stdin);
 
-            let parts: Vec<&str> = header.split_whitespace().collect();
-            if parts.len() < 3 {
-                bail!("Object not found or invalid header for {}: {}", oid, header);
+            // Read responses
+            let mut reader = BufReader::new(stdout);
+
+            for (i, oid) in batch.iter().enumerate() {
+                let mut header = String::new();
+                reader.read_line(&mut header)?;
+                let header = header.trim();
+
+                let parts: Vec<&str> = header.split_whitespace().collect();
+                if parts.len() < 3 {
+                    bail!("Object not found or invalid header for {}: {}", oid, header);
+                }
+
+                let obj_type = match parts[1] {
+                    "blob" => ObjectType::Blob,
+                    "tree" => ObjectType::Tree,
+                    "commit" => ObjectType::Commit,
+                    "tag" => ObjectType::Tag,
+                    _ => bail!("Unknown object type: {}", parts[1]),
+                };
+
+                let size: usize = parts[2].parse()?;
+                let mut content = vec![0u8; size];
+                reader.read_exact(&mut content)?;
+
+                // Read trailing newline
+                let mut newline = [0u8; 1];
+                reader.read_exact(&mut newline)?;
+
+                results.push((obj_type, content));
+
+                // Progress indicator
+                let done = batch_idx * BATCH_SIZE + i + 1;
+                if done == 1 || done % 100 == 0 || done == total {
+                    eprint!("\r  Reading objects: {}/{}", done, total);
+                    let _ = std::io::stderr().flush();
+                }
             }
 
-            let obj_type = match parts[1] {
-                "blob" => ObjectType::Blob,
-                "tree" => ObjectType::Tree,
-                "commit" => ObjectType::Commit,
-                "tag" => ObjectType::Tag,
-                _ => bail!("Unknown object type: {}", parts[1]),
-            };
-
-            let size: usize = parts[2].parse()?;
-
-            // Read content
-            let mut content = vec![0u8; size];
-            reader.read_exact(&mut content)?;
-
-            // Read trailing newline
-            let mut newline = [0u8; 1];
-            reader.read_exact(&mut newline)?;
-
-            results.push((obj_type, content));
+            child.wait()?;
         }
 
-        child.wait()?;
         Ok(results)
     }
 }
