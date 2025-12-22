@@ -769,6 +769,11 @@ impl RemoteHelper {
         eprintln!("Published to: {} ({} relays, {} blossom servers)",
             npub_url, relay_count, blossom_count);
 
+        // Print web viewer URL
+        if let Some(path) = npub_url.strip_prefix("htree://") {
+            eprintln!("View at: https://files.iris.to/#/{}", path);
+        }
+
         Ok(())
     }
 
