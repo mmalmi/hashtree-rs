@@ -6,7 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use hashtree_core::{nhash_decode, to_hex};
+use hashtree_core::{from_hex, nhash_decode, to_hex};
 use hashtree_resolver::{nostr::{NostrRootResolver, NostrResolverConfig}, RootResolver};
 use serde_json::json;
 use std::sync::Arc;
@@ -59,7 +59,19 @@ async fn serve_content_internal(
                     let content_type = "application/octet-stream";
 
                     // Get metadata to determine total size
-                    match store.get_file_chunk_metadata(cid) {
+                    let hash = match from_hex(cid) {
+                        Ok(h) => h,
+                        Err(_) => {
+                            return Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header(header::CONTENT_TYPE, "text/plain")
+                                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                .body(Body::from("Invalid CID format"))
+                                .unwrap()
+                                .into_response();
+                        }
+                    };
+                    match store.get_file_chunk_metadata(&hash) {
                         Ok(Some(metadata)) => {
                             let total_size = metadata.total_size;
 
@@ -238,8 +250,10 @@ pub async fn serve_content_or_blob(
 
     // Always try direct CID/hash lookup first
     // (hashtree hashes are 64 hex chars, same as blossom SHA256)
-    if state.store.get_file_chunk_metadata(&id).ok().flatten().is_some() {
-        return serve_content_internal(&state, &id, headers, true).await;
+    if let Ok(hash) = from_hex(&id) {
+        if state.store.get_file_chunk_metadata(&hash).ok().flatten().is_some() {
+            return serve_content_internal(&state, &id, headers, true).await;
+        }
     }
 
     // Try blossom SHA256 lookup (content hash -> root hash mapping)
@@ -477,8 +491,15 @@ pub async fn pin_cid(
     State(state): State<AppState>,
     Path(cid): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match from_hex(&cid) {
+        Ok(h) => h,
+        Err(e) => return Json(json!({
+            "success": false,
+            "error": format!("Invalid CID format: {}", e)
+        })),
+    };
     let store = &state.store;
-    match store.pin(&cid) {
+    match store.pin(&hash) {
         Ok(_) => Json(json!({
             "success": true,
             "cid": cid
@@ -494,8 +515,15 @@ pub async fn unpin_cid(
     State(state): State<AppState>,
     Path(cid): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match from_hex(&cid) {
+        Ok(h) => h,
+        Err(e) => return Json(json!({
+            "success": false,
+            "error": format!("Invalid CID format: {}", e)
+        })),
+    };
     let store = &state.store;
-    match store.unpin(&cid) {
+    match store.unpin(&hash) {
         Ok(_) => Json(json!({
             "success": true,
             "cid": cid

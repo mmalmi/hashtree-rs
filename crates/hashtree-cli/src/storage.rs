@@ -325,8 +325,8 @@ impl Store for StorageRouter {
 
 pub struct HashtreeStore {
     env: heed::Env,
-    /// Set of pinned hashes (hex strings, prevents garbage collection)
-    pins: Database<Str, Unit>,
+    /// Set of pinned hashes (32-byte raw hashes, prevents garbage collection)
+    pins: Database<Bytes, Unit>,
     /// Maps SHA256 hex -> root hash hex (for blossom compatibility)
     sha256_index: Database<Str, Str>,
     /// Blob ownership: sha256 (32 bytes) ++ pubkey (32 bytes) -> () (composite key for multi-owner)
@@ -467,7 +467,7 @@ impl HashtreeStore {
 
         // Only pin if requested (htree add = pin, blossom upload = no pin)
         if pin {
-            self.pins.put(&mut wtxn, &root_hex, &())?;
+            self.pins.put(&mut wtxn, cid.hash.as_slice(), &())?;
         }
 
         wtxn.commit()?;
@@ -510,7 +510,7 @@ impl HashtreeStore {
         self.sha256_index.put(&mut wtxn, &sha256_hex, &root_hex)?;
 
         // Auto-pin on upload
-        self.pins.put(&mut wtxn, &root_hex, &())?;
+        self.pins.put(&mut wtxn, cid.hash.as_slice(), &())?;
 
         wtxn.commit()?;
 
@@ -537,7 +537,7 @@ impl HashtreeStore {
         let root_hex = to_hex(&root_cid.hash);
 
         let mut wtxn = self.env.write_txn()?;
-        self.pins.put(&mut wtxn, &root_hex, &())?;
+        self.pins.put(&mut wtxn, root_cid.hash.as_slice(), &())?;
         wtxn.commit()?;
 
         Ok(root_hex)
@@ -667,7 +667,7 @@ impl HashtreeStore {
         let cid_str = cid.to_string();
 
         let mut wtxn = self.env.write_txn()?;
-        self.pins.put(&mut wtxn, &cid_str, &())?;
+        self.pins.put(&mut wtxn, cid.hash.as_slice(), &())?;
         wtxn.commit()?;
 
         Ok(cid_str)
@@ -696,7 +696,7 @@ impl HashtreeStore {
 
         let mut wtxn = self.env.write_txn()?;
         // Pin by hash only (the key is for decryption, not identification)
-        self.pins.put(&mut wtxn, &to_hex(&root_cid.hash), &())?;
+        self.pins.put(&mut wtxn, root_cid.hash.as_slice(), &())?;
         wtxn.commit()?;
 
         Ok(cid_str)
@@ -790,7 +790,8 @@ impl HashtreeStore {
             // Get size from root hash lookup
             let size = self
                 .get_cid_by_sha256(sha256_hex)?
-                .and_then(|cid| self.get_file_chunk_metadata(&cid).ok().flatten())
+                .and_then(|cid_hex| from_hex(&cid_hex).ok())
+                .and_then(|hash| self.get_file_chunk_metadata(&hash).ok().flatten())
                 .map(|m| m.total_size)
                 .unwrap_or(0);
 
@@ -904,7 +905,9 @@ impl HashtreeStore {
         let root_hex = self.sha256_index.get(&wtxn, sha256_hex)?.map(|s| s.to_string());
         if let Some(ref root_hex) = root_hex {
             // Unpin
-            self.pins.delete(&mut wtxn, root_hex)?;
+            if let Ok(root_hash) = from_hex(root_hex) {
+                self.pins.delete(&mut wtxn, root_hash.as_slice())?;
+            }
         }
         self.sha256_index.delete(&mut wtxn, sha256_hex)?;
 
@@ -962,11 +965,20 @@ impl HashtreeStore {
         })
     }
 
-    /// Get chunk metadata for a file (chunk list, sizes, total size)
-    pub fn get_file_chunk_metadata(&self, hash_hex: &str) -> Result<Option<FileChunkMetadata>> {
-        let hash = from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
+    /// Get file content by Cid (hash + optional decryption key as raw bytes)
+    /// Handles decryption automatically if key is present
+    pub fn get_file_by_cid(&self, cid: &Cid) -> Result<Option<Vec<u8>>> {
+        let store = self.store_arc();
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
 
+        sync_block_on(async {
+            tree.get(cid).await
+                .map_err(|e| anyhow::anyhow!("Failed to read file: {}", e))
+        })
+    }
+
+    /// Get chunk metadata for a file (chunk list, sizes, total size)
+    pub fn get_file_chunk_metadata(&self, hash: &[u8; 32]) -> Result<Option<FileChunkMetadata>> {
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
 
@@ -1028,7 +1040,9 @@ impl HashtreeStore {
 
     /// Get byte range from file
     pub fn get_file_range(&self, hash_hex: &str, start: u64, end: Option<u64>) -> Result<Option<(Vec<u8>, u64)>> {
-        let metadata = match self.get_file_chunk_metadata(hash_hex)? {
+        let hash = from_hex(hash_hex)
+            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
+        let metadata = match self.get_file_chunk_metadata(&hash)? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -1103,7 +1117,9 @@ impl HashtreeStore {
         start: u64,
         end: u64,
     ) -> Result<Option<FileRangeChunksOwned>> {
-        let metadata = match self.get_file_chunk_metadata(hash_hex)? {
+        let hash = from_hex(hash_hex)
+            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
+        let metadata = match self.get_file_chunk_metadata(&hash)? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -1161,35 +1177,39 @@ impl HashtreeStore {
     }
 
     /// Pin a hash (prevent garbage collection)
-    pub fn pin(&self, hash_hex: &str) -> Result<()> {
+    pub fn pin(&self, hash: &[u8; 32]) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
-        self.pins.put(&mut wtxn, hash_hex, &())?;
+        self.pins.put(&mut wtxn, hash.as_slice(), &())?;
         wtxn.commit()?;
         Ok(())
     }
 
     /// Unpin a hash (allow garbage collection)
-    pub fn unpin(&self, hash_hex: &str) -> Result<()> {
+    pub fn unpin(&self, hash: &[u8; 32]) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
-        self.pins.delete(&mut wtxn, hash_hex)?;
+        self.pins.delete(&mut wtxn, hash.as_slice())?;
         wtxn.commit()?;
         Ok(())
     }
 
     /// Check if hash is pinned
-    pub fn is_pinned(&self, hash_hex: &str) -> Result<bool> {
+    pub fn is_pinned(&self, hash: &[u8; 32]) -> Result<bool> {
         let rtxn = self.env.read_txn()?;
-        Ok(self.pins.get(&rtxn, hash_hex)?.is_some())
+        Ok(self.pins.get(&rtxn, hash.as_slice())?.is_some())
     }
 
-    /// List all pinned hashes
-    pub fn list_pins(&self) -> Result<Vec<String>> {
+    /// List all pinned hashes (raw bytes)
+    pub fn list_pins_raw(&self) -> Result<Vec<[u8; 32]>> {
         let rtxn = self.env.read_txn()?;
         let mut pins = Vec::new();
 
         for item in self.pins.iter(&rtxn)? {
-            let (hash_hex, _) = item?;
-            pins.push(hash_hex.to_string());
+            let (hash_bytes, _) = item?;
+            if hash_bytes.len() == 32 {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(hash_bytes);
+                pins.push(hash);
+            }
         }
 
         Ok(pins)
@@ -1203,20 +1223,20 @@ impl HashtreeStore {
         let mut pins = Vec::new();
 
         for item in self.pins.iter(&rtxn)? {
-            let (hash_hex, _) = item?;
-            let hash_hex_str = hash_hex.to_string();
+            let (hash_bytes, _) = item?;
+            if hash_bytes.len() != 32 {
+                continue;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(hash_bytes);
 
             // Try to determine if it's a directory
-            let is_directory = if let Ok(hash) = from_hex(&hash_hex_str) {
-                sync_block_on(async {
-                    tree.is_directory(&hash).await.unwrap_or(false)
-                })
-            } else {
-                false
-            };
+            let is_directory = sync_block_on(async {
+                tree.is_directory(&hash).await.unwrap_or(false)
+            });
 
             pins.push(PinnedItem {
-                cid: hash_hex_str,
+                cid: to_hex(&hash),
                 name: "Unknown".to_string(),
                 is_directory,
             });
@@ -1527,7 +1547,7 @@ impl HashtreeStore {
             let root_hex = to_hex(&root_hash);
 
             // Never evict pinned trees
-            if self.is_pinned(&root_hex)? {
+            if self.is_pinned(&root_hash)? {
                 continue;
             }
 
@@ -1559,11 +1579,19 @@ impl HashtreeStore {
         let all_hashes = self.router.list()
             .map_err(|e| anyhow::anyhow!("Failed to list hashes: {}", e))?;
 
-        // Get pinned hashes
+        // Get pinned hashes as raw bytes
         let rtxn = self.env.read_txn()?;
-        let pinned: HashSet<String> = self.pins.iter(&rtxn)?
+        let pinned: HashSet<Hash> = self.pins.iter(&rtxn)?
             .filter_map(|item| item.ok())
-            .map(|(hash_hex, _)| hash_hex.to_string())
+            .filter_map(|(hash_bytes, _)| {
+                if hash_bytes.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(hash_bytes);
+                    Some(hash)
+                } else {
+                    None
+                }
+            })
             .collect();
 
         // Collect all blob hashes that are in at least one tree
@@ -1581,10 +1609,8 @@ impl HashtreeStore {
 
         // Find and delete orphaned blobs
         for hash in all_hashes {
-            let hash_hex = to_hex(&hash);
-
             // Skip if pinned
-            if pinned.contains(&hash_hex) {
+            if pinned.contains(&hash) {
                 continue;
             }
 
@@ -1597,7 +1623,7 @@ impl HashtreeStore {
             if let Ok(Some(data)) = self.router.get_sync(&hash) {
                 freed += data.len() as u64;
                 let _ = self.router.delete_local_only(&hash);
-                tracing::debug!("Deleted orphaned blob {} ({} bytes)", &hash_hex[..8], data.len());
+                tracing::debug!("Deleted orphaned blob {} ({} bytes)", &to_hex(&hash)[..8], data.len());
             }
         }
 
@@ -1720,10 +1746,18 @@ impl HashtreeStore {
     pub fn gc(&self) -> Result<GcStats> {
         let rtxn = self.env.read_txn()?;
 
-        // Get all pinned hashes
-        let pinned: HashSet<String> = self.pins.iter(&rtxn)?
+        // Get all pinned hashes as raw bytes
+        let pinned: HashSet<Hash> = self.pins.iter(&rtxn)?
             .filter_map(|item| item.ok())
-            .map(|(hash_hex, _)| hash_hex.to_string())
+            .filter_map(|(hash_bytes, _)| {
+                if hash_bytes.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(hash_bytes);
+                    Some(hash)
+                } else {
+                    None
+                }
+            })
             .collect();
 
         drop(rtxn);
@@ -1737,8 +1771,7 @@ impl HashtreeStore {
         let mut freed_bytes = 0u64;
 
         for hash in all_hashes {
-            let hash_hex = to_hex(&hash);
-            if !pinned.contains(&hash_hex) {
+            if !pinned.contains(&hash) {
                 if let Ok(Some(data)) = self.router.get_sync(&hash) {
                     freed_bytes += data.len() as u64;
                     // Delete locally only - keep S3 as archive

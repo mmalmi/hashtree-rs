@@ -164,14 +164,41 @@ enum StorageCommands {
     },
 }
 
+/// Resolved CID with optional path
+pub struct ResolvedCid {
+    pub cid: hashtree_core::Cid,
+    pub path: Option<String>,
+}
+
 /// Resolve a CID input which can be:
-/// - A raw hex hash (64 chars)
+/// - An nhash (bech32-encoded hash with optional path/key)
 /// - An npub/repo path (e.g., "npub1.../myrepo")
 /// - An htree:// URL (e.g., "htree://npub1.../myrepo")
-/// Returns the resolved hex hash and optional path within the tree
-async fn resolve_cid_input(input: &str) -> Result<(String, Option<String>)> {
+/// Returns the resolved Cid (raw bytes) and optional path within the tree
+async fn resolve_cid_input(input: &str) -> Result<ResolvedCid> {
+    use hashtree_core::{nhash_decode, is_nhash, Cid};
+
     // Strip htree:// prefix if present
     let input = input.strip_prefix("htree://").unwrap_or(input);
+
+    // Check if it's an nhash (bech32-encoded) - gives us raw bytes directly
+    if is_nhash(input) {
+        let data = nhash_decode(input)
+            .map_err(|e| anyhow::anyhow!("Invalid nhash: {}", e))?;
+        let path = if data.path.is_empty() {
+            None
+        } else {
+            Some(data.path.join("/"))
+        };
+        return Ok(ResolvedCid {
+            cid: Cid {
+                hash: data.hash,
+                key: data.decrypt_key,
+                size: 0,
+            },
+            path,
+        });
+    }
 
     // Check if it looks like an npub path (npub1.../name or npub1.../name/path)
     if input.starts_with("npub1") && input.contains('/') {
@@ -190,9 +217,8 @@ async fn resolve_cid_input(input: &str) -> Result<(String, Option<String>)> {
 
             match resolver.resolve(&key).await {
                 Ok(Some(cid)) => {
-                    let hash_hex = hashtree_core::to_hex(&cid.hash);
-                    eprintln!("Resolved to: {}", hash_hex);
-                    return Ok((hash_hex, subpath));
+                    eprintln!("Resolved to: {}", hashtree_core::to_hex(&cid.hash));
+                    return Ok(ResolvedCid { cid, path: subpath });
                 }
                 Ok(None) => {
                     anyhow::bail!("No content found for {}", key);
@@ -204,8 +230,7 @@ async fn resolve_cid_input(input: &str) -> Result<(String, Option<String>)> {
         }
     }
 
-    // Otherwise treat as raw CID
-    Ok((input.to_string(), None))
+    anyhow::bail!("Invalid format. Use nhash1... or npub1.../name")
 }
 
 #[tokio::main]
@@ -630,51 +655,39 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Get { cid: cid_input, output } => {
-            use hashtree_cli::{FetchConfig, Fetcher};
+            use hashtree_core::to_hex;
 
-            // Resolve npub/repo or htree:// URLs to CID
-            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
+            // Resolve to Cid (raw bytes, no hex conversion needed for nhash)
+            let resolved = resolve_cid_input(&cid_input).await?;
+            let cid = resolved.cid;
+            let hash_hex = to_hex(&cid.hash);
 
             let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
 
-            // Create fetcher (BlossomClient auto-loads servers from config)
-            let fetcher = Fetcher::new(FetchConfig::default());
-
-            // Check if it's a directory (try local first, then fetch)
-            let listing = match store.get_directory_listing(&cid) {
-                Ok(Some(listing)) => Some(listing),
-                _ => {
-                    // Try to fetch it
-                    if let Ok(Some(listing)) = fetcher.fetch_directory(&store, None, &cid).await {
-                        Some(listing)
-                    } else {
-                        None
-                    }
-                }
-            };
+            // Check if it's a directory (try local first)
+            let listing = store.get_directory_listing(&hash_hex)?;
 
             if let Some(_) = listing {
                 // It's a directory - create it and download contents
-                let out_dir = output.unwrap_or_else(|| PathBuf::from(&cid));
+                let out_dir = output.unwrap_or_else(|| PathBuf::from(&hash_hex));
                 std::fs::create_dir_all(&out_dir)?;
 
                 async fn download_dir(
                     store: &Arc<HashtreeStore>,
-                    fetcher: &Fetcher,
-                    cid: &str,
+                    hash_hex: &str,
                     dir: &std::path::Path,
                 ) -> Result<()> {
-                    // Get listing (fetch if needed)
-                    let listing = fetcher.fetch_directory(store, None, cid).await?;
+                    // Get listing
+                    let listing = store.get_directory_listing(hash_hex)?;
                     if let Some(listing) = listing {
                         for entry in listing.entries {
                             let entry_path = dir.join(&entry.name);
                             if entry.is_directory {
                                 std::fs::create_dir_all(&entry_path)?;
-                                Box::pin(download_dir(store, fetcher, &entry.cid, &entry_path)).await?;
+                                Box::pin(download_dir(store, &entry.cid, &entry_path)).await?;
                             } else {
-                                // Fetch file content
-                                if let Some(content) = fetcher.fetch_file(store, None, &entry.cid).await? {
+                                // Get file content
+                                if let Some(content) = store.get_file(&entry.cid)? {
                                     std::fs::write(&entry_path, content)?;
                                     println!("  {} -> {}", entry.cid, entry_path.display());
                                 }
@@ -685,24 +698,26 @@ async fn main() -> Result<()> {
                 }
 
                 println!("Downloading directory to {}", out_dir.display());
-                download_dir(&store, &fetcher, &cid, &out_dir).await?;
+                download_dir(&store, &hash_hex, &out_dir).await?;
                 println!("Done.");
             } else {
-                // Try as a file
-                if let Some(content) = fetcher.fetch_file(&store, None, &cid).await? {
-                    let out_path = output.unwrap_or_else(|| PathBuf::from(&cid));
+                // Try as a file - use get_file_by_cid for decryption support
+                if let Some(content) = store.get_file_by_cid(&cid)? {
+                    let out_path = output.unwrap_or_else(|| PathBuf::from(&hash_hex));
                     std::fs::write(&out_path, content)?;
-                    println!("{} -> {}", cid, out_path.display());
+                    println!("{} -> {}", hash_hex, out_path.display());
                 } else {
-                    anyhow::bail!("CID not found locally or on remote servers: {}", cid);
+                    anyhow::bail!("CID not found locally: {}", hash_hex);
                 }
             }
         }
         Commands::Cat { cid: cid_input } => {
             use hashtree_cli::{FetchConfig, Fetcher};
+            use hashtree_core::to_hex;
 
             // Resolve npub/repo or htree:// URLs to CID
-            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
+            let resolved = resolve_cid_input(&cid_input).await?;
+            let cid_hex = to_hex(&resolved.cid.hash);
 
             let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
 
@@ -710,11 +725,11 @@ async fn main() -> Result<()> {
             let fetcher = Fetcher::new(FetchConfig::default());
 
             // Fetch file (local first, then Blossom)
-            if let Some(content) = fetcher.fetch_file(&store, None, &cid).await? {
+            if let Some(content) = fetcher.fetch_file(&store, None, &cid_hex).await? {
                 use std::io::Write;
                 std::io::stdout().write_all(&content)?;
             } else {
-                anyhow::bail!("CID not found locally or on remote servers: {}", cid);
+                anyhow::bail!("CID not found locally or on remote servers: {}", cid_hex);
             }
         }
         Commands::Pins => {
@@ -731,28 +746,41 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Pin { cid: cid_input } => {
+            use hashtree_core::{nhash_encode, to_hex};
+
             // Resolve npub/repo or htree:// URLs to CID
-            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
+            let resolved = resolve_cid_input(&cid_input).await?;
             let store = HashtreeStore::new(&cli.data_dir)?;
-            store.pin(&cid)?;
-            println!("Pinned: {}", cid);
+            store.pin(&resolved.cid.hash)?;
+            let nhash = nhash_encode(&resolved.cid.hash)
+                .unwrap_or_else(|_| to_hex(&resolved.cid.hash));
+            println!("Pinned: {}", nhash);
         }
         Commands::Unpin { cid: cid_input } => {
+            use hashtree_core::{nhash_encode, to_hex};
+
             // Resolve npub/repo or htree:// URLs to CID
-            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
+            let resolved = resolve_cid_input(&cid_input).await?;
             let store = HashtreeStore::new(&cli.data_dir)?;
-            store.unpin(&cid)?;
-            println!("Unpinned: {}", cid);
+            store.unpin(&resolved.cid.hash)?;
+            let nhash = nhash_encode(&resolved.cid.hash)
+                .unwrap_or_else(|_| to_hex(&resolved.cid.hash));
+            println!("Unpinned: {}", nhash);
         }
         Commands::Info { cid: cid_input } => {
+            use hashtree_core::{nhash_encode, to_hex};
+
             // Resolve npub/repo or htree:// URLs to CID
-            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
+            let resolved = resolve_cid_input(&cid_input).await?;
             let store = HashtreeStore::new(&cli.data_dir)?;
+            let nhash = nhash_encode(&resolved.cid.hash)
+                .unwrap_or_else(|_| to_hex(&resolved.cid.hash));
+            let cid_hex = to_hex(&resolved.cid.hash);
 
             // Check if content exists using file chunk metadata
-            if let Some(metadata) = store.get_file_chunk_metadata(&cid)? {
-                println!("Hash: {}", cid);
-                println!("Pinned: {}", store.is_pinned(&cid)?);
+            if let Some(metadata) = store.get_file_chunk_metadata(&resolved.cid.hash)? {
+                println!("Hash: {}", nhash);
+                println!("Pinned: {}", store.is_pinned(&resolved.cid.hash)?);
                 println!("Total size: {} bytes", metadata.total_size);
                 println!("Chunked: {}", metadata.is_chunked);
 
@@ -765,7 +793,7 @@ async fn main() -> Result<()> {
                 }
 
                 // Show directory listing if it's a directory
-                if let Ok(Some(listing)) = store.get_directory_listing(&cid) {
+                if let Ok(Some(listing)) = store.get_directory_listing(&cid_hex) {
                     println!("\nDirectory contents:");
                     for entry in listing.entries {
                         let type_str = if entry.is_directory { "dir" } else { "file" };
@@ -775,7 +803,7 @@ async fn main() -> Result<()> {
                 }
 
                 // Show tree node info if available
-                if let Ok(Some(node)) = store.get_tree_node(&cid) {
+                if let Ok(Some(node)) = store.get_tree_node(&cid_hex) {
                     println!("\nTree node info:");
                     println!("  Links: {}", node.links.len());
                     for (i, link) in node.links.iter().enumerate() {
@@ -785,7 +813,7 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                println!("Hash not found: {}", cid);
+                println!("Hash not found: {}", nhash);
             }
         }
         Commands::Stats => {
@@ -930,9 +958,12 @@ async fn main() -> Result<()> {
             list_following(&cli.data_dir).await?;
         }
         Commands::Push { cid: cid_input, server } => {
+            use hashtree_core::to_hex;
+
             // Resolve npub/repo or htree:// URLs to CID
-            let (cid, _subpath) = resolve_cid_input(&cid_input).await?;
-            push_to_blossom(&cli.data_dir, &cid, server).await?;
+            let resolved = resolve_cid_input(&cid_input).await?;
+            let cid_hex = to_hex(&resolved.cid.hash);
+            push_to_blossom(&cli.data_dir, &cid_hex, server).await?;
         }
         Commands::Storage { command } => {
             // Load config
@@ -1270,26 +1301,28 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
                     queue.push(child_hash);
                 }
             }
-        } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
-            // It's a file - get the file data
-            if metadata.is_chunked {
-                // Get chunks
-                for chunk_cid in &metadata.chunk_cids {
-                    if !visited.contains(chunk_cid) {
-                        if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
-                            blocks_to_push.push((chunk_cid.clone(), chunk_data));
-                            visited.insert(chunk_cid.clone());
+        } else if let Ok(hash_bytes) = from_hex(&hash) {
+            if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash_bytes) {
+                // It's a file - get the file data
+                if metadata.is_chunked {
+                    // Get chunks
+                    for chunk_cid in &metadata.chunk_cids {
+                        if !visited.contains(chunk_cid) {
+                            if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
+                                blocks_to_push.push((chunk_cid.clone(), chunk_data));
+                                visited.insert(chunk_cid.clone());
+                            }
                         }
                     }
                 }
-            }
-            // Get the file's own block
-            if let Ok(Some(data)) = store.get_blob(&hash) {
+                // Get the file's own block
+                if let Ok(Some(data)) = store.get_blob(&hash) {
+                    blocks_to_push.push((hash.clone(), data));
+                }
+            } else if let Ok(Some(data)) = store.get_blob(&hash) {
+                // Raw block
                 blocks_to_push.push((hash.clone(), data));
             }
-        } else if let Ok(Some(data)) = store.get_blob(&hash) {
-            // Raw block
-            blocks_to_push.push((hash.clone(), data));
         }
     }
 
@@ -1382,7 +1415,7 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
 /// Background push to Blossom - fire and forget with server-level backoff
 /// Tries up to MAX_ATTEMPTS total, gives up and drops if still failing
 async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[String]) -> Result<()> {
-    use hashtree_core::to_hex;
+    use hashtree_core::{from_hex, to_hex};
     use sha2::{Sha256, Digest};
     use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
     use std::collections::HashMap;
@@ -1451,22 +1484,24 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
                     queue.push(child_hash);
                 }
             }
-        } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
-            if metadata.is_chunked {
-                for chunk_cid in &metadata.chunk_cids {
-                    if !visited.contains(chunk_cid) {
-                        if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
-                            blocks_to_push.push((chunk_cid.clone(), chunk_data));
-                            visited.insert(chunk_cid.clone());
+        } else if let Ok(hash_bytes) = from_hex(&hash) {
+            if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash_bytes) {
+                if metadata.is_chunked {
+                    for chunk_cid in &metadata.chunk_cids {
+                        if !visited.contains(chunk_cid) {
+                            if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
+                                blocks_to_push.push((chunk_cid.clone(), chunk_data));
+                                visited.insert(chunk_cid.clone());
+                            }
                         }
                     }
                 }
-            }
-            if let Ok(Some(data)) = store.get_blob(&hash) {
+                if let Ok(Some(data)) = store.get_blob(&hash) {
+                    blocks_to_push.push((hash.clone(), data));
+                }
+            } else if let Ok(Some(data)) = store.get_blob(&hash) {
                 blocks_to_push.push((hash.clone(), data));
             }
-        } else if let Ok(Some(data)) = store.get_blob(&hash) {
-            blocks_to_push.push((hash.clone(), data));
         }
     }
 

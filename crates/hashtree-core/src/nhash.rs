@@ -135,11 +135,12 @@ fn encode_tlv(tlv: &std::collections::HashMap<u8, Vec<Vec<u8>>>) -> Result<Vec<u
 }
 
 /// Encode bech32 with given prefix and data
+/// Uses regular bech32 (not bech32m) for compatibility with nostr nip19
 fn encode_bech32(hrp: &str, data: &[u8]) -> Result<String, NHashError> {
-    use bech32::{Bech32m, Hrp};
+    use bech32::{Bech32, Hrp};
 
     let hrp = Hrp::parse(hrp).map_err(|e| NHashError::Bech32(e.to_string()))?;
-    bech32::encode::<Bech32m>(hrp, data)
+    bech32::encode::<Bech32>(hrp, data)
         .map_err(|e| NHashError::Bech32(e.to_string()))
 }
 

@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
 };
 use base64::Engine;
+use hashtree_core::from_hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -633,11 +634,9 @@ fn is_valid_sha256(s: &str) -> bool {
 }
 
 fn get_blob_metadata(state: &AppState, cid: &str, ext: Option<&str>) -> (u64, String) {
-    let size = state
-        .store
-        .get_file_chunk_metadata(cid)
+    let size = from_hex(cid)
         .ok()
-        .flatten()
+        .and_then(|hash| state.store.get_file_chunk_metadata(&hash).ok().flatten())
         .map(|m| m.total_size)
         .unwrap_or(0);
 
