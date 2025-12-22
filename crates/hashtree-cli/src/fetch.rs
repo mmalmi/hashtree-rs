@@ -179,9 +179,23 @@ impl Fetcher {
                     }
 
                     let hash_hex = to_hex(&hash);
-                    let blossom = &self.blossom;
+                    let blossom = self.blossom.clone();
+                    let webrtc = webrtc_state.map(Arc::clone);
+                    let timeout = self.config.webrtc_timeout;
 
                     let fut = async move {
+                        // Try WebRTC first
+                        if let Some(state) = &webrtc {
+                            if let Ok(Some(data)) = tokio::time::timeout(
+                                timeout,
+                                state.request_from_peers(&hash_hex),
+                            )
+                            .await
+                            {
+                                return (hash, Ok(data));
+                            }
+                        }
+                        // Fallback to Blossom
                         let data = blossom.download(&hash_hex).await;
                         (hash, data)
                     };
