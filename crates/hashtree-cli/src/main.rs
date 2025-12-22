@@ -30,13 +30,23 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "htree")]
 #[command(version)]
-#[command(about = "Like Blossom, but with directories and chunking", long_about = None)]
+#[command(about = "Content-addressed filesystem", long_about = None)]
 struct Cli {
-    #[arg(long, default_value = "./hashtree-data", global = true, env = "HTREE_DATA_DIR")]
-    data_dir: PathBuf,
+    /// Data directory (default: ~/.hashtree/data)
+    #[arg(long, global = true, env = "HTREE_DATA_DIR")]
+    data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// Get the data directory, defaulting to ~/.hashtree/data
+    fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone().unwrap_or_else(|| {
+            hashtree_cli::config::get_hashtree_dir().join("data")
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -243,6 +253,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Get data_dir early to avoid borrow issues in match arms
+    let data_dir = cli.data_dir();
+
     match cli.command {
         Commands::Start { addr, relays: relays_override } => {
             // Load or create config
@@ -254,12 +267,10 @@ async fn main() -> Result<()> {
                 println!("Using relays from CLI: {:?}", config.nostr.relays);
             }
 
-            // Use data dir from config if not overridden by CLI
-            let data_dir = if cli.data_dir.to_str() == Some("./hashtree-data") {
+            // Use CLI data_dir if provided, otherwise use config's data_dir
+            let data_dir = cli.data_dir.clone().unwrap_or_else(|| {
                 PathBuf::from(&config.storage.data_dir)
-            } else {
-                cli.data_dir.clone()
-            };
+            });
 
             // Convert max_size_gb to bytes
             let max_size_bytes = config.storage.max_size_gb * 1024 * 1024 * 1024;
@@ -510,7 +521,7 @@ async fn main() -> Result<()> {
                 // Store in local hashtree
                 use hashtree_core::{nhash_encode, nhash_encode_full, NHashData, from_hex, key_from_hex, Cid};
 
-                let store = HashtreeStore::new(&cli.data_dir)?;
+                let store = HashtreeStore::new(&data_dir)?;
 
                 // Store and capture hash/key for potential publishing
                 let (hash_hex, key_hex): (String, Option<String>) = if public {
@@ -647,7 +658,7 @@ async fn main() -> Result<()> {
                     write_servers.extend(config.blossom.write_servers.clone());
                     if !write_servers.is_empty() {
                         // Await the upload to ensure it completes before exiting
-                        if let Err(e) = background_blossom_push(&cli.data_dir, &hash_hex, &write_servers).await {
+                        if let Err(e) = background_blossom_push(&data_dir, &hash_hex, &write_servers).await {
                             eprintln!("  file server push failed: {}", e);
                         }
                     }
@@ -662,7 +673,7 @@ async fn main() -> Result<()> {
             let cid = resolved.cid;
             let hash_hex = to_hex(&cid.hash);
 
-            let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
+            let store = Arc::new(HashtreeStore::new(&data_dir)?);
 
             // Check if it's a directory (try local first)
             let listing = store.get_directory_listing(&hash_hex)?;
@@ -719,7 +730,7 @@ async fn main() -> Result<()> {
             let resolved = resolve_cid_input(&cid_input).await?;
             let cid_hex = to_hex(&resolved.cid.hash);
 
-            let store = Arc::new(HashtreeStore::new(&cli.data_dir)?);
+            let store = Arc::new(HashtreeStore::new(&data_dir)?);
 
             // Create fetcher (BlossomClient auto-loads servers from config)
             let fetcher = Fetcher::new(FetchConfig::default());
@@ -733,7 +744,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Pins => {
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            let store = HashtreeStore::new(&data_dir)?;
             let pins = store.list_pins_with_names()?;
             if pins.is_empty() {
                 println!("No pinned CIDs");
@@ -750,7 +761,7 @@ async fn main() -> Result<()> {
 
             // Resolve npub/repo or htree:// URLs to CID
             let resolved = resolve_cid_input(&cid_input).await?;
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            let store = HashtreeStore::new(&data_dir)?;
             store.pin(&resolved.cid.hash)?;
             let nhash = nhash_encode(&resolved.cid.hash)
                 .unwrap_or_else(|_| to_hex(&resolved.cid.hash));
@@ -761,7 +772,7 @@ async fn main() -> Result<()> {
 
             // Resolve npub/repo or htree:// URLs to CID
             let resolved = resolve_cid_input(&cid_input).await?;
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            let store = HashtreeStore::new(&data_dir)?;
             store.unpin(&resolved.cid.hash)?;
             let nhash = nhash_encode(&resolved.cid.hash)
                 .unwrap_or_else(|_| to_hex(&resolved.cid.hash));
@@ -772,7 +783,7 @@ async fn main() -> Result<()> {
 
             // Resolve npub/repo or htree:// URLs to CID
             let resolved = resolve_cid_input(&cid_input).await?;
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            let store = HashtreeStore::new(&data_dir)?;
             let nhash = nhash_encode(&resolved.cid.hash)
                 .unwrap_or_else(|_| to_hex(&resolved.cid.hash));
             let cid_hex = to_hex(&resolved.cid.hash);
@@ -817,7 +828,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Stats => {
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            let store = HashtreeStore::new(&data_dir)?;
             let stats = store.get_storage_stats()?;
             println!("Storage Statistics:");
             println!("  Total DAGs: {}", stats.total_dags);
@@ -827,7 +838,7 @@ async fn main() -> Result<()> {
                 stats.total_bytes as f64 / 1024.0);
         }
         Commands::Gc => {
-            let store = HashtreeStore::new(&cli.data_dir)?;
+            let store = HashtreeStore::new(&data_dir)?;
             println!("Running garbage collection...");
             let gc_stats = store.gc()?;
             println!("Deleted {} DAGs", gc_stats.deleted_dags);
@@ -949,13 +960,13 @@ async fn main() -> Result<()> {
             let _ = resolver.stop().await;
         }
         Commands::Follow { npub } => {
-            follow_user(&cli.data_dir, &npub, true).await?;
+            follow_user(&data_dir, &npub, true).await?;
         }
         Commands::Unfollow { npub } => {
-            follow_user(&cli.data_dir, &npub, false).await?;
+            follow_user(&data_dir, &npub, false).await?;
         }
         Commands::Following => {
-            list_following(&cli.data_dir).await?;
+            list_following(&data_dir).await?;
         }
         Commands::Push { cid: cid_input, server } => {
             use hashtree_core::to_hex;
@@ -963,18 +974,16 @@ async fn main() -> Result<()> {
             // Resolve npub/repo or htree:// URLs to CID
             let resolved = resolve_cid_input(&cid_input).await?;
             let cid_hex = to_hex(&resolved.cid.hash);
-            push_to_blossom(&cli.data_dir, &cid_hex, server).await?;
+            push_to_blossom(&data_dir, &cid_hex, server).await?;
         }
         Commands::Storage { command } => {
             // Load config
             let config = Config::load()?;
 
-            // Use data dir from config if not overridden by CLI
-            let data_dir = if cli.data_dir.to_str() == Some("./hashtree-data") {
+            // Use CLI data_dir if provided, otherwise use config's data_dir
+            let data_dir = cli.data_dir.clone().unwrap_or_else(|| {
                 PathBuf::from(&config.storage.data_dir)
-            } else {
-                cli.data_dir.clone()
-            };
+            });
 
             let max_size_bytes = config.storage.max_size_gb * 1024 * 1024 * 1024;
             let store = HashtreeStore::with_options(&data_dir, config.storage.s3.as_ref(), max_size_bytes)?;
