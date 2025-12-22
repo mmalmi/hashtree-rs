@@ -646,29 +646,14 @@ impl RemoteHelper {
     }
 
     /// Push content to file servers (blossom)
-    /// Walks the merkle tree from root_hash and uploads only blobs belonging to this tree
+    /// Walks the merkle tree from root_hash and uploads blobs as it discovers them
     /// Returns the number of blossom servers successfully used
     fn push_to_file_servers(&self, root_hash: &str) -> usize {
+        use hashtree_core::try_decode_tree_node;
+
         let store = self.storage.store();
         let blossom = self.nostr.blossom();
         let blossom_server_count = blossom.write_servers().len();
-
-        // Collect all hashes reachable from the root (tree walk)
-        eprint!("  Collecting blobs...");
-        let _ = std::io::stderr().flush();
-        let hashes = match self.collect_tree_hashes(root_hash) {
-            Ok(h) => {
-                eprintln!(" {} blobs", h.len());
-                h
-            }
-            Err(e) => {
-                eprintln!(" failed: {}", e);
-                warn!("Failed to collect tree hashes: {}", e);
-                return 0;
-            }
-        };
-
-        info!("Uploading {} blobs to file servers", hashes.len());
 
         // Create runtime for async uploads
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -682,82 +667,88 @@ impl RemoteHelper {
             }
         };
 
+        // Parse root hash
+        let root_bytes = match hex::decode(root_hash) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                arr
+            }
+            _ => {
+                warn!("Invalid root hash: {}", root_hash);
+                return 0;
+            }
+        };
+
         let success = rt.block_on(async {
-            use futures::stream::{self, StreamExt};
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            use std::sync::Arc as StdArc;
+            let mut uploaded = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
+            let mut processed = 0usize;
 
-            let uploaded = StdArc::new(AtomicUsize::new(0));
-            let skipped = StdArc::new(AtomicUsize::new(0));
-            let failed = StdArc::new(AtomicUsize::new(0));
-            let processed = StdArc::new(AtomicUsize::new(0));
+            // Walk tree and upload as we go
+            let mut visited: HashSet<[u8; 32]> = HashSet::new();
+            let mut queue = vec![root_bytes];
 
-            // Pre-load all blob data from LMDB (sync operation)
-            eprint!("  Loading blobs from store...");
-            let _ = std::io::stderr().flush();
-            let blobs: Vec<_> = hashes
-                .iter()
-                .filter_map(|hash| {
-                    match store.get_sync(hash) {
-                        Ok(Some(data)) => Some((hash.clone(), data)),
-                        _ => None,
+            while let Some(hash) = queue.pop() {
+                if visited.contains(&hash) {
+                    continue;
+                }
+                visited.insert(hash);
+
+                // Load blob from store
+                let data = match store.get_sync(&hash) {
+                    Ok(Some(data)) => data,
+                    _ => {
+                        failed += 1;
+                        continue;
                     }
-                })
-                .collect();
+                };
 
-            let blob_count = blobs.len();
-            eprintln!(" {} blobs loaded", blob_count);
-
-            // Parallel upload with concurrency limit
-            const UPLOAD_CONCURRENCY: usize = 10;
-            let _results: Vec<()> = stream::iter(blobs)
-                .map(|(hash, data)| {
-                    let blossom = &blossom;
-                    let uploaded = StdArc::clone(&uploaded);
-                    let skipped = StdArc::clone(&skipped);
-                    let failed = StdArc::clone(&failed);
-                    let processed = StdArc::clone(&processed);
-                    async move {
-                        match blossom.upload_if_missing(&data).await {
-                            Ok((_, true)) => { uploaded.fetch_add(1, Ordering::Relaxed); }
-                            Ok((_, false)) => { skipped.fetch_add(1, Ordering::Relaxed); }
-                            Err(e) => {
-                                debug!("Failed to upload blob {}: {}", hex::encode(&hash), e);
-                                failed.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        let count = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 10 == 0 || count == blob_count {
-                            eprint!("\r  Uploading: {}/{} ({} new, {} exist)",
-                                count, blob_count,
-                                uploaded.load(Ordering::Relaxed),
-                                skipped.load(Ordering::Relaxed));
-                            let _ = std::io::stderr().flush();
+                // Check if it's a tree node and queue children
+                if let Some(node) = try_decode_tree_node(&data) {
+                    for link in node.links {
+                        if !visited.contains(&link.hash) {
+                            queue.push(link.hash);
                         }
                     }
-                })
-                .buffer_unordered(UPLOAD_CONCURRENCY)
-                .collect()
-                .await;
+                }
 
-            let final_uploaded = uploaded.load(Ordering::Relaxed);
-            let final_skipped = skipped.load(Ordering::Relaxed);
-            let final_failed = failed.load(Ordering::Relaxed);
+                // Upload this blob
+                match blossom.upload_if_missing(&data).await {
+                    Ok((_, true)) => { uploaded += 1; }
+                    Ok((_, false)) => { skipped += 1; }
+                    Err(e) => {
+                        debug!("Failed to upload blob {}: {}", hex::encode(&hash), e);
+                        failed += 1;
+                    }
+                }
 
-            eprintln!(); // Newline after progress
+                processed += 1;
+                if processed == 1 || processed % 10 == 0 {
+                    eprint!("\r  Uploading: {} ({} new, {} exist)",
+                        processed, uploaded, skipped);
+                    let _ = std::io::stderr().flush();
+                }
+            }
+
+            // Final progress
+            eprint!("\r  Uploading: {} ({} new, {} exist)", processed, uploaded, skipped);
+            eprintln!();
+
             info!(
                 "Blossom upload complete: {} uploaded, {} already existed, {} failed",
-                final_uploaded, final_skipped, final_failed
+                uploaded, skipped, failed
             );
 
-            // Return true if we had any success
-            final_uploaded > 0 || final_skipped > 0
+            uploaded > 0 || skipped > 0
         });
 
         if success { blossom_server_count } else { 0 }
     }
 
     /// Collect all hashes reachable from a root hash by walking the merkle tree
+    #[allow(dead_code)]
     fn collect_tree_hashes(&self, root_hash: &str) -> Result<Vec<[u8; 32]>> {
         use hashtree_core::try_decode_tree_node;
 
