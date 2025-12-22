@@ -89,6 +89,7 @@ impl HashtreeServer {
             .route("/list/:pubkey", get(blossom::list_blobs)
                 .options(blossom::cors_preflight))
             // Hashtree API endpoints
+            .route("/health", get(handlers::health_check))
             .route("/api/pins", get(handlers::list_pins))
             .route("/api/stats", get(handlers::storage_stats))
             .route("/api/peers", get(handlers::webrtc_peers))

@@ -531,6 +531,16 @@ pub async fn storage_stats(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Health check endpoint - minimal overhead, just returns ok
+pub async fn health_check() -> impl IntoResponse {
+    // Minimal health check - if we can respond, we're alive
+    // Storage checks would be heavier and DDoS-able
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from("ok"))
+        .unwrap()
+}
+
 /// Get connected WebRTC peers
 pub async fn webrtc_peers(State(state): State<AppState>) -> impl IntoResponse {
     use crate::webrtc::ConnectionState;
