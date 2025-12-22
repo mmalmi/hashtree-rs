@@ -327,12 +327,12 @@ pub struct HashtreeStore {
     env: heed::Env,
     /// Set of pinned hashes (32-byte raw hashes, prevents garbage collection)
     pins: Database<Bytes, Unit>,
-    /// Maps SHA256 hex -> root hash hex (for blossom compatibility)
-    sha256_index: Database<Str, Str>,
+    /// Maps SHA256 (32 bytes) -> root hash (32 bytes) for blossom compatibility
+    sha256_index: Database<Bytes, Bytes>,
     /// Blob ownership: sha256 (32 bytes) ++ pubkey (32 bytes) -> () (composite key for multi-owner)
     blob_owners: Database<Bytes, Unit>,
-    /// Maps pubkey -> blob metadata JSON (for blossom list)
-    pubkey_blobs: Database<Str, Bytes>,
+    /// Maps pubkey (32 bytes) -> blob metadata JSON (for blossom list)
+    pubkey_blobs: Database<Bytes, Bytes>,
     /// Tree metadata for eviction: tree_root_hash (32 bytes) -> TreeMeta (msgpack)
     tree_meta: Database<Bytes, Bytes>,
     /// Blob-to-tree mapping: blob_hash ++ tree_hash (64 bytes) -> ()
@@ -448,7 +448,6 @@ impl HashtreeStore {
 
         // Compute SHA256 hash of file content for blossom compatibility
         let content_sha256 = sha256(&file_content);
-        let sha256_hex = to_hex(&content_sha256);
 
         // Use hashtree to store the file (public mode - no encryption)
         let store = self.store_arc();
@@ -458,12 +457,10 @@ impl HashtreeStore {
             tree.put(&file_content).await
         }).context("Failed to store file")?;
 
-        let root_hex = to_hex(&cid.hash);
-
         let mut wtxn = self.env.write_txn()?;
 
         // Store SHA256 -> root hash mapping for blossom compatibility
-        self.sha256_index.put(&mut wtxn, &sha256_hex, &root_hex)?;
+        self.sha256_index.put(&mut wtxn, &content_sha256, &cid.hash)?;
 
         // Only pin if requested (htree add = pin, blossom upload = no pin)
         if pin {
@@ -472,7 +469,7 @@ impl HashtreeStore {
 
         wtxn.commit()?;
 
-        Ok(root_hex)
+        Ok(to_hex(&cid.hash))
     }
 
     /// Upload a file from a stream with progress callbacks
@@ -491,7 +488,6 @@ impl HashtreeStore {
 
         // Compute SHA256 hash of file content for blossom compatibility
         let content_sha256 = sha256(&data);
-        let sha256_hex = to_hex(&content_sha256);
 
         // Use HashTree.put for upload (public mode for blossom)
         let store = self.store_arc();
@@ -507,7 +503,7 @@ impl HashtreeStore {
         let mut wtxn = self.env.write_txn()?;
 
         // Store SHA256 -> root hash mapping for blossom compatibility
-        self.sha256_index.put(&mut wtxn, &sha256_hex, &root_hex)?;
+        self.sha256_index.put(&mut wtxn, &content_sha256, &cid.hash)?;
 
         // Auto-pin on upload
         self.pins.put(&mut wtxn, cid.hash.as_slice(), &())?;
@@ -702,24 +698,25 @@ impl HashtreeStore {
         Ok(cid_str)
     }
 
-    /// Get tree node by hash (hex)
-    pub fn get_tree_node(&self, hash_hex: &str) -> Result<Option<TreeNode>> {
-        let hash = from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-
+    /// Get tree node by hash (raw bytes)
+    pub fn get_tree_node(&self, hash: &[u8; 32]) -> Result<Option<TreeNode>> {
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
-            tree.get_tree_node(&hash).await
+            tree.get_tree_node(hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to get tree node: {}", e))
         })
     }
 
     /// Look up root hash by SHA256 hash (blossom compatibility)
-    pub fn get_cid_by_sha256(&self, sha256_hex: &str) -> Result<Option<String>> {
+    pub fn get_cid_by_sha256(&self, sha256: &[u8; 32]) -> Result<Option<Hash>> {
         let rtxn = self.env.read_txn()?;
-        Ok(self.sha256_index.get(&rtxn, sha256_hex)?.map(|s| s.to_string()))
+        Ok(self.sha256_index.get(&rtxn, sha256)?.map(|bytes| {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(bytes);
+            hash
+        }))
     }
 
     /// Store a raw blob, returns SHA256 hash as hex.
@@ -730,19 +727,15 @@ impl HashtreeStore {
         Ok(to_hex(&hash))
     }
 
-    /// Get a raw blob by SHA256 hex hash.
-    pub fn get_blob(&self, sha256_hex: &str) -> Result<Option<Vec<u8>>> {
-        let hash = from_hex(sha256_hex)
-            .map_err(|e| anyhow::anyhow!("invalid hex: {}", e))?;
-        self.router.get_sync(&hash)
+    /// Get a raw blob by SHA256 hash (raw bytes).
+    pub fn get_blob(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.router.get_sync(hash)
             .map_err(|e| anyhow::anyhow!("Failed to get blob: {}", e))
     }
 
-    /// Check if a blob exists by SHA256 hex hash.
-    pub fn blob_exists(&self, sha256_hex: &str) -> Result<bool> {
-        let hash = from_hex(sha256_hex)
-            .map_err(|e| anyhow::anyhow!("invalid hex: {}", e))?;
-        self.router.exists(&hash)
+    /// Check if a blob exists by SHA256 hash (raw bytes).
+    pub fn blob_exists(&self, hash: &[u8; 32]) -> Result<bool> {
+        self.router.exists(hash)
             .map_err(|e| anyhow::anyhow!("Failed to check blob: {}", e))
     }
 
@@ -751,27 +744,24 @@ impl HashtreeStore {
     // This allows efficient multi-owner tracking with O(1) lookups
 
     /// Build composite key for blob_owners: sha256 ++ pubkey (64 bytes total)
-    fn blob_owner_key(sha256_hex: &str, pubkey_hex: &str) -> Result<[u8; 64]> {
-        let sha256_bytes = from_hex(sha256_hex)
-            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
-        let pubkey_bytes = from_hex(pubkey_hex)
-            .map_err(|e| anyhow::anyhow!("invalid pubkey hex: {}", e))?;
+    fn blob_owner_key(sha256: &[u8; 32], pubkey: &[u8; 32]) -> [u8; 64] {
         let mut key = [0u8; 64];
-        key[..32].copy_from_slice(&sha256_bytes);
-        key[32..].copy_from_slice(&pubkey_bytes);
-        Ok(key)
+        key[..32].copy_from_slice(sha256);
+        key[32..].copy_from_slice(pubkey);
+        key
     }
 
     /// Add an owner (pubkey) to a blob for Blossom protocol
     /// Multiple users can own the same blob - it's only deleted when all owners remove it
-    pub fn set_blob_owner(&self, sha256_hex: &str, pubkey: &str) -> Result<()> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let key = Self::blob_owner_key(sha256_hex, pubkey)?;
+    pub fn set_blob_owner(&self, sha256: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
+        let key = Self::blob_owner_key(sha256, pubkey);
         let mut wtxn = self.env.write_txn()?;
 
         // Add ownership entry (idempotent - put overwrites)
         self.blob_owners.put(&mut wtxn, &key[..], &())?;
+
+        // Convert sha256 to hex for BlobMetadata (which stores sha256 as hex string)
+        let sha256_hex = to_hex(sha256);
 
         // Get existing blobs for this pubkey (for /list endpoint)
         let mut blobs: Vec<BlobMetadata> = self
@@ -789,14 +779,13 @@ impl HashtreeStore {
 
             // Get size from root hash lookup
             let size = self
-                .get_cid_by_sha256(sha256_hex)?
-                .and_then(|cid_hex| from_hex(&cid_hex).ok())
-                .and_then(|hash| self.get_file_chunk_metadata(&hash).ok().flatten())
+                .get_cid_by_sha256(sha256)?
+                .and_then(|root_hash| self.get_file_chunk_metadata(&root_hash).ok().flatten())
                 .map(|m| m.total_size)
                 .unwrap_or(0);
 
             blobs.push(BlobMetadata {
-                sha256: sha256_hex.to_string(),
+                sha256: sha256_hex,
                 size,
                 mime_type: "application/octet-stream".to_string(),
                 uploaded: now,
@@ -811,38 +800,35 @@ impl HashtreeStore {
     }
 
     /// Check if a pubkey owns a blob
-    pub fn is_blob_owner(&self, sha256_hex: &str, pubkey: &str) -> Result<bool> {
-        let key = Self::blob_owner_key(sha256_hex, pubkey)?;
+    pub fn is_blob_owner(&self, sha256: &[u8; 32], pubkey: &[u8; 32]) -> Result<bool> {
+        let key = Self::blob_owner_key(sha256, pubkey);
         let rtxn = self.env.read_txn()?;
         Ok(self.blob_owners.get(&rtxn, &key[..])?.is_some())
     }
 
-    /// Get all owners (pubkeys) of a blob via prefix scan
-    pub fn get_blob_owners(&self, sha256_hex: &str) -> Result<Vec<String>> {
-        let sha256_bytes = from_hex(sha256_hex)
-            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
+    /// Get all owners (pubkeys) of a blob via prefix scan (returns raw bytes)
+    pub fn get_blob_owners(&self, sha256: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
         let rtxn = self.env.read_txn()?;
 
         let mut owners = Vec::new();
-        for item in self.blob_owners.prefix_iter(&rtxn, &sha256_bytes[..])? {
+        for item in self.blob_owners.prefix_iter(&rtxn, &sha256[..])? {
             let (key, _) = item?;
             if key.len() == 64 {
                 // Extract pubkey from composite key (bytes 32-64)
-                let pubkey_hex = to_hex(&key[32..64].try_into().unwrap());
-                owners.push(pubkey_hex);
+                let mut pubkey = [0u8; 32];
+                pubkey.copy_from_slice(&key[32..64]);
+                owners.push(pubkey);
             }
         }
         Ok(owners)
     }
 
     /// Check if blob has any owners
-    pub fn blob_has_owners(&self, sha256_hex: &str) -> Result<bool> {
-        let sha256_bytes = from_hex(sha256_hex)
-            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
+    pub fn blob_has_owners(&self, sha256: &[u8; 32]) -> Result<bool> {
         let rtxn = self.env.read_txn()?;
 
         // Just check if any entry exists with this prefix
-        for item in self.blob_owners.prefix_iter(&rtxn, &sha256_bytes[..])? {
+        for item in self.blob_owners.prefix_iter(&rtxn, &sha256[..])? {
             if item.is_ok() {
                 return Ok(true);
             }
@@ -851,19 +837,22 @@ impl HashtreeStore {
     }
 
     /// Get the first owner (pubkey) of a blob (for backwards compatibility)
-    pub fn get_blob_owner(&self, sha256_hex: &str) -> Result<Option<String>> {
-        Ok(self.get_blob_owners(sha256_hex)?.into_iter().next())
+    pub fn get_blob_owner(&self, sha256: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+        Ok(self.get_blob_owners(sha256)?.into_iter().next())
     }
 
     /// Remove a user's ownership of a blossom blob
     /// Only deletes the actual blob when no owners remain
     /// Returns true if the blob was actually deleted (no owners left)
-    pub fn delete_blossom_blob(&self, sha256_hex: &str, pubkey: &str) -> Result<bool> {
-        let key = Self::blob_owner_key(sha256_hex, pubkey)?;
+    pub fn delete_blossom_blob(&self, sha256: &[u8; 32], pubkey: &[u8; 32]) -> Result<bool> {
+        let key = Self::blob_owner_key(sha256, pubkey);
         let mut wtxn = self.env.write_txn()?;
 
         // Remove this pubkey's ownership entry
         self.blob_owners.delete(&mut wtxn, &key[..])?;
+
+        // Hex strings for logging and BlobMetadata (which stores sha256 as hex string)
+        let sha256_hex = to_hex(sha256);
 
         // Remove from pubkey's blob list
         if let Some(blobs_bytes) = self.pubkey_blobs.get(&wtxn, pubkey)? {
@@ -875,10 +864,8 @@ impl HashtreeStore {
         }
 
         // Check if any other owners remain (prefix scan)
-        let sha256_bytes = from_hex(sha256_hex)
-            .map_err(|e| anyhow::anyhow!("invalid sha256 hex: {}", e))?;
         let mut has_other_owners = false;
-        for item in self.blob_owners.prefix_iter(&wtxn, &sha256_bytes[..])? {
+        for item in self.blob_owners.prefix_iter(&wtxn, &sha256[..])? {
             if item.is_ok() {
                 has_other_owners = true;
                 break;
@@ -889,8 +876,8 @@ impl HashtreeStore {
             wtxn.commit()?;
             tracing::debug!(
                 "Removed {} from blob {} owners, other owners remain",
-                &pubkey[..8.min(pubkey.len())],
-                &sha256_hex[..8.min(sha256_hex.len())]
+                &to_hex(pubkey)[..8],
+                &sha256_hex[..8]
             );
             return Ok(false);
         }
@@ -898,30 +885,29 @@ impl HashtreeStore {
         // No owners left - delete the blob completely
         tracing::info!(
             "All owners removed from blob {}, deleting",
-            &sha256_hex[..8.min(sha256_hex.len())]
+            &sha256_hex[..8]
         );
 
-        // Delete from sha256_index
-        let root_hex = self.sha256_index.get(&wtxn, sha256_hex)?.map(|s| s.to_string());
-        if let Some(ref root_hex) = root_hex {
-            // Unpin
-            if let Ok(root_hash) = from_hex(root_hex) {
-                self.pins.delete(&mut wtxn, root_hash.as_slice())?;
-            }
+        // Delete from sha256_index and unpin
+        let root_hash: Option<Hash> = self.sha256_index.get(&wtxn, sha256)?.map(|bytes| {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(bytes);
+            hash
+        });
+        if let Some(ref hash) = root_hash {
+            self.pins.delete(&mut wtxn, hash)?;
         }
-        self.sha256_index.delete(&mut wtxn, sha256_hex)?;
+        self.sha256_index.delete(&mut wtxn, sha256)?;
 
         // Delete raw blob (by content hash) - this deletes from S3 too
-        let hash = from_hex(sha256_hex)
-            .map_err(|e| anyhow::anyhow!("invalid hex: {}", e))?;
-        let _ = self.router.delete_sync(&hash);
+        let _ = self.router.delete_sync(sha256);
 
         wtxn.commit()?;
         Ok(true)
     }
 
     /// List all blobs owned by a pubkey (for Blossom /list endpoint)
-    pub fn list_blobs_by_pubkey(&self, pubkey: &str) -> Result<Vec<crate::server::blossom::BlobDescriptor>> {
+    pub fn list_blobs_by_pubkey(&self, pubkey: &[u8; 32]) -> Result<Vec<crate::server::blossom::BlobDescriptor>> {
         let rtxn = self.env.read_txn()?;
 
         let blobs: Vec<BlobMetadata> = self
@@ -942,25 +928,20 @@ impl HashtreeStore {
             .collect())
     }
 
-    /// Get a single chunk/blob by hash (hex)
-    pub fn get_chunk(&self, chunk_hex: &str) -> Result<Option<Vec<u8>>> {
-        let hash = from_hex(chunk_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-        self.router.get_sync(&hash)
+    /// Get a single chunk/blob by hash (raw bytes)
+    pub fn get_chunk(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.router.get_sync(hash)
             .map_err(|e| anyhow::anyhow!("Failed to get chunk: {}", e))
     }
 
-    /// Get file content by hash (hex)
+    /// Get file content by hash (raw bytes)
     /// Returns raw bytes (caller handles decryption if needed)
-    pub fn get_file(&self, hash_hex: &str) -> Result<Option<Vec<u8>>> {
-        let hash = from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-
+    pub fn get_file(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         sync_block_on(async {
-            tree.read_file(&hash).await
+            tree.read_file(hash).await
                 .map_err(|e| anyhow::anyhow!("Failed to read file: {}", e))
         })
     }
@@ -1004,7 +985,7 @@ impl HashtreeStore {
                 // Single blob, not chunked
                 return Ok(Some(FileChunkMetadata {
                     total_size,
-                    chunk_cids: vec![],
+                    chunk_hashes: vec![],
                     chunk_sizes: vec![],
                     is_chunked: false,
                 }));
@@ -1026,12 +1007,12 @@ impl HashtreeStore {
             }
 
             // Extract chunk info from links
-            let chunk_cids: Vec<String> = node.links.iter().map(|l| to_hex(&l.hash)).collect();
+            let chunk_hashes: Vec<Hash> = node.links.iter().map(|l| l.hash).collect();
             let chunk_sizes: Vec<u64> = node.links.iter().map(|l| l.size).collect();
 
             Ok(Some(FileChunkMetadata {
                 total_size,
-                chunk_cids,
+                chunk_hashes,
                 chunk_sizes,
                 is_chunked: !node.links.is_empty(),
             }))
@@ -1039,10 +1020,8 @@ impl HashtreeStore {
     }
 
     /// Get byte range from file
-    pub fn get_file_range(&self, hash_hex: &str, start: u64, end: Option<u64>) -> Result<Option<(Vec<u8>, u64)>> {
-        let hash = from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-        let metadata = match self.get_file_chunk_metadata(&hash)? {
+    pub fn get_file_range(&self, hash: &[u8; 32], start: u64, end: Option<u64>) -> Result<Option<(Vec<u8>, u64)>> {
+        let metadata = match self.get_file_chunk_metadata(hash)? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -1059,7 +1038,7 @@ impl HashtreeStore {
 
         // For non-chunked files, load entire file
         if !metadata.is_chunked {
-            let content = self.get_file(hash_hex)?.unwrap_or_default();
+            let content = self.get_file(hash)?.unwrap_or_default();
             let range_content = if start < content.len() as u64 {
                 content[start as usize..=(end as usize).min(content.len() - 1)].to_vec()
             } else {
@@ -1072,16 +1051,16 @@ impl HashtreeStore {
         let mut result = Vec::new();
         let mut current_offset = 0u64;
 
-        for (i, chunk_cid) in metadata.chunk_cids.iter().enumerate() {
+        for (i, chunk_hash) in metadata.chunk_hashes.iter().enumerate() {
             let chunk_size = metadata.chunk_sizes[i];
             let chunk_end = current_offset + chunk_size - 1;
 
             // Check if this chunk overlaps with requested range
             if chunk_end >= start && current_offset <= end {
-                let chunk_content = match self.get_chunk(chunk_cid)? {
+                let chunk_content = match self.get_chunk(chunk_hash)? {
                     Some(content) => content,
                     None => {
-                        return Err(anyhow::anyhow!("Chunk {} not found", chunk_cid));
+                        return Err(anyhow::anyhow!("Chunk {} not found", to_hex(chunk_hash)));
                     }
                 };
 
@@ -1113,13 +1092,11 @@ impl HashtreeStore {
     /// Stream file range as chunks using Arc for async/Send contexts
     pub fn stream_file_range_chunks_owned(
         self: Arc<Self>,
-        hash_hex: &str,
+        hash: &[u8; 32],
         start: u64,
         end: u64,
     ) -> Result<Option<FileRangeChunksOwned>> {
-        let hash = from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-        let metadata = match self.get_file_chunk_metadata(&hash)? {
+        let metadata = match self.get_file_chunk_metadata(hash)? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -1140,11 +1117,8 @@ impl HashtreeStore {
         }))
     }
 
-    /// Get directory structure by hash (hex)
-    pub fn get_directory_listing(&self, hash_hex: &str) -> Result<Option<DirectoryListing>> {
-        let hash = from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-
+    /// Get directory structure by hash (raw bytes)
+    pub fn get_directory_listing(&self, hash: &[u8; 32]) -> Result<Option<DirectoryListing>> {
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
@@ -1158,7 +1132,7 @@ impl HashtreeStore {
             }
 
             // Get directory entries (public Cid - no encryption key)
-            let cid = hashtree_core::Cid::public(hash, 0);
+            let cid = hashtree_core::Cid::public(*hash, 0);
             let tree_entries = tree.list_directory(&cid).await
                 .map_err(|e| anyhow::anyhow!("Failed to list directory: {}", e))?;
 
@@ -2047,7 +2021,7 @@ pub struct StorageByPriority {
 #[derive(Debug, Clone)]
 pub struct FileChunkMetadata {
     pub total_size: u64,
-    pub chunk_cids: Vec<String>,
+    pub chunk_hashes: Vec<Hash>,
     pub chunk_sizes: Vec<u64>,
     pub is_chunked: bool,
 }
@@ -2066,7 +2040,7 @@ impl Iterator for FileRangeChunksOwned {
     type Item = Result<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.metadata.is_chunked || self.current_chunk_idx >= self.metadata.chunk_cids.len() {
+        if !self.metadata.is_chunked || self.current_chunk_idx >= self.metadata.chunk_hashes.len() {
             return None;
         }
 
@@ -2074,7 +2048,7 @@ impl Iterator for FileRangeChunksOwned {
             return None;
         }
 
-        let chunk_cid = &self.metadata.chunk_cids[self.current_chunk_idx];
+        let chunk_hash = &self.metadata.chunk_hashes[self.current_chunk_idx];
         let chunk_size = self.metadata.chunk_sizes[self.current_chunk_idx];
         let chunk_end = self.current_offset + chunk_size - 1;
 
@@ -2085,10 +2059,10 @@ impl Iterator for FileRangeChunksOwned {
             return self.next();
         }
 
-        let chunk_content = match self.store.get_chunk(chunk_cid) {
+        let chunk_content = match self.store.get_chunk(chunk_hash) {
             Ok(Some(content)) => content,
             Ok(None) => {
-                return Some(Err(anyhow::anyhow!("Chunk {} not found", chunk_cid)));
+                return Some(Err(anyhow::anyhow!("Chunk {} not found", to_hex(chunk_hash))));
             }
             Err(e) => {
                 return Some(Err(e));
@@ -2153,6 +2127,8 @@ pub struct BlobMetadata {
 // Implement ContentStore trait for WebRTC data exchange
 impl crate::webrtc::ContentStore for HashtreeStore {
     fn get(&self, hash_hex: &str) -> Result<Option<Vec<u8>>> {
-        self.get_chunk(hash_hex)
+        let hash = from_hex(hash_hex)
+            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
+        self.get_chunk(&hash)
     }
 }

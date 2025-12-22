@@ -136,8 +136,7 @@ fn test_eviction_under_limit() {
     assert_eq!(freed, 0, "Should not evict when under limit");
 
     // Blob should still exist
-    let hash_hex = hashtree_core::to_hex(&hash);
-    assert!(store.blob_exists(&hash_hex).unwrap(), "Blob should still exist");
+    assert!(store.blob_exists(&hash).unwrap(), "Blob should still exist");
 }
 
 #[test]
@@ -184,8 +183,7 @@ fn test_pinned_tree_protection() {
     let data_pinned = vec![0u8; 200];
     let hash_pinned = add_blob(&store, &data_pinned);
     store.index_tree(&hash_pinned, "me", Some("pinned"), PRIORITY_OWN, None).unwrap();
-    let hash_pinned_hex = hashtree_core::to_hex(&hash_pinned);
-    store.pin(&hash_pinned_hex).expect("Failed to pin");
+    store.pin(&hash_pinned).expect("Failed to pin");
 
     // Add other tree (evictable)
     let data_other = vec![1u8; 200];
@@ -250,8 +248,7 @@ fn test_priority_order_eviction() {
     let data_own = vec![2u8; 150];
     let hash_own = add_blob(&store, &data_own);
     store.index_tree(&hash_own, "me", Some("own"), PRIORITY_OWN, None).unwrap();
-    let hash_own_hex = hashtree_core::to_hex(&hash_own);
-    store.pin(&hash_own_hex).expect("Failed to pin");
+    store.pin(&hash_own).expect("Failed to pin");
 
     // Total is 450 bytes, limit is 400
     // Should evict lowest priority first (other)
@@ -282,8 +279,7 @@ fn test_unindex_tree() {
 
     // Verify it exists
     assert!(store.get_tree_meta(&hash).unwrap().is_some());
-    let hash_hex = hashtree_core::to_hex(&hash);
-    assert!(store.blob_exists(&hash_hex).unwrap());
+    assert!(store.blob_exists(&hash).unwrap());
 
     // Unindex it
     let freed = store.unindex_tree(&hash).expect("Unindex failed");
@@ -293,7 +289,7 @@ fn test_unindex_tree() {
     assert!(store.get_tree_meta(&hash).unwrap().is_none());
 
     // Blob should also be deleted (orphaned)
-    assert!(!store.blob_exists(&hash_hex).unwrap(), "Orphaned blob should be deleted");
+    assert!(!store.blob_exists(&hash).unwrap(), "Orphaned blob should be deleted");
 }
 
 #[test]
@@ -309,7 +305,6 @@ fn test_orphan_eviction_first() {
     // Add an orphan blob (not indexed as part of any tree)
     let orphan_data = vec![0u8; 200];
     let orphan_hash = add_blob(&store, &orphan_data);
-    let orphan_hex = hashtree_core::to_hex(&orphan_hash);
 
     // Add an indexed tree
     let tree_data = vec![1u8; 200];
@@ -326,7 +321,7 @@ fn test_orphan_eviction_first() {
     assert!(freed > 0, "Should have freed space");
 
     // Orphan blob should be gone
-    assert!(!store.blob_exists(&orphan_hex).unwrap(), "Orphan blob should be evicted first");
+    assert!(!store.blob_exists(&orphan_hash).unwrap(), "Orphan blob should be evicted first");
 
     // Indexed tree should still exist (orphan eviction was enough)
     let meta = store.get_tree_meta(&tree_hash).unwrap();
@@ -340,8 +335,7 @@ fn test_pinned_not_evicted_as_orphan() {
     // Add a pinned blob (not in any tree but pinned)
     let pinned_data = vec![0u8; 200];
     let pinned_hash = add_blob(&store, &pinned_data);
-    let pinned_hex = hashtree_core::to_hex(&pinned_hash);
-    store.pin(&pinned_hex).expect("Failed to pin");
+    store.pin(&pinned_hash).expect("Failed to pin");
 
     // Add another blob to push over limit
     let extra_data = vec![1u8; 200];
@@ -352,7 +346,7 @@ fn test_pinned_not_evicted_as_orphan() {
     let _ = store.evict_if_needed();
 
     // Pinned blob should still exist
-    assert!(store.blob_exists(&pinned_hex).unwrap(), "Pinned blob should not be evicted");
+    assert!(store.blob_exists(&pinned_hash).unwrap(), "Pinned blob should not be evicted");
 }
 
 #[test]

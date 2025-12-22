@@ -135,6 +135,7 @@ mod tests {
     use crate::storage::HashtreeStore;
     use tempfile::TempDir;
     use std::path::Path;
+    use hashtree_core::from_hex;
 
     #[tokio::test]
     async fn test_server_serve_file() -> Result<()> {
@@ -146,9 +147,10 @@ mod tests {
         std::fs::write(&test_file, b"Hello, Hashtree!")?;
 
         let cid = store.upload_file(&test_file)?;
+        let hash = from_hex(&cid)?;
 
         // Verify we can get it
-        let content = store.get_file(&cid)?;
+        let content = store.get_file(&hash)?;
         assert!(content.is_some());
         assert_eq!(content.unwrap(), b"Hello, Hashtree!");
 
@@ -164,10 +166,11 @@ mod tests {
         std::fs::write(&test_file, b"Test")?;
 
         let cid = store.upload_file(&test_file)?;
+        let hash = from_hex(&cid)?;
 
-        let pins = store.list_pins()?;
+        let pins = store.list_pins_raw()?;
         assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0], cid);
+        assert_eq!(pins[0], hash);
 
         Ok(())
     }

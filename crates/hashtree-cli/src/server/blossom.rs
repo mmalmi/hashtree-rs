@@ -313,12 +313,22 @@ pub async fn head_blob(
     }
 
     let sha256_hex = hash_part.to_lowercase();
+    let sha256_bytes: [u8; 32] = match from_hex(&sha256_hex) {
+        Ok(b) => b,
+        Err(_) => return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header("X-Reason", "Invalid SHA256 format")
+            .body(Body::empty())
+            .unwrap(),
+    };
 
     // Check if blob exists via CID lookup
-    match state.store.get_cid_by_sha256(&sha256_hex) {
-        Ok(Some(cid)) => {
+    match state.store.get_cid_by_sha256(&sha256_bytes) {
+        Ok(Some(root_hash)) => {
             // Get file size and mime type
-            let (size, mime_type) = get_blob_metadata(&state, &cid, ext);
+            let root_hex = hashtree_core::to_hex(&root_hash);
+            let (size, mime_type) = get_blob_metadata(&state, &root_hex, ext);
 
             Response::builder()
                 .status(StatusCode::OK)
@@ -403,8 +413,8 @@ pub async fn upload_blob(
     // Compute SHA256 of uploaded data
     let mut hasher = Sha256::new();
     hasher.update(&body);
-    let sha256_bytes = hasher.finalize();
-    let sha256_hex = hex::encode(sha256_bytes);
+    let sha256_hash: [u8; 32] = hasher.finalize().into();
+    let sha256_hex = hex::encode(sha256_hash);
 
     // If auth has x tags, verify hash matches
     if !auth.blob_hashes.is_empty() && !auth.blob_hashes.contains(&sha256_hex) {
@@ -417,10 +427,23 @@ pub async fn upload_blob(
             .unwrap();
     }
 
+    // Convert pubkey hex to bytes
+    let pubkey_bytes = match from_hex(&auth.pubkey) {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header("X-Reason", "Invalid pubkey format")
+                .body(Body::empty())
+                .unwrap();
+        }
+    };
+
     let size = body.len() as u64;
 
     // Store the blob (only track ownership if user is in allowed list)
-    let store_result = store_blossom_blob(&state, &body, &sha256_hex, &auth.pubkey, is_allowed);
+    let store_result = store_blossom_blob(&state, &body, &sha256_hash, &pubkey_bytes, is_allowed);
 
     match store_result {
         Ok(()) => {
@@ -477,6 +500,19 @@ pub async fn delete_blob(
 
     let sha256_hex = hash_part.to_lowercase();
 
+    // Convert hash to bytes
+    let sha256_bytes = match from_hex(&sha256_hex) {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header("X-Reason", "Invalid SHA256 hash format")
+                .body(Body::empty())
+                .unwrap();
+        }
+    };
+
     // Verify authorization with hash requirement
     let auth = match verify_blossom_auth(&headers, "delete", Some(&sha256_hex)) {
         Ok(a) => a,
@@ -490,14 +526,27 @@ pub async fn delete_blob(
         }
     };
 
+    // Convert pubkey hex to bytes
+    let pubkey_bytes = match from_hex(&auth.pubkey) {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header("X-Reason", "Invalid pubkey format")
+                .body(Body::empty())
+                .unwrap();
+        }
+    };
+
     // Check ownership - user must be one of the owners (O(1) lookup with composite key)
-    match state.store.is_blob_owner(&sha256_hex, &auth.pubkey) {
+    match state.store.is_blob_owner(&sha256_bytes, &pubkey_bytes) {
         Ok(true) => {
             // User is an owner, proceed with delete
         }
         Ok(false) => {
             // Check if blob exists at all (for proper error message)
-            match state.store.blob_has_owners(&sha256_hex) {
+            match state.store.blob_has_owners(&sha256_bytes) {
                 Ok(true) => {
                     return Response::builder()
                         .status(StatusCode::FORBIDDEN)
@@ -533,7 +582,7 @@ pub async fn delete_blob(
     }
 
     // Remove this user's ownership (blob only deleted when no owners remain)
-    match state.store.delete_blossom_blob(&sha256_hex, &auth.pubkey) {
+    match state.store.delete_blossom_blob(&sha256_bytes, &pubkey_bytes) {
         Ok(fully_deleted) => {
             // Return 200 OK whether blob was fully deleted or just removed from user's list
             // The client doesn't need to know if other owners still exist
@@ -571,12 +620,22 @@ pub async fn list_blobs(
     }
 
     let pubkey_hex = pubkey.to_lowercase();
+    let pubkey_bytes: [u8; 32] = match from_hex(&pubkey_hex) {
+        Ok(b) => b,
+        Err(_) => return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header("X-Reason", "Invalid pubkey format")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("[]"))
+            .unwrap(),
+    };
 
     // Optional auth verification for list
     let _auth = verify_blossom_auth(&headers, "list", None).ok();
 
     // Get blobs for this pubkey
-    match state.store.list_blobs_by_pubkey(&pubkey_hex) {
+    match state.store.list_blobs_by_pubkey(&pubkey_bytes) {
         Ok(blobs) => {
             // Apply filters
             let mut filtered: Vec<_> = blobs
@@ -653,8 +712,8 @@ fn get_blob_metadata(state: &AppState, cid: &str, ext: Option<&str>) -> (u64, St
 fn store_blossom_blob(
     state: &AppState,
     data: &[u8],
-    sha256_hex: &str,
-    pubkey: &str,
+    sha256: &[u8; 32],
+    pubkey: &[u8; 32],
     track_ownership: bool,
 ) -> anyhow::Result<()> {
     // Store as raw blob
@@ -662,6 +721,7 @@ fn store_blossom_blob(
 
     // Create a temporary file and upload through normal path for CID/DAG storage
     let temp_dir = tempfile::tempdir()?;
+    let sha256_hex = hashtree_core::to_hex(sha256);
     let temp_file = temp_dir.path().join(format!("{}.bin", sha256_hex));
     std::fs::write(&temp_file, data)?;
 
@@ -671,7 +731,7 @@ fn store_blossom_blob(
     // Only track ownership for social graph members
     // Non-members can upload (if public_writes=true) but can't delete
     if track_ownership {
-        state.store.set_blob_owner(sha256_hex, pubkey)?;
+        state.store.set_blob_owner(sha256, pubkey)?;
     }
 
     Ok(())

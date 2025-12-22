@@ -112,15 +112,16 @@ impl Fetcher {
         &self,
         store: &HashtreeStore,
         webrtc_state: Option<&Arc<WebRTCState>>,
-        hash_hex: &str,
+        hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
         // Check local storage first
-        if let Some(data) = store.get_chunk(hash_hex)? {
+        if let Some(data) = store.get_chunk(hash)? {
             return Ok(data);
         }
 
         // Fetch remotely and store
-        let data = self.fetch_chunk(webrtc_state, hash_hex).await?;
+        let hash_hex = to_hex(hash);
+        let data = self.fetch_chunk(webrtc_state, &hash_hex).await?;
         store.put_blob(&data)?;
         Ok(data)
     }
@@ -136,10 +137,8 @@ impl Fetcher {
         let mut chunks_fetched = 0usize;
         let mut bytes_fetched = 0u64;
 
-        let root_hex = to_hex(root_hash);
-
         // Check if we already have the root
-        if store.blob_exists(&root_hex)? {
+        if store.blob_exists(root_hash)? {
             return Ok((0, 0));
         }
 
@@ -148,12 +147,12 @@ impl Fetcher {
         queue.push_back(*root_hash);
 
         while let Some(hash) = queue.pop_front() {
-            let hash_hex = to_hex(&hash);
-
             // Check if we already have it
-            if store.blob_exists(&hash_hex)? {
+            if store.blob_exists(&hash)? {
                 continue;
             }
+
+            let hash_hex = to_hex(&hash);
 
             // Fetch it
             let data = self.fetch_chunk(webrtc_state, &hash_hex).await?;
@@ -180,22 +179,18 @@ impl Fetcher {
         &self,
         store: &HashtreeStore,
         webrtc_state: Option<&Arc<WebRTCState>>,
-        hash_hex: &str,
+        hash: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
         // First, try to get from local storage
-        if let Some(content) = store.get_file(hash_hex)? {
+        if let Some(content) = store.get_file(hash)? {
             return Ok(Some(content));
         }
 
-        // Parse hash
-        let hash = hashtree_core::from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-
         // Fetch the tree
-        self.fetch_tree(store, webrtc_state, &hash).await?;
+        self.fetch_tree(store, webrtc_state, hash).await?;
 
         // Now try to read the file
-        store.get_file(hash_hex)
+        store.get_file(hash)
     }
 
     /// Fetch a directory listing, fetching chunks if needed
@@ -203,22 +198,18 @@ impl Fetcher {
         &self,
         store: &HashtreeStore,
         webrtc_state: Option<&Arc<WebRTCState>>,
-        hash_hex: &str,
+        hash: &[u8; 32],
     ) -> Result<Option<crate::storage::DirectoryListing>> {
         // First, try to get from local storage
-        if let Ok(Some(listing)) = store.get_directory_listing(hash_hex) {
+        if let Ok(Some(listing)) = store.get_directory_listing(hash) {
             return Ok(Some(listing));
         }
 
-        // Parse hash
-        let hash = hashtree_core::from_hex(hash_hex)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-
         // Fetch the tree
-        self.fetch_tree(store, webrtc_state, &hash).await?;
+        self.fetch_tree(store, webrtc_state, hash).await?;
 
         // Now try to get the directory listing
-        store.get_directory_listing(hash_hex)
+        store.get_directory_listing(hash)
     }
 
     /// Upload data to Blossom servers

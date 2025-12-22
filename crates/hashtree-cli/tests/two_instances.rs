@@ -384,6 +384,14 @@ fn test_two_instances_discover_and_sync() {
 }
 
 fn extract_cid(text: &str) -> Option<String> {
+    // First try to find nhash format (preferred)
+    if let Some(nhash) = text.lines().find_map(|line| {
+        line.split_whitespace().find(|word| word.starts_with("nhash1"))
+            .map(|s| s.to_string())
+    }) {
+        return Some(nhash);
+    }
+    // Fall back to 64-char hex format
     text.lines().find_map(|line| {
         line.split_whitespace().find(|word| {
             word.len() == 64 && word.chars().all(|c| c.is_ascii_hexdigit())

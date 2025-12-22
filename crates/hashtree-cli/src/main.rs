@@ -666,7 +666,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Get { cid: cid_input, output } => {
-            use hashtree_core::to_hex;
+            use hashtree_core::{from_hex, to_hex};
 
             // Resolve to Cid (raw bytes, no hex conversion needed for nhash)
             let resolved = resolve_cid_input(&cid_input).await?;
@@ -676,7 +676,7 @@ async fn main() -> Result<()> {
             let store = Arc::new(HashtreeStore::new(&data_dir)?);
 
             // Check if it's a directory (try local first)
-            let listing = store.get_directory_listing(&hash_hex)?;
+            let listing = store.get_directory_listing(&cid.hash)?;
 
             if let Some(_) = listing {
                 // It's a directory - create it and download contents
@@ -685,20 +685,22 @@ async fn main() -> Result<()> {
 
                 async fn download_dir(
                     store: &Arc<HashtreeStore>,
-                    hash_hex: &str,
+                    hash: &[u8; 32],
                     dir: &std::path::Path,
                 ) -> Result<()> {
                     // Get listing
-                    let listing = store.get_directory_listing(hash_hex)?;
+                    let listing = store.get_directory_listing(hash)?;
                     if let Some(listing) = listing {
                         for entry in listing.entries {
                             let entry_path = dir.join(&entry.name);
+                            let entry_hash = from_hex(&entry.cid)
+                                .map_err(|e| anyhow::anyhow!("Invalid CID: {}", e))?;
                             if entry.is_directory {
                                 std::fs::create_dir_all(&entry_path)?;
-                                Box::pin(download_dir(store, &entry.cid, &entry_path)).await?;
+                                Box::pin(download_dir(store, &entry_hash, &entry_path)).await?;
                             } else {
                                 // Get file content
-                                if let Some(content) = store.get_file(&entry.cid)? {
+                                if let Some(content) = store.get_file(&entry_hash)? {
                                     std::fs::write(&entry_path, content)?;
                                     println!("  {} -> {}", entry.cid, entry_path.display());
                                 }
@@ -709,7 +711,7 @@ async fn main() -> Result<()> {
                 }
 
                 println!("Downloading directory to {}", out_dir.display());
-                download_dir(&store, &hash_hex, &out_dir).await?;
+                download_dir(&store, &cid.hash, &out_dir).await?;
                 println!("Done.");
             } else {
                 // Try as a file - use get_file_by_cid for decryption support
@@ -736,7 +738,7 @@ async fn main() -> Result<()> {
             let fetcher = Fetcher::new(FetchConfig::default());
 
             // Fetch file (local first, then Blossom)
-            if let Some(content) = fetcher.fetch_file(&store, None, &cid_hex).await? {
+            if let Some(content) = fetcher.fetch_file(&store, None, &resolved.cid.hash).await? {
                 use std::io::Write;
                 std::io::stdout().write_all(&content)?;
             } else {
@@ -786,7 +788,6 @@ async fn main() -> Result<()> {
             let store = HashtreeStore::new(&data_dir)?;
             let nhash = nhash_encode(&resolved.cid.hash)
                 .unwrap_or_else(|_| to_hex(&resolved.cid.hash));
-            let cid_hex = to_hex(&resolved.cid.hash);
 
             // Check if content exists using file chunk metadata
             if let Some(metadata) = store.get_file_chunk_metadata(&resolved.cid.hash)? {
@@ -796,15 +797,15 @@ async fn main() -> Result<()> {
                 println!("Chunked: {}", metadata.is_chunked);
 
                 if metadata.is_chunked {
-                    println!("Chunks: {}", metadata.chunk_cids.len());
+                    println!("Chunks: {}", metadata.chunk_hashes.len());
                     println!("\nChunk details:");
-                    for (i, (chunk_cid, size)) in metadata.chunk_cids.iter().zip(metadata.chunk_sizes.iter()).enumerate() {
-                        println!("  [{}] {} ({} bytes)", i, chunk_cid, size);
+                    for (i, (chunk_hash, size)) in metadata.chunk_hashes.iter().zip(metadata.chunk_sizes.iter()).enumerate() {
+                        println!("  [{}] {} ({} bytes)", i, to_hex(chunk_hash), size);
                     }
                 }
 
                 // Show directory listing if it's a directory
-                if let Ok(Some(listing)) = store.get_directory_listing(&cid_hex) {
+                if let Ok(Some(listing)) = store.get_directory_listing(&resolved.cid.hash) {
                     println!("\nDirectory contents:");
                     for entry in listing.entries {
                         let type_str = if entry.is_directory { "dir" } else { "file" };
@@ -814,7 +815,7 @@ async fn main() -> Result<()> {
                 }
 
                 // Show tree node info if available
-                if let Ok(Some(node)) = store.get_tree_node(&cid_hex) {
+                if let Ok(Some(node)) = store.get_tree_node(&resolved.cid.hash) {
                     println!("\nTree node info:");
                     println!("  Links: {}", node.links.len());
                     for (i, link) in node.links.iter().enumerate() {
@@ -1283,55 +1284,51 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
         (cid_str.to_string(), None)
     };
 
-    let _root_hash = from_hex(&hash_hex).context("Invalid hash")?;
-
     // Collect all blocks to push (walk the DAG)
     println!("Collecting blocks...");
-    let mut blocks_to_push: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut queue = vec![hash_hex.clone()];
+    let mut blocks_to_push: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let root_hash = from_hex(&hash_hex).context("Invalid hash")?;
+    let mut queue = vec![root_hash];
 
     while let Some(hash) = queue.pop() {
         if visited.contains(&hash) {
             continue;
         }
-        visited.insert(hash.clone());
+        visited.insert(hash);
 
         // Try to get as tree node first (for directories/internal nodes)
         if let Ok(Some(node)) = store.get_tree_node(&hash) {
             // Get raw block data
             if let Ok(Some(data)) = store.get_blob(&hash) {
-                blocks_to_push.push((hash.clone(), data));
+                blocks_to_push.push((hash, data));
             }
             // Queue child hashes
             for link in &node.links {
-                let child_hash = to_hex(&link.hash);
-                if !visited.contains(&child_hash) {
-                    queue.push(child_hash);
+                if !visited.contains(&link.hash) {
+                    queue.push(link.hash);
                 }
             }
-        } else if let Ok(hash_bytes) = from_hex(&hash) {
-            if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash_bytes) {
-                // It's a file - get the file data
-                if metadata.is_chunked {
-                    // Get chunks
-                    for chunk_cid in &metadata.chunk_cids {
-                        if !visited.contains(chunk_cid) {
-                            if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
-                                blocks_to_push.push((chunk_cid.clone(), chunk_data));
-                                visited.insert(chunk_cid.clone());
-                            }
+        } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
+            // It's a file - get the file data
+            if metadata.is_chunked {
+                // Get chunks
+                for chunk_hash in &metadata.chunk_hashes {
+                    if !visited.contains(chunk_hash) {
+                        if let Ok(Some(chunk_data)) = store.get_blob(chunk_hash) {
+                            blocks_to_push.push((*chunk_hash, chunk_data));
+                            visited.insert(*chunk_hash);
                         }
                     }
                 }
-                // Get the file's own block
-                if let Ok(Some(data)) = store.get_blob(&hash) {
-                    blocks_to_push.push((hash.clone(), data));
-                }
-            } else if let Ok(Some(data)) = store.get_blob(&hash) {
-                // Raw block
-                blocks_to_push.push((hash.clone(), data));
             }
+            // Get the file's own block
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash, data));
+            }
+        } else if let Ok(Some(data)) = store.get_blob(&hash) {
+            // Raw block
+            blocks_to_push.push((hash, data));
         }
     }
 
@@ -1348,8 +1345,9 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
         let mut errors = 0;
 
         for (hash, data) in &blocks_to_push {
+            let hash_hex = to_hex(hash);
             // Check if already exists (HEAD request)
-            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
+            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash_hex);
             let head_resp = client.head(&url).send().await;
 
             if let Ok(resp) = head_resp {
@@ -1404,11 +1402,11 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
                 Ok(r) => {
                     let status = r.status();
                     let text = r.text().await.unwrap_or_default();
-                    eprintln!("  Error uploading {}: {} {}", &hash[..12], status, text);
+                    eprintln!("  Error uploading {}: {} {}", &hash_hex[..12], status, text);
                     errors += 1;
                 }
                 Err(e) => {
-                    eprintln!("  Error uploading {}: {}", &hash[..12], e);
+                    eprintln!("  Error uploading {}: {}", &hash_hex[..12], e);
                     errors += 1;
                 }
             }
@@ -1472,45 +1470,43 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
     };
 
     // Collect all blocks to push (walk the DAG)
-    let mut blocks_to_push: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut queue = vec![hash_hex.clone()];
+    let mut blocks_to_push: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let root_hash = from_hex(&hash_hex).context("Invalid hash")?;
+    let mut queue = vec![root_hash];
 
     while let Some(hash) = queue.pop() {
         if visited.contains(&hash) {
             continue;
         }
-        visited.insert(hash.clone());
+        visited.insert(hash);
 
         // Try to get as tree node first (for directories/internal nodes)
         if let Ok(Some(node)) = store.get_tree_node(&hash) {
             if let Ok(Some(data)) = store.get_blob(&hash) {
-                blocks_to_push.push((hash.clone(), data));
+                blocks_to_push.push((hash, data));
             }
             for link in &node.links {
-                let child_hash = to_hex(&link.hash);
-                if !visited.contains(&child_hash) {
-                    queue.push(child_hash);
+                if !visited.contains(&link.hash) {
+                    queue.push(link.hash);
                 }
             }
-        } else if let Ok(hash_bytes) = from_hex(&hash) {
-            if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash_bytes) {
-                if metadata.is_chunked {
-                    for chunk_cid in &metadata.chunk_cids {
-                        if !visited.contains(chunk_cid) {
-                            if let Ok(Some(chunk_data)) = store.get_blob(chunk_cid) {
-                                blocks_to_push.push((chunk_cid.clone(), chunk_data));
-                                visited.insert(chunk_cid.clone());
-                            }
+        } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
+            if metadata.is_chunked {
+                for chunk_hash in &metadata.chunk_hashes {
+                    if !visited.contains(chunk_hash) {
+                        if let Ok(Some(chunk_data)) = store.get_blob(chunk_hash) {
+                            blocks_to_push.push((*chunk_hash, chunk_data));
+                            visited.insert(*chunk_hash);
                         }
                     }
                 }
-                if let Ok(Some(data)) = store.get_blob(&hash) {
-                    blocks_to_push.push((hash.clone(), data));
-                }
-            } else if let Ok(Some(data)) = store.get_blob(&hash) {
-                blocks_to_push.push((hash.clone(), data));
             }
+            if let Ok(Some(data)) = store.get_blob(&hash) {
+                blocks_to_push.push((hash, data));
+            }
+        } else if let Ok(Some(data)) = store.get_blob(&hash) {
+            blocks_to_push.push((hash, data));
         }
     }
 
@@ -1524,6 +1520,7 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
 
     // Try each block with limited retries
     for (hash, data) in &blocks_to_push {
+        let hash_hex = to_hex(hash);
         let mut attempts = 0;
         let mut uploaded = false;
 
@@ -1542,7 +1539,7 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
             };
 
             // Check if already exists (HEAD request)
-            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
+            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash_hex);
             if let Ok(resp) = client.head(&url).send().await {
                 if resp.status().is_success() {
                     total_skipped += 1;

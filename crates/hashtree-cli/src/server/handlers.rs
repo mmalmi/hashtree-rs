@@ -36,6 +36,20 @@ async fn serve_content_internal(
 ) -> Response<Body> {
     let store = &state.store;
 
+    // Parse CID to bytes early
+    let hash = match from_hex(cid) {
+        Ok(h) => h,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from("Invalid CID format"))
+                .unwrap()
+                .into_response();
+        }
+    };
+
     // Always return raw bytes - no conversion to JSON/HTML
     // This is required for Blossom protocol compatibility
 
@@ -59,18 +73,6 @@ async fn serve_content_internal(
                     let content_type = "application/octet-stream";
 
                     // Get metadata to determine total size
-                    let hash = match from_hex(cid) {
-                        Ok(h) => h,
-                        Err(_) => {
-                            return Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .header(header::CONTENT_TYPE, "text/plain")
-                                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                                .body(Body::from("Invalid CID format"))
-                                .unwrap()
-                                .into_response();
-                        }
-                    };
                     match store.get_file_chunk_metadata(&hash) {
                         Ok(Some(metadata)) => {
                             let total_size = metadata.total_size;
@@ -91,7 +93,7 @@ async fn serve_content_internal(
 
                             // Use streaming for chunked files
                             if metadata.is_chunked {
-                                match state.store.clone().stream_file_range_chunks_owned(cid, start, end_actual) {
+                                match state.store.clone().stream_file_range_chunks_owned(&hash, start, end_actual) {
                                     Ok(Some(chunks_iter)) => {
                                         let stream = stream::iter(chunks_iter)
                                             .map(|result| result.map(Bytes::from));
@@ -130,7 +132,7 @@ async fn serve_content_internal(
                                 }
                             } else {
                                 // For small non-chunked files, use buffered approach
-                                match store.get_file_range(cid, start, Some(end_actual)) {
+                                match store.get_file_range(&hash, start, Some(end_actual)) {
                                     Ok(Some((range_content, _))) => {
                                         let mut builder = Response::builder()
                                             .status(StatusCode::PARTIAL_CONTENT)
@@ -189,7 +191,7 @@ async fn serve_content_internal(
     }
 
     // Fall back to full file
-    match store.get_file(cid) {
+    match store.get_file(&hash) {
         Ok(Some(content)) => {
             // Content type - hashtree doesn't store filenames, so default to octet-stream
             let content_type = "application/octet-stream";
@@ -259,8 +261,11 @@ pub async fn serve_content_or_blob(
     // Try blossom SHA256 lookup (content hash -> root hash mapping)
     if is_sha256 {
         let sha256_hex = hash_part.to_lowercase();
-        if let Ok(Some(cid)) = state.store.get_cid_by_sha256(&sha256_hex) {
-            return serve_content_internal(&state, &cid, headers, true).await;
+        if let Ok(sha256_bytes) = from_hex(&sha256_hex) {
+            if let Ok(Some(root_hash)) = state.store.get_cid_by_sha256(&sha256_bytes) {
+                let root_hex = to_hex(&root_hash);
+                return serve_content_internal(&state, &root_hex, headers, true).await;
+            }
         }
     }
 
