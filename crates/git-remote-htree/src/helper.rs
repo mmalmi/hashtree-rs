@@ -329,10 +329,17 @@ impl RemoteHelper {
         let mut fetch_tasks: Vec<(String, Cid)> = Vec::new();
 
         if is_prefix_layout {
+            let total_prefixes = entries.iter().filter(|e| e.name.len() == 2 && hex::decode(&e.name).is_ok()).count();
+            let mut scanned = 0;
+            eprint!("  Scanning: 0/{} prefixes", total_prefixes);
+            let _ = std::io::stderr().flush();
             for entry in &entries {
                 if entry.name.len() != 2 || hex::decode(&entry.name).is_err() {
                     continue;
                 }
+                scanned += 1;
+                eprint!("\r  Scanning: {}/{} prefixes", scanned, total_prefixes);
+                let _ = std::io::stderr().flush();
                 let prefix = entry.name.clone();
                 let prefix_cid = Cid {
                     hash: entry.hash,
@@ -354,6 +361,7 @@ impl RemoteHelper {
                     }
                 }
             }
+            eprintln!();
         } else {
             for entry in &entries {
                 if entry.name.len() != 40 || hex::decode(&entry.name).is_err() {
