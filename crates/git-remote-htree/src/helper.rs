@@ -303,70 +303,58 @@ impl RemoteHelper {
 
         info!("Resolved .git/objects: {}", hex::encode(objects_cid.hash));
 
-        // List objects directory
-        let entries = match tree.list_directory(&objects_cid).await {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("Failed to list objects directory: {}", e);
-                return Ok(objects);
-            }
-        };
-
         use futures::stream::{self, StreamExt};
         use std::io::Write;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
+        use hashtree_core::LinkType;
 
-        // Collect all objects to fetch (oid, cid) pairs
-        let is_prefix_layout = entries.iter().any(|e| e.name.len() == 2);
-        let mut fetch_tasks: Vec<(String, Cid)> = Vec::new();
+        // Walk the objects tree with parallel fetching
+        eprint!("  Loading objects tree...");
+        let _ = std::io::stderr().flush();
 
-        if is_prefix_layout {
-            let total_prefixes = entries.iter().filter(|e| e.name.len() == 2 && hex::decode(&e.name).is_ok()).count();
-            let mut scanned = 0;
-            eprint!("  Scanning: 0/{} prefixes", total_prefixes);
-            let _ = std::io::stderr().flush();
-            for entry in &entries {
-                if entry.name.len() != 2 || hex::decode(&entry.name).is_err() {
-                    continue;
-                }
-                scanned += 1;
-                eprint!("\r  Scanning: {}/{} prefixes", scanned, total_prefixes);
-                let _ = std::io::stderr().flush();
-                let prefix = entry.name.clone();
-                let prefix_cid = Cid {
-                    hash: entry.hash,
-                    key: entry.key,
-                    size: entry.size,
-                };
-                if let Ok(sub_entries) = tree.list_directory(&prefix_cid).await {
-                    for obj_entry in sub_entries {
-                        if obj_entry.name.len() != 38 || hex::decode(&obj_entry.name).is_err() {
-                            continue;
-                        }
-                        let oid = format!("{}{}", prefix, obj_entry.name);
-                        let obj_cid = Cid {
-                            hash: obj_entry.hash,
-                            key: obj_entry.key,
-                            size: obj_entry.size,
-                        };
-                        fetch_tasks.push((oid, obj_cid));
-                    }
-                }
+        const WALK_CONCURRENCY: usize = 32;
+        let walk_entries = match tree.walk_parallel(&objects_cid, "", WALK_CONCURRENCY).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(" failed: {}", e);
+                warn!("Failed to walk objects directory: {}", e);
+                return Ok(objects);
             }
-            eprintln!();
-        } else {
-            for entry in &entries {
-                if entry.name.len() != 40 || hex::decode(&entry.name).is_err() {
-                    continue;
+        };
+        eprintln!(" done ({} entries)", walk_entries.len());
+
+        // Extract git objects from walk entries (files with 40 char hex names like "ab/cdef..." -> "abcdef...")
+        let mut fetch_tasks: Vec<(String, Cid)> = Vec::new();
+        for entry in walk_entries {
+            // Skip directories
+            if entry.link_type == LinkType::Dir {
+                continue;
+            }
+
+            // Parse path like "ab/cdef1234..." into oid "abcdef1234..."
+            let parts: Vec<&str> = entry.path.split('/').collect();
+            if parts.len() == 2 && parts[0].len() == 2 && parts[1].len() == 38 {
+                if hex::decode(parts[0]).is_ok() && hex::decode(parts[1]).is_ok() {
+                    let oid = format!("{}{}", parts[0], parts[1]);
+                    let obj_cid = Cid {
+                        hash: entry.hash,
+                        key: entry.key,
+                        size: entry.size,
+                    };
+                    fetch_tasks.push((oid, obj_cid));
                 }
-                let oid = entry.name.clone();
-                let obj_cid = Cid {
-                    hash: entry.hash,
-                    key: entry.key,
-                    size: entry.size,
-                };
-                fetch_tasks.push((oid, obj_cid));
+            } else if parts.len() == 1 && parts[0].len() == 40 {
+                // Flat layout: object files directly in objects/
+                if hex::decode(parts[0]).is_ok() {
+                    let oid = parts[0].to_string();
+                    let obj_cid = Cid {
+                        hash: entry.hash,
+                        key: entry.key,
+                        size: entry.size,
+                    };
+                    fetch_tasks.push((oid, obj_cid));
+                }
             }
         }
 

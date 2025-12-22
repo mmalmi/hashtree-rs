@@ -126,7 +126,7 @@ impl Fetcher {
         Ok(data)
     }
 
-    /// Fetch an entire tree (all chunks recursively)
+    /// Fetch an entire tree (all chunks recursively) - sequential version
     /// Returns (chunks_fetched, bytes_fetched)
     pub async fn fetch_tree(
         &self,
@@ -134,43 +134,99 @@ impl Fetcher {
         webrtc_state: Option<&Arc<WebRTCState>>,
         root_hash: &[u8; 32],
     ) -> Result<(usize, u64)> {
-        let mut chunks_fetched = 0usize;
-        let mut bytes_fetched = 0u64;
+        self.fetch_tree_parallel(store, webrtc_state, root_hash, 1).await
+    }
+
+    /// Fetch an entire tree with parallel downloads
+    /// Uses work-stealing: always keeps `concurrency` requests in flight
+    /// Returns (chunks_fetched, bytes_fetched)
+    pub async fn fetch_tree_parallel(
+        &self,
+        store: &HashtreeStore,
+        webrtc_state: Option<&Arc<WebRTCState>>,
+        root_hash: &[u8; 32],
+        concurrency: usize,
+    ) -> Result<(usize, u64)> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
         // Check if we already have the root
         if store.blob_exists(root_hash)? {
             return Ok((0, 0));
         }
 
-        // BFS to fetch all chunks
-        let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
-        queue.push_back(*root_hash);
+        let chunks_fetched = Arc::new(AtomicUsize::new(0));
+        let bytes_fetched = Arc::new(AtomicU64::new(0));
 
-        while let Some(hash) = queue.pop_front() {
-            // Check if we already have it
-            if store.blob_exists(&hash)? {
-                continue;
+        // Track what we've queued to avoid duplicates
+        let mut queued: HashSet<[u8; 32]> = HashSet::new();
+        let mut pending: VecDeque<[u8; 32]> = VecDeque::new();
+
+        // Seed with root
+        pending.push_back(*root_hash);
+        queued.insert(*root_hash);
+
+        let mut active = FuturesUnordered::new();
+
+        loop {
+            // Fill up to concurrency limit from pending queue
+            while active.len() < concurrency {
+                if let Some(hash) = pending.pop_front() {
+                    // Skip if we already have it locally
+                    if store.blob_exists(&hash).unwrap_or(false) {
+                        continue;
+                    }
+
+                    let hash_hex = to_hex(&hash);
+                    let blossom = &self.blossom;
+
+                    let fut = async move {
+                        let data = blossom.download(&hash_hex).await;
+                        (hash, data)
+                    };
+                    active.push(fut);
+                } else {
+                    break;
+                }
             }
 
-            let hash_hex = to_hex(&hash);
+            // If nothing active, we're done
+            if active.is_empty() {
+                break;
+            }
 
-            // Fetch it
-            let data = self.fetch_chunk(webrtc_state, &hash_hex).await?;
+            // Wait for any download to complete
+            if let Some((hash, result)) = active.next().await {
+                match result {
+                    Ok(data) => {
+                        // Store it
+                        store.put_blob(&data)?;
+                        chunks_fetched.fetch_add(1, Ordering::Relaxed);
+                        bytes_fetched.fetch_add(data.len() as u64, Ordering::Relaxed);
 
-            // Store it
-            store.put_blob(&data)?;
-            chunks_fetched += 1;
-            bytes_fetched += data.len() as u64;
-
-            // Parse as tree node and queue children
-            if let Ok(node) = decode_tree_node(&data) {
-                for link in node.links {
-                    queue.push_back(link.hash);
+                        // Parse as tree node and queue children
+                        if let Ok(node) = decode_tree_node(&data) {
+                            for link in node.links {
+                                if !queued.contains(&link.hash) {
+                                    queued.insert(link.hash);
+                                    pending.push_back(link.hash);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Failed to fetch {}: {}", to_hex(&hash), e);
+                        // Continue with other chunks - don't fail the whole tree
+                    }
                 }
             }
         }
 
-        Ok((chunks_fetched, bytes_fetched))
+        Ok((
+            chunks_fetched.load(Ordering::Relaxed),
+            bytes_fetched.load(Ordering::Relaxed),
+        ))
     }
 
     /// Fetch a file by hash, fetching all chunks if needed

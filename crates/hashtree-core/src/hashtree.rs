@@ -1223,6 +1223,109 @@ impl<S: Store> HashTree<S> {
         Ok(())
     }
 
+    /// Walk entire tree with parallel fetching
+    /// Uses a work-stealing approach: always keeps `concurrency` requests in flight
+    pub async fn walk_parallel(&self, cid: &Cid, path: &str, concurrency: usize) -> Result<Vec<WalkEntry>, HashTreeError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::collections::VecDeque;
+
+        let mut entries = Vec::new();
+        let mut pending: VecDeque<(Cid, String)> = VecDeque::new();
+        let mut active = FuturesUnordered::new();
+
+        // Seed with root
+        pending.push_back((cid.clone(), path.to_string()));
+
+        loop {
+            // Fill up to concurrency limit from pending queue
+            while active.len() < concurrency {
+                if let Some((node_cid, node_path)) = pending.pop_front() {
+                    let store = &self.store;
+                    let fut = async move {
+                        let data = store.get(&node_cid.hash).await
+                            .map_err(|e| HashTreeError::Store(e.to_string()))?;
+                        Ok::<_, HashTreeError>((node_cid, node_path, data))
+                    };
+                    active.push(fut);
+                } else {
+                    break;
+                }
+            }
+
+            // If nothing active, we're done
+            if active.is_empty() {
+                break;
+            }
+
+            // Wait for any future to complete
+            if let Some(result) = active.next().await {
+                let (node_cid, node_path, data) = result?;
+
+                let data = match data {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                // Decrypt if key is present
+                let data = if let Some(key) = &node_cid.key {
+                    decrypt_chk(&data, key).map_err(|e| HashTreeError::Decryption(e.to_string()))?
+                } else {
+                    data
+                };
+
+                let node = match try_decode_tree_node(&data) {
+                    Some(n) => n,
+                    None => {
+                        // It's a blob/file
+                        entries.push(WalkEntry {
+                            path: node_path,
+                            hash: node_cid.hash,
+                            link_type: LinkType::Blob,
+                            size: data.len() as u64,
+                            key: node_cid.key,
+                        });
+                        continue;
+                    }
+                };
+
+                // It's a directory node
+                let node_size: u64 = node.links.iter().map(|l| l.size).sum();
+                entries.push(WalkEntry {
+                    path: node_path.clone(),
+                    hash: node_cid.hash,
+                    link_type: node.node_type,
+                    size: node_size,
+                    key: node_cid.key,
+                });
+
+                // Queue children
+                for link in &node.links {
+                    let child_path = match &link.name {
+                        Some(name) => {
+                            if name.starts_with("_chunk_") || name.starts_with('_') {
+                                // Internal chunked nodes - inherit parent's key, same path
+                                let sub_cid = Cid { hash: link.hash, key: node_cid.key, size: 0 };
+                                pending.push_back((sub_cid, node_path.clone()));
+                                continue;
+                            }
+                            if node_path.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{}/{}", node_path, name)
+                            }
+                        }
+                        None => node_path.clone(),
+                    };
+
+                    let child_cid = Cid { hash: link.hash, key: link.key, size: link.size };
+                    pending.push_back((child_cid, child_path));
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Walk tree as stream
     pub fn walk_stream(
         &self,
