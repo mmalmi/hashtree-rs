@@ -236,7 +236,27 @@ pub async fn serve_content_or_blob(
     // Check if it looks like a SHA256 hash (64 hex chars)
     let is_sha256 = hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit());
 
-    // Always try direct CID/hash lookup first
+    // Try raw blob lookup first (for hashtree chunks / git objects)
+    // This takes priority over file tree serving to avoid returning reassembled
+    // file content when the caller expects raw chunk data
+    if is_sha256 {
+        let hash_hex = hash_part.to_lowercase();
+        if let Ok(hash_bytes) = from_hex(&hash_hex) {
+            if let Ok(Some(data)) = state.store.get_blob(&hash_bytes) {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_LENGTH, data.len())
+                    .header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL)
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(data))
+                    .unwrap()
+                    .into_response();
+            }
+        }
+    }
+
+    // Try file tree lookup (serves reassembled file content)
     // (hashtree hashes are 64 hex chars, same as blossom SHA256)
     if let Ok(hash) = from_hex(&id) {
         if state.store.get_file_chunk_metadata(&hash).ok().flatten().is_some() {

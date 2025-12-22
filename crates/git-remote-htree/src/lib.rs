@@ -146,6 +146,8 @@ fn run() -> Result<()> {
             Ok(None) => {}
             Err(e) => {
                 warn!("Command error: {}", e);
+                // Exit on error to avoid hanging
+                return Err(e);
             }
         }
 
