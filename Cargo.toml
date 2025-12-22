@@ -27,14 +27,14 @@ tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
 futures = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 
-# Internal (path for local dev)
-hashtree-core = { path = "crates/hashtree-core" }
-hashtree-lmdb = { path = "crates/hashtree-lmdb" }
-hashtree-s3 = { path = "crates/hashtree-s3" }
-hashtree-blossom = { path = "crates/hashtree-blossom" }
-hashtree-sim = { path = "crates/hashtree-sim" }
-hashtree-resolver = { path = "crates/hashtree-resolver" }
-hashtree-config = { path = "crates/hashtree-config" }
+# Internal (path for local dev, version for publishing)
+hashtree-core = { version = "0.1.5", path = "crates/hashtree-core" }
+hashtree-lmdb = { version = "0.1.5", path = "crates/hashtree-lmdb" }
+hashtree-s3 = { version = "0.1.5", path = "crates/hashtree-s3" }
+hashtree-blossom = { version = "0.1.5", path = "crates/hashtree-blossom" }
+hashtree-sim = { version = "0.1.5", path = "crates/hashtree-sim" }
+hashtree-resolver = { version = "0.1.5", path = "crates/hashtree-resolver" }
+hashtree-config = { version = "0.1.5", path = "crates/hashtree-config" }
 
 # AWS S3
 aws-sdk-s3 = "1"
