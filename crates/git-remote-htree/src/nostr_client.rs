@@ -454,8 +454,7 @@ impl NostrClient {
             .max_by_key(|e| e.created_at);
 
         let Some(event) = event else {
-            debug!("No hashtree event found for {}", repo_name);
-            return Ok((HashMap::new(), None, None));
+            anyhow::bail!("Repository '{}' not found (no hashtree event published by {})", repo_name, &self.pubkey[..12]);
         };
 
         // Get root hash from content or "hash" tag
@@ -529,12 +528,11 @@ impl NostrClient {
     async fn fetch_refs_from_hashtree(&self, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> Result<HashMap<String, String>> {
         let mut refs = HashMap::new();
 
-        // Download root directory from Blossom
-        let root_data = match self.blossom.try_download(root_hash).await {
-            Some(data) => data,
-            None => {
-                debug!("Could not download root hash {} from Blossom", root_hash);
-                return Ok(refs);
+        // Download root directory from Blossom - propagate errors properly
+        let root_data = match self.blossom.download(root_hash).await {
+            Ok(data) => data,
+            Err(e) => {
+                anyhow::bail!("Failed to download root hash {}: {}", &root_hash[..12.min(root_hash.len())], e);
             }
         };
 
@@ -557,11 +555,10 @@ impl NostrClient {
         };
 
         // Download .git directory
-        let git_data = match self.blossom.try_download(&git_hash).await {
-            Some(data) => data,
-            None => {
-                debug!("Could not download .git directory");
-                return Ok(refs);
+        let git_data = match self.blossom.download(&git_hash).await {
+            Ok(data) => data,
+            Err(e) => {
+                anyhow::bail!("Failed to download .git directory ({}): {}", &git_hash[..12], e);
             }
         };
 

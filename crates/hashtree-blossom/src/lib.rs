@@ -188,6 +188,7 @@ impl BlossomClient {
     ///
     /// For small files (<256KB), skips existence check and relies on server returning 409.
     /// For large files (>=256KB), does HEAD check first to save bandwidth.
+    /// Retries up to 3 times with exponential backoff on transient failures.
     pub async fn upload_if_missing(&self, data: &[u8]) -> Result<(String, bool), BlossomError> {
         if self.write_servers.is_empty() {
             return Err(BlossomError::NoServers);
@@ -207,27 +208,44 @@ impl BlossomClient {
             return Ok((hash, false));
         }
 
-        // Try to upload directly - server returns 409 if already exists
-        let auth_header = self.create_upload_auth(&hash).await?;
+        const MAX_RETRIES: u32 = 3;
+        let mut last_error = String::new();
 
-        for server in &self.write_servers {
-            match self.upload_to_server(server, data, &hash, &auth_header).await {
-                Ok(was_new) => {
-                    if was_new {
-                        debug!("Uploaded {} to {}", &hash[..12], server);
-                    } else {
-                        debug!("Blob {} already exists on {}", &hash[..12], server);
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                // Exponential backoff: 100ms, 200ms, 400ms
+                let delay = Duration::from_millis(100 * (1 << (attempt - 1)));
+                debug!("Retrying upload {} (attempt {}/{}), waiting {:?}",
+                       &hash[..12], attempt + 1, MAX_RETRIES, delay);
+                tokio::time::sleep(delay).await;
+            }
+
+            // Regenerate auth header for each retry (in case of expiration)
+            let auth_header = self.create_upload_auth(&hash).await?;
+
+            for server in &self.write_servers {
+                match self.upload_to_server(server, data, &hash, &auth_header).await {
+                    Ok(was_new) => {
+                        if was_new {
+                            debug!("Uploaded {} to {}", &hash[..12], server);
+                        } else {
+                            debug!("Blob {} already exists on {}", &hash[..12], server);
+                        }
+                        return Ok((hash, was_new));
                     }
-                    return Ok((hash, was_new));
-                }
-                Err(e) => {
-                    warn!("Upload to {} failed: {}", server, e);
-                    continue;
+                    Err(e) => {
+                        last_error = format!("{}: {}", server, e);
+                        warn!("Upload to {} failed: {}", server, e);
+                        continue;
+                    }
                 }
             }
         }
 
-        Err(BlossomError::UploadFailed("all servers failed".to_string()))
+        Err(BlossomError::UploadFailed(format!(
+            "all servers failed after {} retries (last: {})",
+            MAX_RETRIES, last_error
+        )))
     }
 
     /// Check if a blob exists on any read server
