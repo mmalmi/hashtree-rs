@@ -215,14 +215,7 @@ impl RemoteHelper {
                 self.write_git_object(&oid, &data)?;
             }
         } else {
-            // Fallback to original per-ref fetch (will likely fail)
-            for spec in &self.fetch_specs {
-                debug!("Fetching {} ({})", spec.name, spec.sha);
-                let objects = self.fetch_objects_via_htree(&spec.sha)?;
-                for (oid, data) in objects {
-                    self.write_git_object(&oid, &data)?;
-                }
-            }
+            bail!("No root hash found for repository - cannot fetch");
         }
 
         // Update local refs to point to the fetched commits
@@ -411,40 +404,6 @@ impl RemoteHelper {
 
         info!("Fetched {} git objects from hashtree", objects.len());
         Ok(objects)
-    }
-
-    /// Fetch objects using htree CLI (which has file server fallback)
-    fn fetch_objects_via_htree(&self, root_hash: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        // First, try to get the root hash content via htree get
-        let output = Command::new("htree")
-            .args(["get", root_hash])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                // htree get outputs raw content - for git repos this is the tree structure
-                // Parse and recursively fetch git objects
-                let content = out.stdout;
-                debug!("Fetched {} bytes for {}", content.len(), root_hash);
-
-                // The hashtree stores git objects - return them for unpacking
-                // TODO: Parse the hashtree structure to get individual git objects
-                // For now, return empty - needs full implementation
-                Ok(vec![])
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                debug!("htree get failed for {}: {}", root_hash, stderr);
-                // Not found locally or on file servers
-                Ok(vec![])
-            }
-            Err(e) => {
-                warn!("Failed to run htree get: {}", e);
-                Ok(vec![])
-            }
-        }
     }
 
     /// Write loose object to local git object store
