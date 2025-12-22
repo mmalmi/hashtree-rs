@@ -47,11 +47,11 @@ relays = []
         std::fs::write(config_dir.join("config.toml"), config_content)
             .expect("Failed to write config");
 
-        // Generate and write nsec
+        // Generate and write keys file
         let keys = Keys::generate();
         let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
-        std::fs::write(config_dir.join("nsec"), &nsec)
-            .expect("Failed to write nsec");
+        std::fs::write(config_dir.join("keys"), &nsec)
+            .expect("Failed to write keys");
 
         let process = Command::new(htree_bin)
             .arg("--data-dir")

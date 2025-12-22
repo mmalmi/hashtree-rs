@@ -3,7 +3,6 @@ use nostr::nips::nip19::{FromBech32, ToBech32};
 use nostr::{Keys, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -190,7 +189,7 @@ fn default_enable_webrtc() -> bool {
 }
 
 fn default_data_dir() -> String {
-    get_hashtree_dir()
+    hashtree_config::get_hashtree_dir()
         .join("data")
         .to_string_lossy()
         .to_string()
@@ -299,27 +298,8 @@ impl Config {
     }
 }
 
-/// Get the hashtree directory (~/.hashtree)
-pub fn get_hashtree_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".hashtree")
-}
-
-/// Get the config file path (~/.hashtree/config.toml)
-pub fn get_config_path() -> PathBuf {
-    get_hashtree_dir().join("config.toml")
-}
-
-/// Get the auth cookie path (~/.hashtree/auth.cookie)
-pub fn get_auth_cookie_path() -> PathBuf {
-    get_hashtree_dir().join("auth.cookie")
-}
-
-/// Get the nsec file path (~/.hashtree/nsec)
-pub fn get_nsec_path() -> PathBuf {
-    get_hashtree_dir().join("nsec")
-}
+// Re-export path functions from hashtree_config
+pub use hashtree_config::{get_auth_cookie_path, get_config_path, get_hashtree_dir, get_keys_path};
 
 /// Generate and save auth cookie if it doesn't exist
 pub fn ensure_auth_cookie() -> Result<(String, String)> {
@@ -346,59 +326,59 @@ pub fn read_auth_cookie() -> Result<(String, String)> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-/// Ensure nsec exists, generating one if not present
+/// Ensure keys file exists, generating one if not present
 /// Returns (Keys, was_generated)
-pub fn ensure_nsec() -> Result<(Keys, bool)> {
-    let nsec_path = get_nsec_path();
+pub fn ensure_keys() -> Result<(Keys, bool)> {
+    let keys_path = get_keys_path();
 
-    if nsec_path.exists() {
-        let nsec_str = fs::read_to_string(&nsec_path)
-            .context("Failed to read nsec file")?;
+    if keys_path.exists() {
+        let nsec_str = fs::read_to_string(&keys_path)
+            .context("Failed to read keys file")?;
         let nsec_str = nsec_str.trim();
         let secret_key = SecretKey::from_bech32(nsec_str)
             .context("Invalid nsec format")?;
         let keys = Keys::new(secret_key);
         Ok((keys, false))
     } else {
-        let keys = generate_nsec()?;
+        let keys = generate_keys()?;
         Ok((keys, true))
     }
 }
 
-/// Read existing nsec
-pub fn read_nsec() -> Result<Keys> {
-    let nsec_path = get_nsec_path();
-    let nsec_str = fs::read_to_string(&nsec_path)
-        .context("Failed to read nsec file")?;
+/// Read existing keys
+pub fn read_keys() -> Result<Keys> {
+    let keys_path = get_keys_path();
+    let nsec_str = fs::read_to_string(&keys_path)
+        .context("Failed to read keys file")?;
     let nsec_str = nsec_str.trim();
     let secret_key = SecretKey::from_bech32(nsec_str)
         .context("Invalid nsec format")?;
     Ok(Keys::new(secret_key))
 }
 
-/// Get nsec string, ensuring it exists (generate if needed)
+/// Get nsec string, ensuring keys file exists (generate if needed)
 /// Returns (nsec_string, was_generated)
-pub fn ensure_nsec_string() -> Result<(String, bool)> {
-    let nsec_path = get_nsec_path();
+pub fn ensure_keys_string() -> Result<(String, bool)> {
+    let keys_path = get_keys_path();
 
-    if nsec_path.exists() {
-        let nsec_str = fs::read_to_string(&nsec_path)
-            .context("Failed to read nsec file")?;
+    if keys_path.exists() {
+        let nsec_str = fs::read_to_string(&keys_path)
+            .context("Failed to read keys file")?;
         Ok((nsec_str.trim().to_string(), false))
     } else {
-        let keys = generate_nsec()?;
+        let keys = generate_keys()?;
         let nsec = keys.secret_key().to_bech32()
             .context("Failed to encode nsec")?;
         Ok((nsec, true))
     }
 }
 
-/// Generate new nsec and save to file
-pub fn generate_nsec() -> Result<Keys> {
-    let nsec_path = get_nsec_path();
+/// Generate new keys and save to file
+pub fn generate_keys() -> Result<Keys> {
+    let keys_path = get_keys_path();
 
     // Ensure parent directory exists
-    if let Some(parent) = nsec_path.parent() {
+    if let Some(parent) = keys_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
@@ -408,14 +388,14 @@ pub fn generate_nsec() -> Result<Keys> {
         .context("Failed to encode nsec")?;
 
     // Save to file
-    fs::write(&nsec_path, &nsec)?;
+    fs::write(&keys_path, &nsec)?;
 
     // Set permissions to 0600 (owner read/write only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&nsec_path, perms)?;
+        fs::set_permissions(&keys_path, perms)?;
     }
 
     Ok(keys)

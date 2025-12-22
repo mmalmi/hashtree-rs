@@ -122,36 +122,6 @@ pub fn load_keys() -> Vec<StoredKey> {
         }
     }
 
-    // Legacy: single-key files
-    if keys.is_empty() {
-        let home = dirs::home_dir().unwrap_or_default();
-        let legacy_paths = [
-            hashtree_config::get_nsec_path(),
-            home.join(".config/nostr/secret"),
-            home.join(".nostr/secret"),
-            home.join(".config/git-remote-htree/secret"),
-        ];
-
-        for path in legacy_paths {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let key_str = content.trim();
-                let key = if key_str.starts_with("nsec1") {
-                    StoredKey::from_nsec(key_str, Some("default".to_string()))
-                } else if key_str.len() == 64 {
-                    StoredKey::from_secret_hex(key_str, Some("default".to_string()))
-                } else {
-                    continue;
-                };
-
-                if let Ok(k) = key {
-                    debug!("Loaded legacy key from {:?}: pubkey={}", path, k.pubkey_hex);
-                    keys.push(k);
-                    break;
-                }
-            }
-        }
-    }
-
     keys
 }
 
@@ -880,16 +850,6 @@ impl NostrClient {
     #[allow(dead_code)]
     pub async fn try_download_blob(&self, hash: &str) -> Option<Vec<u8>> {
         self.blossom.try_download(hash).await
-    }
-}
-
-mod dirs {
-    use std::path::PathBuf;
-
-    pub fn home_dir() -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
     }
 }
 

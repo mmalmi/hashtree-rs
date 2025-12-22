@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hashtree_cli::config::{ensure_auth_cookie, ensure_nsec, ensure_nsec_string, parse_npub, pubkey_bytes};
+use hashtree_cli::config::{ensure_auth_cookie, ensure_keys, ensure_keys_string, parse_npub, pubkey_bytes};
 use hashtree_cli::{
     BackgroundSync, Config, HashtreeServer, HashtreeStore,
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RootResolver,
@@ -277,7 +277,7 @@ async fn main() -> Result<()> {
             let store = Arc::new(HashtreeStore::with_options(&data_dir, config.storage.s3.as_ref(), max_size_bytes)?);
 
             // Ensure nsec exists (generate if needed)
-            let (keys, was_generated) = ensure_nsec()?;
+            let (keys, was_generated) = ensure_keys()?;
             let pk_bytes = pubkey_bytes(&keys);
             let npub = keys.public_key().to_bech32()
                 .context("Failed to encode npub")?;
@@ -574,7 +574,7 @@ async fn main() -> Result<()> {
 
                 // Index tree for eviction tracking (own content = highest priority)
                 // Get user's npub as owner
-                let (nsec_str, _) = ensure_nsec_string()?;
+                let (nsec_str, _) = ensure_keys_string()?;
                 let keys = NostrKeys::parse(&nsec_str)
                     .context("Failed to parse nsec")?;
                 let npub = NostrToBech32::to_bech32(&keys.public_key())
@@ -604,7 +604,7 @@ async fn main() -> Result<()> {
                     let config = Config::load()?;
 
                     // Ensure nsec exists (generate if needed)
-                    let (nsec_str, was_generated) = ensure_nsec_string()?;
+                    let (nsec_str, was_generated) = ensure_keys_string()?;
 
                     // Create Keys using nostr-sdk's version (via NostrKeys re-export)
                     let keys = NostrKeys::parse(&nsec_str)
@@ -848,14 +848,14 @@ async fn main() -> Result<()> {
                 gc_stats.freed_bytes as f64 / 1024.0);
         }
         Commands::User { identity } => {
-            use hashtree_cli::config::get_nsec_path;
+            use hashtree_cli::config::get_keys_path;
             use nostr::nips::nip19::FromBech32;
             use std::fs;
 
             match identity {
                 None => {
                     // Show current identity
-                    let (keys, was_generated) = ensure_nsec()?;
+                    let (keys, was_generated) = ensure_keys()?;
                     let npub = keys.public_key().to_bech32()?;
                     if was_generated {
                         eprintln!("Generated new identity");
@@ -873,18 +873,18 @@ async fn main() -> Result<()> {
                         anyhow::bail!("Identity must be an nsec (secret key). Use 'htree user' to see your current npub.");
                     };
 
-                    // Save to nsec file
-                    let nsec_path = get_nsec_path();
-                    if let Some(parent) = nsec_path.parent() {
+                    // Save to keys file
+                    let keys_path = get_keys_path();
+                    if let Some(parent) = keys_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    fs::write(&nsec_path, &nsec)?;
+                    fs::write(&keys_path, &nsec)?;
 
                     // Set permissions to 0600
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        fs::set_permissions(&nsec_path, fs::Permissions::from_mode(0o600))?;
+                        fs::set_permissions(&keys_path, fs::Permissions::from_mode(0o600))?;
                     }
 
                     // Show the new npub
@@ -902,7 +902,7 @@ async fn main() -> Result<()> {
             let config = Config::load()?;
 
             // Ensure nsec exists (generate if needed)
-            let (nsec_str, was_generated) = ensure_nsec_string()?;
+            let (nsec_str, was_generated) = ensure_keys_string()?;
 
             // Create Keys using nostr-sdk's version
             let keys = NostrKeys::parse(&nsec_str)
@@ -1143,7 +1143,7 @@ async fn follow_user(data_dir: &PathBuf, npub_str: &str, follow: bool) -> Result
     let config = Config::load()?;
 
     // Ensure nsec exists
-    let (nsec_str, _) = ensure_nsec_string()?;
+    let (nsec_str, _) = ensure_keys_string()?;
     let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
 
     // Parse target npub
@@ -1271,7 +1271,7 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
     }
 
     // Ensure nsec exists for signing
-    let (nsec_str, _) = ensure_nsec_string()?;
+    let (nsec_str, _) = ensure_keys_string()?;
     let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
 
     // Open local store
@@ -1456,7 +1456,7 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
     };
 
     // Ensure nsec exists for signing
-    let (nsec_str, _) = ensure_nsec_string()?;
+    let (nsec_str, _) = ensure_keys_string()?;
     let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
 
     // Open local store

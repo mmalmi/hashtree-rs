@@ -298,11 +298,6 @@ pub fn get_keys_path() -> PathBuf {
     get_hashtree_dir().join("keys")
 }
 
-/// Get the nsec file path (~/.hashtree/nsec)
-pub fn get_nsec_path() -> PathBuf {
-    get_hashtree_dir().join("nsec")
-}
-
 /// Get the auth cookie path (~/.hashtree/auth.cookie)
 pub fn get_auth_cookie_path() -> PathBuf {
     get_hashtree_dir().join("auth.cookie")

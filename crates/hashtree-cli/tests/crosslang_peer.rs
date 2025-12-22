@@ -56,10 +56,10 @@ crawl_depth = 0
         println!("CROSSLANG_CONFIG_WRITTEN:{}", config_path.display());
         println!("CROSSLANG_CONFIG_CONTENT:{}", config_content.replace('\n', " "));
 
-        // Write pre-generated nsec key
+        // Write pre-generated keys file
         let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
-        std::fs::write(config_dir.join("nsec"), &nsec)
-            .expect("Failed to write nsec");
+        std::fs::write(config_dir.join("keys"), &nsec)
+            .expect("Failed to write keys");
 
         // Write contacts.json with pubkeys to follow (for WebRTC peer classification)
         if !follow_pubkeys.is_empty() {
