@@ -1226,8 +1226,21 @@ impl<S: Store> HashTree<S> {
     /// Walk entire tree with parallel fetching
     /// Uses a work-stealing approach: always keeps `concurrency` requests in flight
     pub async fn walk_parallel(&self, cid: &Cid, path: &str, concurrency: usize) -> Result<Vec<WalkEntry>, HashTreeError> {
+        self.walk_parallel_with_progress(cid, path, concurrency, None).await
+    }
+
+    /// Walk entire tree with parallel fetching and optional progress counter
+    /// The counter is incremented for each node fetched (not just entries found)
+    pub async fn walk_parallel_with_progress(
+        &self,
+        cid: &Cid,
+        path: &str,
+        concurrency: usize,
+        progress: Option<&std::sync::atomic::AtomicUsize>,
+    ) -> Result<Vec<WalkEntry>, HashTreeError> {
         use futures::stream::{FuturesUnordered, StreamExt};
         use std::collections::VecDeque;
+        use std::sync::atomic::Ordering;
 
         let mut entries = Vec::new();
         let mut pending: VecDeque<(Cid, String)> = VecDeque::new();
@@ -1260,6 +1273,11 @@ impl<S: Store> HashTree<S> {
             // Wait for any future to complete
             if let Some(result) = active.next().await {
                 let (node_cid, node_path, data) = result?;
+
+                // Update progress counter
+                if let Some(counter) = progress {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
 
                 let data = match data {
                     Some(d) => d,

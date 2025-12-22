@@ -305,24 +305,47 @@ impl RemoteHelper {
 
         use futures::stream::{self, StreamExt};
         use std::io::Write;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
         use std::sync::Arc as StdArc;
         use hashtree_core::LinkType;
 
-        // Walk the objects tree with parallel fetching
-        eprint!("  Loading objects tree...");
-        let _ = std::io::stderr().flush();
+        // Walk the objects tree with parallel fetching and progress reporting
+        let progress = StdArc::new(AtomicUsize::new(0));
+        let done = StdArc::new(AtomicBool::new(false));
+
+        // Spawn progress reporter
+        let progress_clone = progress.clone();
+        let done_clone = done.clone();
+        let progress_task = tokio::spawn(async move {
+            let mut last = 0;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                if done_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                let current = progress_clone.load(Ordering::Relaxed);
+                if current != last {
+                    eprint!("\r  Loading objects tree... {} nodes", current);
+                    let _ = std::io::stderr().flush();
+                    last = current;
+                }
+            }
+        });
 
         const WALK_CONCURRENCY: usize = 32;
-        let walk_entries = match tree.walk_parallel(&objects_cid, "", WALK_CONCURRENCY).await {
+        let walk_entries = match tree.walk_parallel_with_progress(&objects_cid, "", WALK_CONCURRENCY, Some(&progress)).await {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!(" failed: {}", e);
+                done.store(true, Ordering::Relaxed);
+                let _ = progress_task.await;
+                eprintln!("\r  Loading objects tree... failed: {}", e);
                 warn!("Failed to walk objects directory: {}", e);
                 return Ok(objects);
             }
         };
-        eprintln!(" done ({} entries)", walk_entries.len());
+        done.store(true, Ordering::Relaxed);
+        let _ = progress_task.await;
+        eprintln!("\r  Loading objects tree... done ({} entries)        ", walk_entries.len());
 
         // Extract git objects from walk entries (files with 40 char hex names like "ab/cdef..." -> "abcdef...")
         let mut fetch_tasks: Vec<(String, Cid)> = Vec::new();
