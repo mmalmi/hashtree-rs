@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/mmalmi/hashtree-rs"
@@ -28,6 +28,7 @@ futures = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 
 # Internal (path for local dev, version for publishing)
+<<<<<<< HEAD
 hashtree-core = { version = "0.1.6", path = "crates/hashtree-core" }
 hashtree-lmdb = { version = "0.1.6", path = "crates/hashtree-lmdb" }
 hashtree-s3 = { version = "0.1.6", path = "crates/hashtree-s3" }
@@ -35,6 +36,15 @@ hashtree-blossom = { version = "0.1.6", path = "crates/hashtree-blossom" }
 hashtree-sim = { version = "0.1.6", path = "crates/hashtree-sim" }
 hashtree-resolver = { version = "0.1.6", path = "crates/hashtree-resolver" }
 hashtree-config = { version = "0.1.6", path = "crates/hashtree-config" }
+=======
+hashtree-core = { version = "0.1.7", path = "crates/hashtree-core" }
+hashtree-lmdb = { version = "0.1.7", path = "crates/hashtree-lmdb" }
+hashtree-s3 = { version = "0.1.7", path = "crates/hashtree-s3" }
+hashtree-blossom = { version = "0.1.7", path = "crates/hashtree-blossom" }
+hashtree-sim = { version = "0.1.7", path = "crates/hashtree-sim" }
+hashtree-resolver = { version = "0.1.7", path = "crates/hashtree-resolver" }
+hashtree-config = { version = "0.1.7", path = "crates/hashtree-config" }
+>>>>>>> 314bfa6 (Fix large directory chunking to use transparent file chunking)
 
 # AWS S3
 aws-sdk-s3 = "1"

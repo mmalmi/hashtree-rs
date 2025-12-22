@@ -18,7 +18,7 @@ path = "src/git_remote.rs"
 
 [dependencies]
 # Git remote helper
-git-remote-htree = { version = "0.1.6", path = "../git-remote-htree" }
+git-remote-htree = { version = "0.1.7", path = "../git-remote-htree" }
 
 # Core hashtree crates
 hashtree-core.workspace = true

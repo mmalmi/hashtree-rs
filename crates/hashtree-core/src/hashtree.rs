@@ -570,6 +570,9 @@ impl<S: Store> HashTree<S> {
 
     /// Build a directory from entries
     /// Returns Cid with key if encrypted
+    ///
+    /// For large directories, the messagepack-encoded TreeNode is stored via put()
+    /// which automatically chunks the data. The reader uses read_file() to reassemble.
     pub async fn put_directory(
         &self,
         entries: Vec<DirEntry>,
@@ -592,22 +595,19 @@ impl<S: Store> HashTree<S> {
 
         let total_size: u64 = links.iter().map(|l| l.size).sum();
 
-        // Fits in one node
-        if links.len() <= self.max_links {
-            let node = TreeNode {
-                node_type: LinkType::Dir,
-                links,
-            };
-            let (data, _plain_hash) = encode_and_hash(&node)?;
+        // Create the directory node with all entries
+        let node = TreeNode {
+            node_type: LinkType::Dir,
+            links,
+        };
+        let (data, _plain_hash) = encode_and_hash(&node)?;
 
-            // Encrypt directory data if encryption is enabled
-            let (hash, key) = self.put_chunk_internal(&data).await?;
-
-            return Ok(Cid { hash, key, size: total_size });
-        }
-
-        // Large directory - create sub-trees
-        self.build_directory_by_chunks(links, total_size).await
+        // Store directory data via put() - handles both small and large directories
+        // For small dirs, stores as single chunk
+        // For large dirs, chunks transparently via build_tree()
+        // Reader uses read_file() to reassemble before decoding
+        let cid = self.put(&data).await?;
+        Ok(Cid { hash: cid.hash, key: cid.key, size: total_size })
     }
 
     /// Build a balanced tree from links
@@ -663,53 +663,6 @@ impl<S: Store> HashTree<S> {
 
         // Recursively build parent level
         Box::pin(self.build_tree(sub_trees, total_size)).await
-    }
-
-    /// Split directory into numeric chunks
-    /// Directory chunks are encrypted if encryption is enabled
-    async fn build_directory_by_chunks(
-        &self,
-        links: Vec<Link>,
-        total_size: u64,
-    ) -> Result<Cid, HashTreeError> {
-        let mut sub_trees: Vec<Link> = Vec::new();
-
-        for (i, batch) in links.chunks(self.max_links).enumerate() {
-            let batch_size: u64 = batch.iter().map(|l| l.size).sum();
-
-            let node = TreeNode {
-                node_type: LinkType::Dir,
-                links: batch.to_vec(),
-            };
-            let (data, _plain_hash) = encode_and_hash(&node)?;
-
-            // Encrypt directory chunk if encryption is enabled
-            let (hash, key) = self.put_chunk_internal(&data).await?;
-
-            sub_trees.push(Link {
-                hash,
-                name: Some(format!("_chunk_{}", i * self.max_links)),
-                size: batch_size,
-                key,
-                link_type: LinkType::Dir, // Internal chunk node
-                meta: None,
-            });
-        }
-
-        if sub_trees.len() <= self.max_links {
-            let node = TreeNode {
-                node_type: LinkType::Dir,
-                links: sub_trees,
-            };
-            let (data, _plain_hash) = encode_and_hash(&node)?;
-
-            // Encrypt root directory if encryption is enabled
-            let (hash, key) = self.put_chunk_internal(&data).await?;
-            return Ok(Cid { hash, key, size: total_size });
-        }
-
-        // Recursively build more levels
-        Box::pin(self.build_directory_by_chunks(sub_trees, total_size)).await
     }
 
     /// Create a tree node with custom links
@@ -775,6 +728,40 @@ impl<S: Store> HashTree<S> {
         }
 
         let node = decode_tree_node(&decrypted)?;
+        Ok(Some(node))
+    }
+
+    /// Get directory node, handling chunked directory data
+    /// Use this when you know the target is a directory (from parent link_type)
+    pub async fn get_directory_node(&self, cid: &Cid) -> Result<Option<TreeNode>, HashTreeError> {
+        let data = match self.store.get(&cid.hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Decrypt if key is present
+        let decrypted = if let Some(key) = &cid.key {
+            decrypt_chk(&data, key)
+                .map_err(|e| HashTreeError::Decryption(e.to_string()))?
+        } else {
+            data
+        };
+
+        if !is_tree_node(&decrypted) {
+            return Ok(None);
+        }
+
+        let node = decode_tree_node(&decrypted)?;
+
+        // If this is a file tree (chunked data), reassemble to get actual directory
+        if node.node_type == LinkType::File {
+            let assembled = self.assemble_chunks(&node).await?;
+            if is_tree_node(&assembled) {
+                let inner_node = decode_tree_node(&assembled)?;
+                return Ok(Some(inner_node));
+            }
+        }
+
         Ok(Some(node))
     }
 
@@ -1013,8 +1000,10 @@ impl<S: Store> HashTree<S> {
     }
 
     /// List directory entries using Cid (with decryption if key present)
+    /// Handles both regular and chunked directory data
     pub async fn list_directory(&self, cid: &Cid) -> Result<Vec<TreeEntry>, HashTreeError> {
-        let node = match self.get_node(cid).await? {
+        // Use get_directory_node which handles chunked directory data
+        let node = match self.get_directory_node(cid).await? {
             Some(n) => n,
             None => return Ok(vec![]),
         };
@@ -1022,7 +1011,7 @@ impl<S: Store> HashTree<S> {
         let mut entries = Vec::new();
 
         for link in &node.links {
-            // Skip internal chunk nodes
+            // Skip internal chunk nodes (backwards compat with old _chunk_ format)
             if let Some(ref name) = link.name {
                 if name.starts_with("_chunk_") || name.starts_with('_') {
                     // Internal nodes inherit parent's key for decryption
@@ -1056,8 +1045,8 @@ impl<S: Store> HashTree<S> {
         let mut current_cid = cid.clone();
 
         for part in parts {
-            // Use get_node which handles decryption when key is present
-            let node = match self.get_node(&current_cid).await? {
+            // Use get_directory_node which handles chunked directory data
+            let node = match self.get_directory_node(&current_cid).await? {
                 Some(n) => n,
                 None => return Ok(None),
             };
