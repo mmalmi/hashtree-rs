@@ -120,7 +120,7 @@ impl StorageRouter {
         // Create background sync channel
         let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<S3SyncMessage>();
 
-        // Spawn background sync task
+        // Spawn background sync task with bounded concurrent uploads
         let sync_client = s3_client.clone();
         let sync_bucket = bucket.clone();
         let sync_prefix = prefix.clone();
@@ -130,39 +130,56 @@ impl StorageRouter {
 
             tracing::info!("S3 background sync task started");
 
+            // Limit concurrent uploads to prevent overwhelming the runtime
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
+            let client = std::sync::Arc::new(sync_client);
+            let bucket = std::sync::Arc::new(sync_bucket);
+            let prefix = std::sync::Arc::new(sync_prefix);
+
             while let Some(msg) = sync_rx.recv().await {
-                match msg {
-                    S3SyncMessage::Upload { hash, data } => {
-                        let key = format!("{}{}.bin", sync_prefix, to_hex(&hash));
-                        tracing::info!("S3 uploading {} ({} bytes)", &key, data.len());
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let prefix = prefix.clone();
+                let semaphore = semaphore.clone();
 
-                        match sync_client
-                            .put_object()
-                            .bucket(&sync_bucket)
-                            .key(&key)
-                            .body(ByteStream::from(data))
-                            .send()
-                            .await
-                        {
-                            Ok(_) => tracing::info!("S3 upload succeeded for {}", &key),
-                            Err(e) => tracing::error!("S3 upload failed for {}: {}", &key, e),
+                // Spawn each upload with semaphore-bounded concurrency
+                tokio::spawn(async move {
+                    // Acquire permit before uploading
+                    let _permit = semaphore.acquire().await;
+
+                    match msg {
+                        S3SyncMessage::Upload { hash, data } => {
+                            let key = format!("{}{}.bin", prefix, to_hex(&hash));
+                            tracing::debug!("S3 uploading {} ({} bytes)", &key, data.len());
+
+                            match client
+                                .put_object()
+                                .bucket(bucket.as_str())
+                                .key(&key)
+                                .body(ByteStream::from(data))
+                                .send()
+                                .await
+                            {
+                                Ok(_) => tracing::debug!("S3 upload succeeded: {}", &key),
+                                Err(e) => tracing::error!("S3 upload failed {}: {}", &key, e),
+                            }
+                        }
+                        S3SyncMessage::Delete { hash } => {
+                            let key = format!("{}{}.bin", prefix, to_hex(&hash));
+                            tracing::debug!("S3 deleting {}", &key);
+
+                            if let Err(e) = client
+                                .delete_object()
+                                .bucket(bucket.as_str())
+                                .key(&key)
+                                .send()
+                                .await
+                            {
+                                tracing::error!("S3 delete failed {}: {}", &key, e);
+                            }
                         }
                     }
-                    S3SyncMessage::Delete { hash } => {
-                        let key = format!("{}{}.bin", sync_prefix, to_hex(&hash));
-                        tracing::debug!("S3 deleting {}", &key);
-
-                        if let Err(e) = sync_client
-                            .delete_object()
-                            .bucket(&sync_bucket)
-                            .key(&key)
-                            .send()
-                            .await
-                        {
-                            tracing::error!("S3 delete failed for {}: {}", &key[..16.min(key.len())], e);
-                        }
-                    }
-                }
+                });
             }
         });
 

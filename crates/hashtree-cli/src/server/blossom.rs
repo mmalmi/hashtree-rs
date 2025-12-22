@@ -715,17 +715,9 @@ fn store_blossom_blob(
     pubkey: &[u8; 32],
     track_ownership: bool,
 ) -> anyhow::Result<()> {
-    // Store as raw blob
+    // Store as raw blob only - no tree creation needed for blossom
+    // This avoids sync_block_on which can deadlock under load
     state.store.put_blob(data)?;
-
-    // Create a temporary file and upload through normal path for CID/DAG storage
-    let temp_dir = tempfile::tempdir()?;
-    let sha256_hex = hashtree_core::to_hex(sha256);
-    let temp_file = temp_dir.path().join(format!("{}.bin", sha256_hex));
-    std::fs::write(&temp_file, data)?;
-
-    // Don't auto-pin blossom uploads - they can be evicted like other synced content
-    let _cid = state.store.upload_file_no_pin(&temp_file)?;
 
     // Only track ownership for social graph members
     // Non-members can upload (if public_writes=true) but can't delete

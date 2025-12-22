@@ -558,13 +558,13 @@ impl RemoteHelper {
         let objects_with_content = self.read_git_objects_batch(&objects)?;
         eprintln!(); // Newline after reading progress
 
-        eprint!("  Writing to store...");
+        eprint!("  Writing to local store...");
         let _ = std::io::stderr().flush();
         let total = objects_with_content.len();
         for (i, (obj_type, content)) in objects_with_content.into_iter().enumerate() {
             self.storage.write_raw_object(obj_type, &content)?;
             if (i + 1) % 1000 == 0 || i + 1 == total {
-                eprint!("\r  Writing to store: {}/{}", i + 1, total);
+                eprint!("\r  Writing to local store: {}/{}", i + 1, total);
                 let _ = std::io::stderr().flush();
             }
         }
