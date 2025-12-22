@@ -681,12 +681,63 @@ impl RemoteHelper {
         };
 
         let success = rt.block_on(async {
-            let mut uploaded = 0usize;
-            let mut skipped = 0usize;
-            let mut failed = 0usize;
-            let mut processed = 0usize;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            use tokio::sync::mpsc;
 
-            // Walk tree and upload as we go
+            let uploaded = Arc::new(AtomicUsize::new(0));
+            let skipped = Arc::new(AtomicUsize::new(0));
+            let failed = Arc::new(AtomicUsize::new(0));
+            let processed = Arc::new(AtomicUsize::new(0));
+
+            // Channel for blobs to upload (bounded to limit memory)
+            const CHANNEL_SIZE: usize = 100;
+            const UPLOAD_CONCURRENCY: usize = 10;
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+
+            // Spawn upload workers
+            let upload_handle = {
+                let blossom = blossom.clone();
+                let uploaded = Arc::clone(&uploaded);
+                let skipped = Arc::clone(&skipped);
+                let failed = Arc::clone(&failed);
+                let processed = Arc::clone(&processed);
+
+                tokio::spawn(async move {
+                    use futures::stream::StreamExt;
+                    use tokio_stream::wrappers::ReceiverStream;
+
+                    let stream = ReceiverStream::new(rx);
+                    stream
+                        .map(|data| {
+                            let blossom = &blossom;
+                            let uploaded = Arc::clone(&uploaded);
+                            let skipped = Arc::clone(&skipped);
+                            let failed = Arc::clone(&failed);
+                            let processed = Arc::clone(&processed);
+                            async move {
+                                match blossom.upload_if_missing(&data).await {
+                                    Ok((_, true)) => { uploaded.fetch_add(1, Ordering::Relaxed); }
+                                    Ok((_, false)) => { skipped.fetch_add(1, Ordering::Relaxed); }
+                                    Err(_) => { failed.fetch_add(1, Ordering::Relaxed); }
+                                }
+                                let count = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if count == 1 || count % 10 == 0 {
+                                    eprint!("\r  Uploading: {} ({} new, {} exist)",
+                                        count,
+                                        uploaded.load(Ordering::Relaxed),
+                                        skipped.load(Ordering::Relaxed));
+                                    let _ = std::io::stderr().flush();
+                                }
+                            }
+                        })
+                        .buffer_unordered(UPLOAD_CONCURRENCY)
+                        .for_each(|_| async {})
+                        .await;
+                })
+            };
+
+            // Walk tree and send blobs to upload channel
             let mut visited: HashSet<[u8; 32]> = HashSet::new();
             let mut queue = vec![root_bytes];
 
@@ -700,7 +751,7 @@ impl RemoteHelper {
                 let data = match store.get_sync(&hash) {
                     Ok(Some(data)) => data,
                     _ => {
-                        failed += 1;
+                        failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 };
@@ -714,34 +765,31 @@ impl RemoteHelper {
                     }
                 }
 
-                // Upload this blob
-                match blossom.upload_if_missing(&data).await {
-                    Ok((_, true)) => { uploaded += 1; }
-                    Ok((_, false)) => { skipped += 1; }
-                    Err(e) => {
-                        debug!("Failed to upload blob {}: {}", hex::encode(&hash), e);
-                        failed += 1;
-                    }
-                }
-
-                processed += 1;
-                if processed == 1 || processed % 10 == 0 {
-                    eprint!("\r  Uploading: {} ({} new, {} exist)",
-                        processed, uploaded, skipped);
-                    let _ = std::io::stderr().flush();
+                // Send blob to upload channel (blocks if channel is full)
+                if tx.send(data).await.is_err() {
+                    break; // Channel closed
                 }
             }
 
+            // Close channel and wait for uploads to complete
+            drop(tx);
+            let _ = upload_handle.await;
+
+            let final_uploaded = uploaded.load(Ordering::Relaxed);
+            let final_skipped = skipped.load(Ordering::Relaxed);
+            let final_failed = failed.load(Ordering::Relaxed);
+            let final_processed = processed.load(Ordering::Relaxed);
+
             // Final progress
-            eprint!("\r  Uploading: {} ({} new, {} exist)", processed, uploaded, skipped);
+            eprint!("\r  Uploading: {} ({} new, {} exist)", final_processed, final_uploaded, final_skipped);
             eprintln!();
 
             info!(
                 "Blossom upload complete: {} uploaded, {} already existed, {} failed",
-                uploaded, skipped, failed
+                final_uploaded, final_skipped, final_failed
             );
 
-            uploaded > 0 || skipped > 0
+            final_uploaded > 0 || final_skipped > 0
         });
 
         if success { blossom_server_count } else { 0 }

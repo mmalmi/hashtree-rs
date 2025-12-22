@@ -55,6 +55,7 @@ pub enum BlossomError {
 }
 
 /// Blossom protocol client
+#[derive(Clone)]
 pub struct BlossomClient {
     keys: Keys,
     /// Servers for reading (download)
