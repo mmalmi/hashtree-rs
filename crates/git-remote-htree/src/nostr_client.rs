@@ -380,16 +380,19 @@ impl NostrClient {
             }
         }
 
-        // Connect and wait for at least one relay to connect
+        // Connect to relays - this starts async connection
         client.connect().await;
 
-        // Wait for relay connections (use half of timeout for connection, half for query)
-        let connect_timeout = Duration::from_secs(timeout_secs / 2).max(Duration::from_secs(1));
-        let query_timeout = Duration::from_secs(timeout_secs / 2).max(Duration::from_secs(1));
+        // Wait for at least one relay to connect (quick timeout - break immediately when one connects)
+        // Use shorter connect timeout (2s max) since we only need 1 relay
+        let connect_timeout = Duration::from_secs(2);
+        let query_timeout = Duration::from_secs(timeout_secs.saturating_sub(2).max(3));
 
         let start = std::time::Instant::now();
+        let mut last_log = std::time::Instant::now();
         loop {
             let relays = client.relays().await;
+            let total = relays.len();
             let mut connected = 0;
             for relay in relays.values() {
                 if relay.is_connected().await {
@@ -397,15 +400,20 @@ impl NostrClient {
                 }
             }
             if connected > 0 {
-                debug!("Connected to {} relay(s)", connected);
+                debug!("Connected to {}/{} relay(s) in {:?}", connected, total, start.elapsed());
                 break;
+            }
+            // Log progress every 500ms so user knows something is happening
+            if last_log.elapsed() > Duration::from_millis(500) {
+                debug!("Connecting to relays... (0/{} after {:?})", total, start.elapsed());
+                last_log = std::time::Instant::now();
             }
             if start.elapsed() > connect_timeout {
                 debug!("Timeout waiting for relay connections - treating as empty repo");
                 let _ = client.disconnect().await;
                 return Ok((HashMap::new(), None, None));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         // Build filter for kind 30078 events from this author with matching d-tag
