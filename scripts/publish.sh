@@ -67,8 +67,8 @@ publish_crate "hashtree-resolver"
 publish_crate "hashtree-webrtc"
 
 # Tier 5: Depends on multiple crates
-publish_crate "hashtree-cli"
 publish_crate "git-remote-htree"
+publish_crate "hashtree-cli"  # depends on git-remote-htree
 
 echo ""
 echo "=========================================="
