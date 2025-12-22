@@ -327,8 +327,7 @@ pub async fn head_blob(
     match state.store.get_cid_by_sha256(&sha256_bytes) {
         Ok(Some(root_hash)) => {
             // Get file size and mime type
-            let root_hex = hashtree_core::to_hex(&root_hash);
-            let (size, mime_type) = get_blob_metadata(&state, &root_hex, ext);
+            let (size, mime_type) = get_blob_metadata(&state, &root_hash, ext);
 
             Response::builder()
                 .status(StatusCode::OK)
@@ -692,10 +691,10 @@ fn is_valid_sha256(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn get_blob_metadata(state: &AppState, cid: &str, ext: Option<&str>) -> (u64, String) {
-    let size = from_hex(cid)
+fn get_blob_metadata(state: &AppState, hash: &[u8; 32], ext: Option<&str>) -> (u64, String) {
+    let size = state.store.get_file_chunk_metadata(hash)
         .ok()
-        .and_then(|hash| state.store.get_file_chunk_metadata(&hash).ok().flatten())
+        .flatten()
         .map(|m| m.total_size)
         .unwrap_or(0);
 

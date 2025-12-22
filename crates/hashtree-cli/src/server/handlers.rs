@@ -30,25 +30,11 @@ const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 /// Use false for mutable routes (npub/ref_name) where the reference can change.
 async fn serve_content_internal(
     state: &AppState,
-    cid: &str,
+    hash: &[u8; 32],
     headers: axum::http::HeaderMap,
     is_immutable: bool,
 ) -> Response<Body> {
     let store = &state.store;
-
-    // Parse CID to bytes early
-    let hash = match from_hex(cid) {
-        Ok(h) => h,
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(header::CONTENT_TYPE, "text/plain")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Body::from("Invalid CID format"))
-                .unwrap()
-                .into_response();
-        }
-    };
 
     // Always return raw bytes - no conversion to JSON/HTML
     // This is required for Blossom protocol compatibility
@@ -254,7 +240,7 @@ pub async fn serve_content_or_blob(
     // (hashtree hashes are 64 hex chars, same as blossom SHA256)
     if let Ok(hash) = from_hex(&id) {
         if state.store.get_file_chunk_metadata(&hash).ok().flatten().is_some() {
-            return serve_content_internal(&state, &id, headers, true).await;
+            return serve_content_internal(&state, &hash, headers, true).await;
         }
     }
 
@@ -263,8 +249,7 @@ pub async fn serve_content_or_blob(
         let sha256_hex = hash_part.to_lowercase();
         if let Ok(sha256_bytes) = from_hex(&sha256_hex) {
             if let Ok(Some(root_hash)) = state.store.get_cid_by_sha256(&sha256_bytes) {
-                let root_hex = to_hex(&root_hash);
-                return serve_content_internal(&state, &root_hex, headers, true).await;
+                return serve_content_internal(&state, &root_hash, headers, true).await;
             }
         }
     }
@@ -317,9 +302,8 @@ pub async fn serve_nhash(
 
     match nhash_decode(&nhash) {
         Ok(nhash_data) => {
-            let hash_hex = to_hex(&nhash_data.hash);
             // TODO: handle decryption key if present in nhash_data.decrypt_key
-            serve_content_internal(&state, &hash_hex, headers, true).await
+            serve_content_internal(&state, &nhash_data.hash, headers, true).await
         }
         Err(e) => {
             Response::builder()
@@ -367,9 +351,8 @@ pub async fn serve_npub(
     // npub routes are mutable - the reference can change over time
     match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
         Ok(Ok(cid)) => {
-            let hash_hex = to_hex(&cid.hash);
             let _ = resolver.stop().await;
-            serve_content_internal(&state, &hash_hex, headers, false).await
+            serve_content_internal(&state, &cid.hash, headers, false).await
         }
         Ok(Err(e)) => {
             let _ = resolver.stop().await;
@@ -649,9 +632,8 @@ pub async fn resolve_and_serve(
     // This is a mutable route (npub/treename can change over time)
     match tokio::time::timeout(HTTP_RESOLVER_TIMEOUT, resolver.resolve_wait(&key)).await {
         Ok(Ok(cid)) => {
-            let hash_hex = to_hex(&cid.hash);
             let _ = resolver.stop().await;
-            serve_content_internal(&state, &hash_hex, headers, false).await
+            serve_content_internal(&state, &cid.hash, headers, false).await
         }
         Ok(Err(e)) => {
             let _ = resolver.stop().await;
