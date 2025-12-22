@@ -16,6 +16,61 @@ use tracing::{debug, info, warn};
 use hashtree_config::Config;
 use crate::nostr_client::NostrClient;
 
+// CachedStore: LMDB first, then Blossom fallback
+mod cached_store {
+    use hashtree_blossom::BlossomStore;
+    use hashtree_core::{Hash, Store, StoreError};
+    use hashtree_lmdb::LmdbBlobStore;
+    use std::sync::Arc;
+
+    pub struct CachedStore {
+        lmdb: Arc<LmdbBlobStore>,
+        blossom: BlossomStore,
+    }
+
+    impl CachedStore {
+        pub fn new(lmdb: Arc<LmdbBlobStore>, blossom: BlossomStore) -> Self {
+            Self { lmdb, blossom }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Store for CachedStore {
+        async fn put(&self, hash: Hash, data: Vec<u8>) -> Result<bool, StoreError> {
+            // Store in LMDB locally
+            self.lmdb.put(hash, data).await
+        }
+
+        async fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+            // Try LMDB first
+            if let Ok(Some(data)) = self.lmdb.get(hash).await {
+                return Ok(Some(data));
+            }
+            // Fallback to Blossom
+            let result = self.blossom.get(hash).await;
+            // Cache in LMDB if found
+            if let Ok(Some(ref data)) = result {
+                let _ = self.lmdb.put(*hash, data.clone()).await;
+            }
+            result
+        }
+
+        async fn has(&self, hash: &Hash) -> Result<bool, StoreError> {
+            // Check LMDB first
+            if self.lmdb.has(hash).await? {
+                return Ok(true);
+            }
+            // Fallback to Blossom
+            self.blossom.has(hash).await
+        }
+
+        async fn delete(&self, hash: &Hash) -> Result<bool, StoreError> {
+            // Delete from LMDB only (don't delete from remote)
+            self.lmdb.delete(hash).await
+        }
+    }
+}
+
 /// Get the shared hashtree data directory
 fn get_hashtree_data_dir() -> PathBuf {
     hashtree_config::get_data_dir()
@@ -210,10 +265,21 @@ impl RemoteHelper {
             let objects = self.fetch_all_git_objects(root)?;
             info!("Downloaded {} git objects from hashtree", objects.len());
 
-            // Store in local git
-            for (oid, data) in objects {
+            // Store in local git with progress
+            let store_start = std::time::Instant::now();
+            let total = objects.len();
+            for (i, (oid, data)) in objects.into_iter().enumerate() {
                 self.write_git_object(&oid, &data)?;
+                let count = i + 1;
+                // Update every 50 items or show elapsed time every second
+                if count % 50 == 0 || count == total || count == 1 {
+                    let elapsed = store_start.elapsed().as_secs();
+                    eprint!("\r  Storing: {}/{} ({}s)    ", count, total, elapsed);
+                    let _ = std::io::stderr().flush();
+                }
             }
+            let store_elapsed = store_start.elapsed();
+            eprintln!("\r  Storing: {}/{} ({:.1?})    ", total, total, store_elapsed);
         } else {
             bail!("No root hash found for repository - cannot fetch");
         }
@@ -260,20 +326,31 @@ impl RemoteHelper {
     ) -> Result<Vec<(String, Vec<u8>)>> {
         use hashtree_blossom::BlossomStore;
         use hashtree_core::{Cid, HashTree, HashTreeConfig};
+        use hashtree_lmdb::LmdbBlobStore;
 
         let blossom = self.nostr.blossom();
         let mut objects = Vec::new();
 
         // Log the servers being used
         let servers = blossom.read_servers().to_vec();
-        info!("Creating BlossomStore with servers: {:?}", servers);
+        info!("Creating CachedStore with LMDB + Blossom (servers: {:?})", servers);
 
-        // Create a BlossomStore-backed HashTree for reading
-        // Use the same read servers from the existing blossom client
-        let store = BlossomStore::with_servers(
+        // Create LMDB store for local caching
+        let data_dir = get_hashtree_data_dir();
+        let lmdb_path = data_dir.join("blobs");
+        let lmdb = std::sync::Arc::new(
+            LmdbBlobStore::new(&lmdb_path)
+                .context("Failed to open LMDB store")?
+        );
+
+        // Create Blossom store for remote fallback
+        let blossom_store = BlossomStore::with_servers(
             nostr::Keys::generate(), // Temporary keys for read-only ops
             servers,
         );
+
+        // Create cached store: LMDB first, then Blossom
+        let store = cached_store::CachedStore::new(lmdb, blossom_store);
         let tree = HashTree::new(HashTreeConfig::new(std::sync::Arc::new(store)));
 
         // Parse root hash and create Cid with encryption key
@@ -345,6 +422,7 @@ impl RemoteHelper {
         };
         done.store(true, Ordering::Relaxed);
         let _ = progress_task.await;
+        let walk_done_time = std::time::Instant::now();
         eprintln!("\r  Loading objects tree... done ({} entries)        ", walk_entries.len());
 
         // Extract git objects from walk entries (files with 40 char hex names like "ab/cdef..." -> "abcdef...")
@@ -382,22 +460,46 @@ impl RemoteHelper {
         }
 
         let total_objects = fetch_tasks.len();
-        eprintln!("  Downloading {} git objects...", total_objects);
+        let prep_elapsed = walk_done_time.elapsed();
+        eprintln!("  Prepared {} objects in {:?}", total_objects, prep_elapsed);
+
+        let download_start = std::time::Instant::now();
         let downloaded = StdArc::new(AtomicUsize::new(0));
+        let download_done = StdArc::new(AtomicBool::new(false));
+
+        // Spawn elapsed time reporter (shows time even when downloads are slow)
+        let download_start_clone = download_start.clone();
+        let downloaded_clone = downloaded.clone();
+        let download_done_clone = download_done.clone();
+        let total_for_timer = total_objects;
+        let timer_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if download_done_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                let count = downloaded_clone.load(Ordering::Relaxed);
+                let elapsed = download_start_clone.elapsed().as_secs();
+                eprint!("\r  Downloading: {}/{} ({}s)    ", count, total_for_timer, elapsed);
+                let _ = std::io::stderr().flush();
+            }
+        });
 
         // Parallel fetch with concurrency limit
         const CONCURRENCY: usize = 20;
-        let results: Vec<Option<(String, Vec<u8>)>> = stream::iter(fetch_tasks)
+
+        // First pass: fetch all objects with normal timeout
+        let results: Vec<Result<(String, Vec<u8>), (String, Cid)>> = stream::iter(fetch_tasks)
             .map(|(oid, obj_cid)| {
                 let tree = &tree;
                 let downloaded = StdArc::clone(&downloaded);
                 async move {
-                    let result = tree.get(&obj_cid).await.ok().flatten().map(|content| (oid, content));
-                    let count = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 20 == 0 || count == total_objects {
-                        eprint!("\r  Downloading: {}/{}", count, total_objects);
-                        let _ = std::io::stderr().flush();
-                    }
+                    let result = match tree.get(&obj_cid).await {
+                        Ok(Some(content)) => Ok((oid, content)),
+                        Ok(None) => Err((oid, obj_cid)),
+                        Err(_) => Err((oid, obj_cid)),
+                    };
+                    downloaded.fetch_add(1, Ordering::Relaxed);
                     result
                 }
             })
@@ -405,12 +507,59 @@ impl RemoteHelper {
             .collect()
             .await;
 
-        eprintln!(); // Newline after progress
+        download_done.store(true, Ordering::Relaxed);
+        let _ = timer_task.await;
+        let download_elapsed = download_start.elapsed();
 
+        // Collect successes and failures
+        let mut failed: Vec<(String, Cid)> = Vec::new();
         for result in results {
-            if let Some((oid, content)) = result {
-                objects.push((oid, content));
+            match result {
+                Ok((oid, content)) => objects.push((oid, content)),
+                Err((oid, cid)) => failed.push((oid, cid)),
             }
+        }
+
+        let success_count = objects.len();
+        eprintln!("\r  Downloading: {}/{} ({:.1?})    ", success_count, total_objects, download_elapsed);
+
+        // Retry failed downloads sequentially
+        let mut missing_objects: Vec<(String, String)> = Vec::new(); // (oid, hash)
+        if !failed.is_empty() {
+            eprintln!("  Retrying {} failed downloads...", failed.len());
+            for (i, (oid, obj_cid)) in failed.iter().enumerate() {
+                let hash_hex = hex::encode(obj_cid.hash);
+                eprint!("\r  Retrying {}/{}: {}...    ", i + 1, failed.len(), oid);
+                let _ = std::io::stderr().flush();
+
+                match tree.get(obj_cid).await {
+                    Ok(Some(content)) => {
+                        objects.push((oid.clone(), content));
+                    }
+                    Ok(None) => {
+                        eprintln!("\n  ERROR: Object {} not found (hash: {})", oid, hash_hex);
+                        missing_objects.push((oid.clone(), hash_hex));
+                    }
+                    Err(e) => {
+                        eprintln!("\n  ERROR: Failed to fetch {}: {} (hash: {})", oid, e, hash_hex);
+                        missing_objects.push((oid.clone(), hash_hex));
+                    }
+                }
+            }
+            eprintln!("\r  Retried: {}/{} objects available        ", objects.len(), total_objects);
+        }
+
+        // Fail if any objects are missing - git clone will fail anyway
+        if !missing_objects.is_empty() {
+            let obj_list: Vec<String> = missing_objects.iter()
+                .take(5)
+                .map(|(oid, hash)| format!("{} ({})", oid, hash))
+                .collect();
+            bail!(
+                "Failed to fetch {} required git objects:\n  {}",
+                missing_objects.len(),
+                obj_list.join("\n  ")
+            );
         }
 
         info!("Fetched {} git objects from hashtree", objects.len());
@@ -697,7 +846,10 @@ impl RemoteHelper {
                                 match blossom.upload_if_missing(&data).await {
                                     Ok((_, true)) => { uploaded.fetch_add(1, Ordering::Relaxed); }
                                     Ok((_, false)) => { skipped.fetch_add(1, Ordering::Relaxed); }
-                                    Err(_) => { failed.fetch_add(1, Ordering::Relaxed); }
+                                    Err(e) => {
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                        eprintln!("\n  Upload failed ({} bytes): {}", data.len(), e);
+                                    }
                                 }
                                 let count = processed.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count == 1 || count % 10 == 0 {
@@ -718,6 +870,10 @@ impl RemoteHelper {
             // Walk tree and send blobs to upload channel
             let mut visited: HashSet<[u8; 32]> = HashSet::new();
             let mut queue = vec![root_bytes];
+            let mut queued_count = 0usize;
+
+            eprint!("  Uploading: 0");
+            let _ = std::io::stderr().flush();
 
             while let Some(hash) = queue.pop() {
                 if visited.contains(&hash) {
@@ -728,8 +884,14 @@ impl RemoteHelper {
                 // Load blob from store
                 let data = match store.get_sync(&hash) {
                     Ok(Some(data)) => data,
-                    _ => {
+                    Ok(None) => {
                         failed.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("\n  Missing from local store: {}", hex::encode(hash));
+                        continue;
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("\n  Store read error for {}: {}", hex::encode(hash), e);
                         continue;
                     }
                 };
@@ -747,6 +909,11 @@ impl RemoteHelper {
                 if tx.send(data).await.is_err() {
                     break; // Channel closed
                 }
+                queued_count += 1;
+                if queued_count % 100 == 0 {
+                    eprint!("\r  Uploading: {} queued", queued_count);
+                    let _ = std::io::stderr().flush();
+                }
             }
 
             // Close channel and wait for uploads to complete
@@ -759,7 +926,11 @@ impl RemoteHelper {
             let final_processed = processed.load(Ordering::Relaxed);
 
             // Final progress
-            eprint!("\r  Uploading: {} ({} new, {} exist)", final_processed, final_uploaded, final_skipped);
+            if final_failed > 0 {
+                eprint!("\r  Uploading: {} ({} new, {} exist, {} FAILED)", final_processed, final_uploaded, final_skipped, final_failed);
+            } else {
+                eprint!("\r  Uploading: {} ({} new, {} exist)", final_processed, final_uploaded, final_skipped);
+            }
             eprintln!();
 
             info!(

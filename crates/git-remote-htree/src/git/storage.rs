@@ -424,11 +424,12 @@ impl GitStorage {
             } else {
                 // Get blob content
                 if let Some((ObjectType::Blob, blob_content)) = self.get_object_content(&oid_hex, objects) {
-                    let blob_hash = self.tree.put_blob(&blob_content).await
+                    // Use put() instead of put_blob() to chunk large files
+                    let cid = self.tree.put(&blob_content).await
                         .map_err(|e| Error::StorageError(format!("put blob {}: {}", entry.name, e)))?;
 
                     entries.push(
-                        DirEntry::new(&entry.name, blob_hash)
+                        DirEntry::new(&entry.name, cid.hash)
                             .with_size(blob_content.len() as u64)
                     );
                 }
@@ -475,9 +476,11 @@ impl GitStorage {
         for (prefix, objs) in buckets {
             let mut sub_entries = Vec::new();
             for (suffix, data) in objs {
-                let hash = self.tree.put_blob(&data).await
+                // Use put() instead of put_blob() to chunk large objects
+                // Git blobs can be >5MB which exceeds blossom server limits
+                let cid = self.tree.put(&data).await
                     .map_err(|e| Error::StorageError(format!("put object {}{}: {}", prefix, suffix, e)))?;
-                sub_entries.push(DirEntry::new(suffix, hash).with_size(data.len() as u64));
+                sub_entries.push(DirEntry::new(suffix, cid.hash).with_size(data.len() as u64));
             }
             // Sort for deterministic ordering
             sub_entries.sort_by(|a, b| a.name.cmp(&b.name));

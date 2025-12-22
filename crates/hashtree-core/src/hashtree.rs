@@ -1231,6 +1231,10 @@ impl<S: Store> HashTree<S> {
 
     /// Walk entire tree with parallel fetching and optional progress counter
     /// The counter is incremented for each node fetched (not just entries found)
+    ///
+    /// OPTIMIZATION: Blobs are NOT fetched - their metadata (hash, size, link_type)
+    /// comes from the parent node's link, so we just add them directly to entries.
+    /// This avoids downloading file contents during tree traversal.
     pub async fn walk_parallel_with_progress(
         &self,
         cid: &Cid,
@@ -1294,7 +1298,7 @@ impl<S: Store> HashTree<S> {
                 let node = match try_decode_tree_node(&data) {
                     Some(n) => n,
                     None => {
-                        // It's a blob/file
+                        // It's a blob/file - this case only happens for root
                         entries.push(WalkEntry {
                             path: node_path,
                             hash: node_cid.hash,
@@ -1306,7 +1310,7 @@ impl<S: Store> HashTree<S> {
                     }
                 };
 
-                // It's a directory node
+                // It's a directory/file node
                 let node_size: u64 = node.links.iter().map(|l| l.size).sum();
                 entries.push(WalkEntry {
                     path: node_path.clone(),
@@ -1316,7 +1320,7 @@ impl<S: Store> HashTree<S> {
                     key: node_cid.key,
                 });
 
-                // Queue children
+                // Queue children - but DON'T fetch blobs, just add them directly
                 for link in &node.links {
                     let child_path = match &link.name {
                         Some(name) => {
@@ -1335,6 +1339,23 @@ impl<S: Store> HashTree<S> {
                         None => node_path.clone(),
                     };
 
+                    // OPTIMIZATION: If it's a blob, add entry directly without fetching
+                    // The link already contains all the metadata we need
+                    if link.link_type == LinkType::Blob {
+                        entries.push(WalkEntry {
+                            path: child_path,
+                            hash: link.hash,
+                            link_type: LinkType::Blob,
+                            size: link.size,
+                            key: link.key,
+                        });
+                        if let Some(counter) = progress {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+
+                    // For tree nodes (File/Dir), we need to fetch to see their children
                     let child_cid = Cid { hash: link.hash, key: link.key, size: link.size };
                     pending.push_back((child_cid, child_path));
                 }
