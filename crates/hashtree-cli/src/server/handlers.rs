@@ -6,7 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use hashtree_core::{from_hex, nhash_decode, to_hex};
+use hashtree_core::{from_hex, to_hex};
 use hashtree_resolver::{nostr::{NostrRootResolver, NostrResolverConfig}, RootResolver};
 use serde_json::json;
 use std::sync::Arc;
@@ -308,32 +308,6 @@ pub async fn serve_content_or_blob(
         .body(Body::from("Not found"))
         .unwrap()
         .into_response()
-}
-
-/// Serve content by nhash (bech32 encoded hash)
-/// Route: /nhash1... (the "nhash1" prefix is matched by the route, :rest captures the remainder)
-pub async fn serve_nhash(
-    State(state): State<AppState>,
-    Path(rest): Path<String>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    // Reconstruct full nhash (route strips the prefix)
-    let nhash = format!("nhash1{}", rest);
-
-    match nhash_decode(&nhash) {
-        Ok(nhash_data) => {
-            // TODO: handle decryption key if present in nhash_data.decrypt_key
-            serve_content_internal(&state, &nhash_data.hash, headers, true).await
-        }
-        Err(e) => {
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Body::from(format!("Invalid nhash: {}", e)))
-                .unwrap()
-                .into_response()
-        }
-    }
 }
 
 /// Serve content by npub/ref_name (Nostr resolver)
