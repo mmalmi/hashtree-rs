@@ -652,6 +652,32 @@ impl RemoteHelper {
     fn execute_push(&mut self) -> Result<Option<Vec<String>>> {
         info!("Pushing {} refs", self.push_specs.len());
 
+        // First, load existing refs and objects from remote to preserve other branches
+        // Check if any push is a force push
+        let has_force_push = self.push_specs.iter().any(|s| s.force);
+
+        if let Err(e) = self.load_existing_remote_state() {
+            if has_force_push {
+                // Force push - proceed without existing state
+                eprintln!("  Warning: Could not load existing remote state: {}", e);
+                eprintln!("  Proceeding with force push (may overwrite other branches)");
+            } else {
+                // Check if this might be a new repo (no refs found is OK)
+                let is_likely_new_repo = e.to_string().contains("No root hash")
+                    || e.to_string().contains("not found")
+                    || e.to_string().contains("timeout");
+
+                if is_likely_new_repo {
+                    info!("Could not load existing remote state: {} (likely new repo)", e);
+                } else {
+                    // There's an existing remote but we can't load it - warn user
+                    eprintln!("  Warning: Could not load existing remote state: {}", e);
+                    eprintln!("  Other branches may be lost. Use 'git push --force' to override.");
+                    eprintln!("  Or check your network connection and try again.");
+                }
+            }
+        }
+
         let mut results = Vec::new();
 
         // Clone specs to avoid borrow issues
@@ -691,6 +717,47 @@ impl RemoteHelper {
 
         results.push(String::new()); // Empty line terminates
         Ok(Some(results))
+    }
+
+    /// Load existing refs and objects from remote before pushing
+    /// This preserves branches that aren't being pushed
+    fn load_existing_remote_state(&mut self) -> Result<()> {
+        eprintln!("  Loading existing remote state...");
+
+        // Fetch refs from nostr (this also caches root hash)
+        let (refs, root_hash, _encryption_key) = self.nostr.fetch_refs_with_root(&self.repo_name)?;
+
+        if refs.is_empty() {
+            eprintln!("  No existing refs found (new repository)");
+            return Ok(());
+        }
+
+        eprintln!("  Found {} existing refs", refs.len());
+
+        // Import refs into storage (these will be merged with pushed refs)
+        for (ref_name, ref_value) in &refs {
+            // Skip refs that we're about to push (they'll be overwritten anyway)
+            let is_being_pushed = self.push_specs.iter().any(|s| s.dst == *ref_name);
+            if !is_being_pushed {
+                self.storage.import_ref(ref_name, ref_value)?;
+                debug!("Imported existing ref: {} -> {}", ref_name, &ref_value[..12.min(ref_value.len())]);
+            }
+        }
+
+        // Fetch all git objects from remote hashtree
+        if let Some(root) = root_hash {
+            let objects = self.fetch_all_git_objects(&root)?;
+            eprintln!("  Importing {} existing objects", objects.len());
+
+            for (oid, content) in objects {
+                // Content from hashtree is already the compressed loose object
+                // (that's what we store in build_objects_dir)
+                self.storage.import_compressed_object(&oid, content)?;
+            }
+        }
+
+        eprintln!("  Remote state loaded");
+        Ok(())
     }
 
     /// Resolve a ref to its sha

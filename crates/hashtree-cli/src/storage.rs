@@ -794,11 +794,10 @@ impl HashtreeStore {
                 .unwrap()
                 .as_secs();
 
-            // Get size from root hash lookup
+            // Get size from raw blob
             let size = self
-                .get_cid_by_sha256(sha256)?
-                .and_then(|root_hash| self.get_file_chunk_metadata(&root_hash).ok().flatten())
-                .map(|m| m.total_size)
+                .get_blob(sha256)?
+                .map(|data| data.len() as u64)
                 .unwrap_or(0);
 
             blobs.push(BlobMetadata {

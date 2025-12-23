@@ -193,6 +193,49 @@ impl GitStorage {
         Ok(existed)
     }
 
+    /// Import a raw git object (already in loose format, zlib compressed)
+    /// Used when fetching existing objects from remote before push
+    pub fn import_compressed_object(&self, oid: &str, compressed_data: Vec<u8>) -> Result<()> {
+        let mut objects = self.objects.write()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        objects.insert(oid.to_string(), compressed_data);
+
+        // Invalidate cached root
+        if let Ok(mut root) = self.root_hash.write() {
+            *root = None;
+        }
+
+        Ok(())
+    }
+
+    /// Import a ref directly (used when loading existing refs from remote)
+    pub fn import_ref(&self, name: &str, value: &str) -> Result<()> {
+        let mut refs = self.refs.write()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        refs.insert(name.to_string(), value.to_string());
+
+        // Invalidate cached root
+        if let Ok(mut root) = self.root_hash.write() {
+            *root = None;
+        }
+
+        Ok(())
+    }
+
+    /// Check if a ref exists
+    pub fn has_ref(&self, name: &str) -> Result<bool> {
+        let refs = self.refs.read()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        Ok(refs.contains_key(name))
+    }
+
+    /// Get count of objects in storage
+    pub fn object_count(&self) -> Result<usize> {
+        let objects = self.objects.read()
+            .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
+        Ok(objects.len())
+    }
+
     /// Get the cached root hash (returns None if tree hasn't been built)
     #[allow(dead_code)]
     pub fn get_root_hash(&self) -> Result<Option<[u8; 32]>> {
@@ -744,5 +787,123 @@ impl GitStorage {
         refs.clear();
         *root = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_storage() -> (GitStorage, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = GitStorage::open(temp_dir.path()).unwrap();
+        (storage, temp_dir)
+    }
+
+    #[test]
+    fn test_import_ref() {
+        let (storage, _temp) = create_test_storage();
+
+        // Import a ref
+        storage.import_ref("refs/heads/main", "abc123def456").unwrap();
+
+        // Check it exists
+        assert!(storage.has_ref("refs/heads/main").unwrap());
+
+        // Check value via list_refs
+        let refs = storage.list_refs().unwrap();
+        assert_eq!(refs.get("refs/heads/main"), Some(&"abc123def456".to_string()));
+    }
+
+    #[test]
+    fn test_import_multiple_refs_preserves_all() {
+        let (storage, _temp) = create_test_storage();
+
+        // Import multiple refs (simulating loading from remote)
+        storage.import_ref("refs/heads/main", "sha_main").unwrap();
+        storage.import_ref("refs/heads/dev", "sha_dev").unwrap();
+        storage.import_ref("refs/heads/feature", "sha_feature").unwrap();
+
+        // All should exist
+        assert!(storage.has_ref("refs/heads/main").unwrap());
+        assert!(storage.has_ref("refs/heads/dev").unwrap());
+        assert!(storage.has_ref("refs/heads/feature").unwrap());
+
+        // Now write a new ref (simulating push)
+        storage.write_ref("refs/heads/new-branch", &Ref::Direct(
+            ObjectId::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap()
+        )).unwrap();
+
+        // Original refs should still exist
+        let refs = storage.list_refs().unwrap();
+        assert_eq!(refs.len(), 4);
+        assert!(refs.contains_key("refs/heads/main"));
+        assert!(refs.contains_key("refs/heads/dev"));
+        assert!(refs.contains_key("refs/heads/feature"));
+        assert!(refs.contains_key("refs/heads/new-branch"));
+    }
+
+    #[test]
+    fn test_import_compressed_object() {
+        let (storage, _temp) = create_test_storage();
+
+        // Create a fake compressed object
+        let fake_compressed = vec![0x78, 0x9c, 0x01, 0x02, 0x03]; // fake zlib data
+
+        storage.import_compressed_object("abc123def456", fake_compressed.clone()).unwrap();
+
+        // Check object count
+        assert_eq!(storage.object_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_write_ref_overwrites_imported() {
+        let (storage, _temp) = create_test_storage();
+
+        // Import a ref
+        storage.import_ref("refs/heads/main", "old_sha").unwrap();
+
+        // Write same ref with new value
+        storage.write_ref("refs/heads/main", &Ref::Direct(
+            ObjectId::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap()
+        )).unwrap();
+
+        // Should have new value
+        let refs = storage.list_refs().unwrap();
+        assert_eq!(refs.get("refs/heads/main"),
+            Some(&"0123456789abcdef0123456789abcdef01234567".to_string()));
+    }
+
+    #[test]
+    fn test_delete_ref_preserves_others() {
+        let (storage, _temp) = create_test_storage();
+
+        // Import multiple refs
+        storage.import_ref("refs/heads/main", "sha_main").unwrap();
+        storage.import_ref("refs/heads/dev", "sha_dev").unwrap();
+
+        // Delete one
+        storage.delete_ref("refs/heads/dev").unwrap();
+
+        // Other should still exist
+        assert!(storage.has_ref("refs/heads/main").unwrap());
+        assert!(!storage.has_ref("refs/heads/dev").unwrap());
+    }
+
+    #[test]
+    fn test_clear_removes_all() {
+        let (storage, _temp) = create_test_storage();
+
+        // Import refs and objects
+        storage.import_ref("refs/heads/main", "sha_main").unwrap();
+        storage.import_compressed_object("obj1", vec![1, 2, 3]).unwrap();
+
+        // Clear
+        storage.clear().unwrap();
+
+        // All gone
+        assert!(!storage.has_ref("refs/heads/main").unwrap());
+        assert_eq!(storage.object_count().unwrap(), 0);
     }
 }

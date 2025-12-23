@@ -15,10 +15,12 @@
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
+use nostr::ToBech32;
 
 struct TestEnv {
     _data_dir: TempDir,
     home_dir: PathBuf,
+    npub: String,
 }
 
 impl TestEnv {
@@ -43,17 +45,35 @@ crawl_depth = 0
         std::fs::write(config_dir.join("config.toml"), config_content)
             .expect("Failed to write config");
 
+        // Generate a test key for "self" identity
+        // Using nostr crate to generate proper nsec
+        // Format: "nsec1... self" (nsec followed by petname)
+        let keys = nostr::Keys::generate();
+        let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
+        let npub = keys.public_key().to_bech32().expect("Failed to encode npub");
+        let key_line = format!("{} self\n", nsec);
+        std::fs::write(config_dir.join("keys"), &key_line)
+            .expect("Failed to write keys");
+        println!("Generated test key: {} (petname: self)", &nsec[..20]);
+
         TestEnv {
             _data_dir: data_dir,
             home_dir,
+            npub,
         }
     }
 
     fn env(&self) -> Vec<(String, String)> {
+        let config_dir = self.home_dir.join(".hashtree");
         vec![
             (
                 "HOME".to_string(),
                 self.home_dir.to_string_lossy().to_string(),
+            ),
+            (
+                // Override hashtree config dir to use our temp directory
+                "HTREE_CONFIG_DIR".to_string(),
+                config_dir.to_string_lossy().to_string(),
             ),
             (
                 "PATH".to_string(),
@@ -206,13 +226,9 @@ fn test_git_push_and_clone() {
         panic!("git push failed: {}", stderr);
     }
 
-    // Extract the actual npub from the push output (e.g., "Published to: htree://npub1...")
-    let npub = stderr
-        .split("htree://")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .expect("Could not extract npub from push output");
-    println!("Published to npub: {}", npub);
+    // Use the npub we generated in TestEnv
+    let npub = &test_env.npub;
+    println!("Using npub: {}", npub);
     println!("Push successful!\n");
 
     // Clone to new directory using the actual npub (not self)
@@ -321,6 +337,272 @@ fn test_git_push_and_clone() {
     println!("\n=== SUCCESS: Git roundtrip test passed! ===");
     println!("Push time: {:?}", push_duration);
     println!("Clone time: {:?}", clone_duration);
+}
+
+#[test]
+#[ignore = "requires network - run with: cargo test --package git-remote-htree --test git_roundtrip -- --ignored --nocapture"]
+fn test_multi_branch_preservation() {
+    // Check prerequisites
+    if find_git_remote_htree_dir().is_none() {
+        panic!(
+            "git-remote-htree binary not found. Run `cargo build --release -p git-remote-htree` first."
+        );
+    }
+
+    println!("=== Multi-Branch Preservation Test ===\n");
+
+    // Create test environment
+    let test_env = TestEnv::new();
+    let env_vars: Vec<_> = test_env.env();
+    println!("Test environment at: {:?}\n", test_env.home_dir);
+
+    // Create test repo
+    let repo = create_test_repo();
+    println!("Test repo at: {:?}\n", repo.path());
+
+    // Add htree remote
+    let remote_url = "htree://self/multi-branch-test";
+    Command::new("git")
+        .args(["remote", "add", "htree", remote_url])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to add remote");
+
+    // === STEP 1: Push master branch ===
+    println!("=== Step 1: Push master branch ===");
+    let push1 = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push master");
+
+    let stderr1 = String::from_utf8_lossy(&push1.stderr);
+    println!("Push master stderr: {}", stderr1);
+
+    if !push1.status.success() && !stderr1.contains("-> master") {
+        panic!("git push master failed: {}", stderr1);
+    }
+
+    // Check for excessive upload failures (network reliability issue)
+    // Line format: "Blossom upload complete: X uploaded, Y already existed, Z failed"
+    if stderr1.contains("failed") {
+        // Extract the number before "failed"
+        for line in stderr1.lines() {
+            if line.contains("Blossom upload complete") && line.contains("failed") {
+                // Parse "N failed" where N > 5 indicates unreliable network
+                if let Some(pos) = line.find("failed") {
+                    let before = &line[..pos];
+                    if let Some(num_str) = before.split_whitespace().last() {
+                        if let Ok(failed_count) = num_str.parse::<u32>() {
+                            if failed_count > 5 {
+                                eprintln!("\nSKIP: Network unreliable - {} blob uploads failed", failed_count);
+                                eprintln!("This test requires working blossom servers\n");
+                                return; // Skip test due to network issues
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Use the npub we generated in TestEnv
+    let npub = &test_env.npub;
+    println!("Using npub: {}\n", npub);
+
+    // === STEP 2: Create and push dev branch ===
+    println!("=== Step 2: Create and push dev branch ===");
+
+    // Create dev branch
+    Command::new("git")
+        .args(["checkout", "-b", "dev"])
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to create dev branch");
+
+    // Add a file unique to dev
+    std::fs::write(repo.path().join("dev-only.txt"), "This file only exists on dev branch\n")
+        .expect("Failed to write dev-only.txt");
+
+    Command::new("git")
+        .args(["add", "dev-only.txt"])
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to git add");
+
+    Command::new("git")
+        .args(["commit", "-m", "Add dev-only file"])
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to commit on dev");
+
+    // Push dev branch
+    let push2 = Command::new("git")
+        .args(["push", "htree", "dev"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push dev");
+
+    let stderr2 = String::from_utf8_lossy(&push2.stderr);
+    println!("Push dev stderr: {}", stderr2);
+
+    if !push2.status.success() && !stderr2.contains("-> dev") {
+        panic!("git push dev failed: {}", stderr2);
+    }
+    println!("Dev branch pushed!\n");
+
+    // === STEP 3: Clone and verify both branches exist ===
+    println!("=== Step 3: Clone and verify both branches ===");
+
+    let clone_url = format!("htree://{}/multi-branch-test", npub);
+    let clone_dir = TempDir::new().expect("Failed to create clone dir");
+    let clone_path = clone_dir.path().join("cloned");
+
+    let clone = Command::new("git")
+        .args(["clone", &clone_url, clone_path.to_str().unwrap()])
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to clone");
+
+    println!("Clone stdout: {}", String::from_utf8_lossy(&clone.stdout));
+    println!("Clone stderr: {}", String::from_utf8_lossy(&clone.stderr));
+
+    if !clone.status.success() {
+        panic!("git clone failed: {}", String::from_utf8_lossy(&clone.stderr));
+    }
+    println!("Clone successful!");
+
+    // List remote branches
+    let branches = Command::new("git")
+        .args(["branch", "-r"])
+        .current_dir(&clone_path)
+        .output()
+        .expect("Failed to list branches");
+
+    let branches_output = String::from_utf8_lossy(&branches.stdout);
+    println!("Remote branches:\n{}", branches_output);
+
+    // Verify both branches exist
+    assert!(
+        branches_output.contains("origin/master") || branches_output.contains("origin/main"),
+        "master/main branch should exist"
+    );
+    assert!(
+        branches_output.contains("origin/dev"),
+        "dev branch should exist - MULTI-BRANCH PRESERVATION FAILED"
+    );
+
+    // Checkout dev and verify dev-only.txt exists
+    Command::new("git")
+        .args(["checkout", "dev"])
+        .current_dir(&clone_path)
+        .output()
+        .expect("Failed to checkout dev");
+
+    assert!(
+        clone_path.join("dev-only.txt").exists(),
+        "dev-only.txt should exist on dev branch"
+    );
+
+    let dev_content = std::fs::read_to_string(clone_path.join("dev-only.txt")).unwrap();
+    assert_eq!(
+        dev_content, "This file only exists on dev branch\n",
+        "dev-only.txt content should match"
+    );
+    println!("Dev branch content verified!\n");
+
+    // === STEP 4: Push update to master, verify dev still exists ===
+    println!("=== Step 4: Push update to master, verify dev preserved ===");
+
+    // Switch back to master in original repo
+    Command::new("git")
+        .args(["checkout", "master"])
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to checkout master");
+
+    // Add another file to master
+    std::fs::write(repo.path().join("master-update.txt"), "Updated master branch\n")
+        .expect("Failed to write master-update.txt");
+
+    Command::new("git")
+        .args(["add", "master-update.txt"])
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to git add");
+
+    Command::new("git")
+        .args(["commit", "-m", "Update master"])
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to commit master update");
+
+    // Push master again
+    let push3 = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push master update");
+
+    let stderr3 = String::from_utf8_lossy(&push3.stderr);
+    println!("Push master update stderr: {}", stderr3);
+
+    if !push3.status.success() && !stderr3.contains("-> master") {
+        panic!("git push master update failed: {}", stderr3);
+    }
+
+    // Clone fresh again
+    let clone_dir2 = TempDir::new().expect("Failed to create clone dir 2");
+    let clone_path2 = clone_dir2.path().join("cloned2");
+
+    let clone2 = Command::new("git")
+        .args(["clone", &clone_url, clone_path2.to_str().unwrap()])
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to clone after master update");
+
+    if !clone2.status.success() {
+        panic!("git clone failed: {}", String::from_utf8_lossy(&clone2.stderr));
+    }
+
+    // Verify dev branch still exists after master push
+    let branches2 = Command::new("git")
+        .args(["branch", "-r"])
+        .current_dir(&clone_path2)
+        .output()
+        .expect("Failed to list branches");
+
+    let branches2_output = String::from_utf8_lossy(&branches2.stdout);
+    println!("Remote branches after master update:\n{}", branches2_output);
+
+    assert!(
+        branches2_output.contains("origin/dev"),
+        "dev branch should STILL exist after pushing master - MULTI-BRANCH PRESERVATION FAILED"
+    );
+
+    // Verify master has the update
+    assert!(
+        clone_path2.join("master-update.txt").exists(),
+        "master-update.txt should exist"
+    );
+
+    // Verify dev still has its content
+    Command::new("git")
+        .args(["checkout", "dev"])
+        .current_dir(&clone_path2)
+        .output()
+        .expect("Failed to checkout dev");
+
+    assert!(
+        clone_path2.join("dev-only.txt").exists(),
+        "dev-only.txt should still exist on dev branch after master push"
+    );
+
+    println!("\n=== SUCCESS: Multi-branch preservation test passed! ===");
 }
 
 #[test]

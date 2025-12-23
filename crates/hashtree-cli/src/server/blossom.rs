@@ -323,16 +323,17 @@ pub async fn head_blob(
             .unwrap(),
     };
 
-    // Check if blob exists via CID lookup
-    match state.store.get_cid_by_sha256(&sha256_bytes) {
-        Ok(Some(root_hash)) => {
-            // Get file size and mime type
-            let (size, mime_type) = get_blob_metadata(&state, &root_hash, ext);
+    // Blossom only serves raw blobs (not merkle tree structures)
+    match state.store.get_blob(&sha256_bytes) {
+        Ok(Some(data)) => {
+            let mime_type = ext
+                .map(|e| get_mime_type(&format!("file{}", e)))
+                .unwrap_or("application/octet-stream");
 
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CONTENT_LENGTH, size)
+                .header(header::CONTENT_LENGTH, data.len())
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL)
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
@@ -689,23 +690,6 @@ fn parse_hash_and_extension(id: &str) -> (&str, Option<&str>) {
 
 fn is_valid_sha256(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn get_blob_metadata(state: &AppState, hash: &[u8; 32], ext: Option<&str>) -> (u64, String) {
-    let size = state.store.get_file_chunk_metadata(hash)
-        .ok()
-        .flatten()
-        .map(|m| m.total_size)
-        .unwrap_or(0);
-
-    // Use extension for MIME type if provided, otherwise default to octet-stream
-    // (hashtree doesn't store filenames in tree nodes)
-    let mime_type = ext
-        .map(|e| get_mime_type(&format!("file{}", e)))
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    (size, mime_type)
 }
 
 fn store_blossom_blob(

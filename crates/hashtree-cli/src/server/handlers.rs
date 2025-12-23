@@ -264,16 +264,6 @@ pub async fn serve_content_or_blob(
         }
     }
 
-    // Try blossom SHA256 lookup (content hash -> root hash mapping)
-    if is_sha256 {
-        let sha256_hex = hash_part.to_lowercase();
-        if let Ok(sha256_bytes) = from_hex(&sha256_hex) {
-            if let Ok(Some(root_hash)) = state.store.get_cid_by_sha256(&sha256_bytes) {
-                return serve_content_internal(&state, &root_hash, headers, true).await;
-            }
-        }
-    }
-
     // Not found locally - try querying connected WebRTC peers
     if is_sha256 {
         if let Some(ref webrtc_state) = state.webrtc_peers {
