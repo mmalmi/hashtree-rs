@@ -344,8 +344,6 @@ pub struct HashtreeStore {
     env: heed::Env,
     /// Set of pinned hashes (32-byte raw hashes, prevents garbage collection)
     pins: Database<Bytes, Unit>,
-    /// Maps SHA256 (32 bytes) -> root hash (32 bytes) for blossom compatibility
-    sha256_index: Database<Bytes, Bytes>,
     /// Blob ownership: sha256 (32 bytes) ++ pubkey (32 bytes) -> () (composite key for multi-owner)
     blob_owners: Database<Bytes, Unit>,
     /// Maps pubkey (32 bytes) -> blob metadata JSON (for blossom list)
@@ -383,13 +381,12 @@ impl HashtreeStore {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(10 * 1024 * 1024 * 1024) // 10GB virtual address space
-                .max_dbs(9)  // pins, sha256_index, blob_owners, pubkey_blobs, tree_meta, blob_trees, tree_refs, cached_roots, blobs
+                .max_dbs(8)  // pins, blob_owners, pubkey_blobs, tree_meta, blob_trees, tree_refs, cached_roots, blobs
                 .open(path)?
         };
 
         let mut wtxn = env.write_txn()?;
         let pins = env.create_database(&mut wtxn, Some("pins"))?;
-        let sha256_index = env.create_database(&mut wtxn, Some("sha256_index"))?;
         let blob_owners = env.create_database(&mut wtxn, Some("blob_owners"))?;
         let pubkey_blobs = env.create_database(&mut wtxn, Some("pubkey_blobs"))?;
         let tree_meta = env.create_database(&mut wtxn, Some("tree_meta"))?;
@@ -426,7 +423,6 @@ impl HashtreeStore {
         Ok(Self {
             env,
             pins,
-            sha256_index,
             blob_owners,
             pubkey_blobs,
             tree_meta,
@@ -463,9 +459,6 @@ impl HashtreeStore {
         let file_path = file_path.as_ref();
         let file_content = std::fs::read(file_path)?;
 
-        // Compute SHA256 hash of file content for blossom compatibility
-        let content_sha256 = sha256(&file_content);
-
         // Use hashtree to store the file (public mode - no encryption)
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
@@ -474,17 +467,12 @@ impl HashtreeStore {
             tree.put(&file_content).await
         }).context("Failed to store file")?;
 
-        let mut wtxn = self.env.write_txn()?;
-
-        // Store SHA256 -> root hash mapping for blossom compatibility
-        self.sha256_index.put(&mut wtxn, &content_sha256, &cid.hash)?;
-
         // Only pin if requested (htree add = pin, blossom upload = no pin)
         if pin {
+            let mut wtxn = self.env.write_txn()?;
             self.pins.put(&mut wtxn, cid.hash.as_slice(), &())?;
+            wtxn.commit()?;
         }
-
-        wtxn.commit()?;
 
         Ok(to_hex(&cid.hash))
     }
@@ -499,14 +487,10 @@ impl HashtreeStore {
     where
         F: FnMut(&str),
     {
-        // Read all data first to compute SHA256
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
 
-        // Compute SHA256 hash of file content for blossom compatibility
-        let content_sha256 = sha256(&data);
-
-        // Use HashTree.put for upload (public mode for blossom)
+        // Use HashTree.put for upload (public mode)
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
@@ -517,14 +501,9 @@ impl HashtreeStore {
         let root_hex = to_hex(&cid.hash);
         callback(&root_hex);
 
-        let mut wtxn = self.env.write_txn()?;
-
-        // Store SHA256 -> root hash mapping for blossom compatibility
-        self.sha256_index.put(&mut wtxn, &content_sha256, &cid.hash)?;
-
         // Auto-pin on upload
+        let mut wtxn = self.env.write_txn()?;
         self.pins.put(&mut wtxn, cid.hash.as_slice(), &())?;
-
         wtxn.commit()?;
 
         Ok(root_hex)
@@ -726,16 +705,6 @@ impl HashtreeStore {
         })
     }
 
-    /// Look up root hash by SHA256 hash (blossom compatibility)
-    pub fn get_cid_by_sha256(&self, sha256: &[u8; 32]) -> Result<Option<Hash>> {
-        let rtxn = self.env.read_txn()?;
-        Ok(self.sha256_index.get(&rtxn, sha256)?.map(|bytes| {
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(bytes);
-            hash
-        }))
-    }
-
     /// Store a raw blob, returns SHA256 hash as hex.
     pub fn put_blob(&self, data: &[u8]) -> Result<String> {
         let hash = sha256(data);
@@ -903,17 +872,6 @@ impl HashtreeStore {
             "All owners removed from blob {}, deleting",
             &sha256_hex[..8]
         );
-
-        // Delete from sha256_index and unpin
-        let root_hash: Option<Hash> = self.sha256_index.get(&wtxn, sha256)?.map(|bytes| {
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(bytes);
-            hash
-        });
-        if let Some(ref hash) = root_hash {
-            self.pins.delete(&mut wtxn, hash)?;
-        }
-        self.sha256_index.delete(&mut wtxn, sha256)?;
 
         // Delete raw blob (by content hash) - this deletes from S3 too
         let _ = self.router.delete_sync(sha256);

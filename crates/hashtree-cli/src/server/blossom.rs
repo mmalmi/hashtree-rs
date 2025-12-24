@@ -323,9 +323,10 @@ pub async fn head_blob(
             .unwrap(),
     };
 
-    // Blossom only serves raw blobs (not merkle tree structures)
-    match state.store.get_blob(&sha256_bytes) {
-        Ok(Some(data)) => {
+    // Check if blob exists directly by SHA256 hash
+    // Blossom only serves raw blobs, not tree structures
+    match state.store.blob_exists(&sha256_bytes) {
+        Ok(true) => {
             let mime_type = ext
                 .map(|e| get_mime_type(&format!("file{}", e)))
                 .unwrap_or("application/octet-stream");
@@ -333,14 +334,13 @@ pub async fn head_blob(
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CONTENT_LENGTH, data.len())
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL)
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(Body::empty())
                 .unwrap()
         }
-        Ok(None) => Response::builder()
+        Ok(false) => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .header("X-Reason", "Blob not found")
