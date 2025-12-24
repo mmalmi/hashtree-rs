@@ -248,9 +248,10 @@ impl BlossomClient {
         )))
     }
 
-    /// Check if a blob exists on any read server
+    /// Check if a blob exists on any write server
+    /// (Used before upload to skip if already present)
     pub async fn exists(&self, hash: &str) -> bool {
-        for server in &self.read_servers {
+        for server in &self.write_servers {
             let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
             debug!("Checking exists: {}", url);
             if let Ok(resp) = self.http.head(&url).send().await {
