@@ -809,6 +809,14 @@ impl RemoteHelper {
             debug!("Set HEAD -> {}", dst_ref);
         }
 
+        // Check if we can sign before doing any work
+        if !self.nostr.can_sign() {
+            anyhow::bail!(
+                "Cannot push: no secret key for {}. You can only push to your own repos.",
+                self.nostr.npub()
+            );
+        }
+
         // Build the merkle tree
         eprint!("  Building merkle tree...");
         let _ = std::io::stderr().flush();
