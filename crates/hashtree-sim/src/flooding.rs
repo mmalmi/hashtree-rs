@@ -64,25 +64,26 @@ struct ConnectedPeer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingStrategy {
     /// Flood requests to all peers simultaneously, first response wins
+    /// + High bandwidth usage, low latency
     /// + Multi-hop forwarding using HTL
-    /// + Lower latency, higher bandwidth usage
     Flooding,
-    /// Try peers one at a time, wait for response before trying next
-    /// + Single-hop only: peers only check local storage (no forwarding)
-    /// + Lower bandwidth, but only reaches direct neighbors
-    Sequential,
+    /// Freenet-style adaptive routing: try best peer first, fallback on failure
+    /// + Low bandwidth, learns peer quality over time
+    /// + Multi-hop forwarding using HTL
+    /// + Orders peers by: success rate, RTT, backoff state
+    Adaptive,
 }
 
 impl Default for RoutingStrategy {
     fn default() -> Self {
-        Self::Flooding
+        Self::Adaptive
     }
 }
 
 /// Configuration for FloodingStore
 #[derive(Clone)]
 pub struct FloodingConfig {
-    /// Per-peer timeout for sequential strategy (try next peer if no response)
+    /// Per-peer timeout (Adaptive: per peer, Flooding: overall)
     pub request_timeout: Duration,
     /// Enable multi-hop forwarding (using HTL)
     pub forward_requests: bool,
@@ -95,26 +96,21 @@ pub struct FloodingConfig {
     pub network_latency_ms: u64,
     /// Routing strategy for data requests
     pub routing_strategy: RoutingStrategy,
-    /// Peer selection strategy (for sequential mode)
+    /// Peer selection strategy (used by Adaptive routing to order peers)
     pub selection_strategy: SelectionStrategy,
-    /// Enable adaptive peer selection
-    pub adaptive_selection: bool,
 }
 
 impl Default for FloodingConfig {
     fn default() -> Self {
         Self {
             // Per-peer timeout: 1s allows multi-hop forwarding with 50ms latency
-            // Sequential tries each peer for 1s before moving to next
-            // Flooding uses this as overall timeout (parallel requests)
             request_timeout: Duration::from_secs(1),
             forward_requests: true,
             max_peers: 5,
             connect_timeout_ms: 5000,
             network_latency_ms: 0, // Instant for tests, set to ~50 for realistic simulation
-            routing_strategy: RoutingStrategy::Flooding,
+            routing_strategy: RoutingStrategy::Adaptive,
             selection_strategy: SelectionStrategy::Weighted,
-            adaptive_selection: true,
         }
     }
 }
@@ -495,7 +491,7 @@ impl FloodingStore {
     async fn fetch_from_peers(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
         match self.config.routing_strategy {
             RoutingStrategy::Flooding => self.fetch_from_peers_flooding(hash, exclude).await,
-            RoutingStrategy::Sequential => self.fetch_from_peers_sequential(hash, exclude).await,
+            RoutingStrategy::Adaptive => self.fetch_from_peers_adaptive(hash, exclude).await,
         }
     }
 
@@ -553,18 +549,14 @@ impl FloodingStore {
         }
     }
 
-    /// Sequential strategy: try one peer at a time, wait for response before trying next
-    /// Uses adaptive peer selection to prefer reliable, fast peers
-    async fn fetch_from_peers_sequential(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
-        // Get peer ordering from selector (if adaptive selection enabled)
-        let ordered_peer_ids: Vec<u64> = if self.config.adaptive_selection {
+    /// Adaptive routing: try best peer first, learn from results, fallback on failure
+    /// Like Freenet's routing but without location-based selection (we use quality only)
+    async fn fetch_from_peers_adaptive(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
+        // Get peer ordering from selector (best peers first)
+        let ordered_peer_ids: Vec<u64> = {
             let mut selector = self.peer_selector.write().await;
             selector.select_peers()
                 .into_iter()
-                .filter(|&id| Some(id) != exclude)
-                .collect()
-        } else {
-            self.peers.read().await.keys().copied()
                 .filter(|&id| Some(id) != exclude)
                 .collect()
         };
@@ -573,7 +565,7 @@ impl FloodingStore {
             return None;
         }
 
-        // Try each peer in order (best peers first)
+        // Try each peer in order (best peers first, like Freenet's closerPeer())
         for peer_id in ordered_peer_ids {
             let (channel, htl_config) = {
                 let peers = self.peers.read().await;
@@ -583,23 +575,18 @@ impl FloodingStore {
                 }
             };
 
-            // Decrement HTL when sending
+            // Decrement HTL when sending (Freenet-style)
             let outgoing_htl = decrement_htl(MAX_HTL, &htl_config);
             let request_bytes = encode_request(hash, outgoing_htl);
             let request_size = request_bytes.len() as u64;
 
             // Track request in selector
-            if self.config.adaptive_selection {
-                self.peer_selector.write().await.record_request(peer_id, request_size);
-            }
-
+            self.peer_selector.write().await.record_request(peer_id, request_size);
             let request_start = std::time::Instant::now();
 
             // Send request
             if self.send_with_latency(channel.as_ref(), request_bytes.clone()).await.is_err() {
-                if self.config.adaptive_selection {
-                    self.peer_selector.write().await.record_failure(peer_id);
-                }
+                self.peer_selector.write().await.record_failure(peer_id);
                 continue; // Try next peer
             }
             self.bytes_sent.fetch_add(request_size, Ordering::Relaxed);
@@ -611,14 +598,12 @@ impl FloodingStore {
                 .await
                 .insert(*hash, OurRequest { response_tx: tx });
 
-            // Wait for response
+            // Wait for response (with timeout, then try next peer)
             match tokio::time::timeout(self.config.request_timeout, rx).await {
                 Ok(Ok(Some(data))) => {
-                    // Success! Record metrics
-                    if self.config.adaptive_selection {
-                        let rtt_ms = request_start.elapsed().as_millis() as u64;
-                        self.peer_selector.write().await.record_success(peer_id, rtt_ms, data.len() as u64);
-                    }
+                    // Success! Record metrics for learning
+                    let rtt_ms = request_start.elapsed().as_millis() as u64;
+                    self.peer_selector.write().await.record_success(peer_id, rtt_ms, data.len() as u64);
                     // Cache locally and return
                     self.local.put_local(*hash, data.clone());
                     return Some(data);
@@ -629,9 +614,7 @@ impl FloodingStore {
                 }
                 _ => {
                     // Timeout or error - record and try next peer
-                    if self.config.adaptive_selection {
-                        self.peer_selector.write().await.record_timeout(peer_id);
-                    }
+                    self.peer_selector.write().await.record_timeout(peer_id);
                     self.our_requests.write().await.remove(hash);
                     continue;
                 }
@@ -749,19 +732,14 @@ impl FloodingStore {
         // Verify hash
         if hashtree_core::sha256(&data) != hash {
             // Record failure for bad data
-            if self.config.adaptive_selection {
-                self.peer_selector.write().await.record_failure(from_peer);
-            }
+            self.peer_selector.write().await.record_failure(from_peer);
             return;
         }
 
-        // Record success for the peer that responded (even in flooding mode)
-        // This helps identify reliable peers for future sequential queries
-        if self.config.adaptive_selection {
-            // We don't have exact RTT for flooding mode, use a placeholder
-            // The success/failure tracking is still valuable
-            self.peer_selector.write().await.record_success(from_peer, 0, data.len() as u64);
-        }
+        // Record success for the peer that responded
+        // Even in flooding mode, tracking helps identify reliable peers
+        // We don't have exact RTT for flooding mode, use 0 as placeholder
+        self.peer_selector.write().await.record_success(from_peer, 0, data.len() as u64);
 
         // Check if this is a response to our own request
         if let Some(req) = self.our_requests.write().await.remove(&hash) {
@@ -995,5 +973,114 @@ mod tests {
         let result = store1.get(&hash).await.unwrap();
         assert_eq!(result, Some(data.to_vec()));
         assert!(store1.local().has_local(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_selection_prefers_reliable_peers() {
+        // Test that adaptive routing learns to prefer reliable peers
+        // Setup: Node A connected to peers B (reliable) and C (unreliable/no data)
+        let config = FloodingConfig {
+            routing_strategy: RoutingStrategy::Adaptive,
+            request_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+
+        let store_a = FloodingStore::new("1", config.clone());
+        let store_b = FloodingStore::new("2", config.clone());
+        let store_c = FloodingStore::new("3", config.clone());
+
+        // Connect A to both B and C
+        let (chan_ab, chan_ba) = MockChannel::pair(1, 2);
+        let (chan_ac, chan_ca) = MockChannel::pair(1, 3);
+        store_a.add_peer(2, Arc::new(chan_ab)).await;
+        store_a.add_peer(3, Arc::new(chan_ac)).await;
+        store_b.add_peer(1, Arc::new(chan_ba)).await;
+        store_c.add_peer(1, Arc::new(chan_ca)).await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // B has multiple pieces of data, C has none
+        let mut hashes = Vec::new();
+        for i in 0..5 {
+            let data = format!("data chunk {}", i);
+            let hash = hashtree_core::sha256(data.as_bytes());
+            store_b.local().put_local(hash, data.into_bytes());
+            hashes.push(hash);
+        }
+
+        // Fetch all data - A should learn that B is reliable
+        for hash in &hashes {
+            let result = store_a.get(hash).await.unwrap();
+            assert!(result.is_some(), "Should find data");
+        }
+
+        // Check peer selection stats
+        let summary = store_a.peer_selection_summary().await;
+        assert!(summary.total_requests > 0, "Should have made requests");
+        assert!(summary.total_successes > 0, "Should have successes");
+
+        // Get individual peer stats
+        let selector = store_a.peer_selector.read().await;
+        let peer_b_stats = selector.get_stats(2).unwrap();
+        let peer_c_stats = selector.get_stats(3).unwrap();
+
+        // Peer B should have higher success rate than C
+        assert!(
+            peer_b_stats.success_rate() > peer_c_stats.success_rate(),
+            "Peer B (reliable) should have higher success rate than C. B={:.2}, C={:.2}",
+            peer_b_stats.success_rate(),
+            peer_c_stats.success_rate()
+        );
+
+        // Peer B should have better score than C
+        assert!(
+            peer_b_stats.score() > peer_c_stats.score(),
+            "Peer B should have better score. B={:.2}, C={:.2}",
+            peer_b_stats.score(),
+            peer_c_stats.score()
+        );
+
+        println!("Peer B stats: requests={}, successes={}, score={:.2}",
+            peer_b_stats.requests_sent, peer_b_stats.successes, peer_b_stats.score());
+        println!("Peer C stats: requests={}, successes={}, score={:.2}",
+            peer_c_stats.requests_sent, peer_c_stats.successes, peer_c_stats.score());
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_with_forwarding() {
+        // Test that Adaptive routing forwards requests through the network
+        // A -- B -- C (C has data, A requests)
+        let config = FloodingConfig {
+            routing_strategy: RoutingStrategy::Adaptive,
+            forward_requests: true,
+            request_timeout: Duration::from_secs(2), // Long timeout for multi-hop
+            ..Default::default()
+        };
+
+        let store_a = FloodingStore::new("1", config.clone());
+        let store_b = FloodingStore::new("2", config.clone());
+        let store_c = FloodingStore::new("3", config.clone());
+
+        // C has the data
+        let data = b"forwarded data";
+        let hash = hashtree_core::sha256(data);
+        store_c.local().put_local(hash, data.to_vec());
+
+        // A -- B -- C (A not directly connected to C)
+        let (chan_ab, chan_ba) = MockChannel::pair(1, 2);
+        let (chan_bc, chan_cb) = MockChannel::pair(2, 3);
+        store_a.add_peer(2, Arc::new(chan_ab)).await;
+        store_b.add_peer(1, Arc::new(chan_ba)).await;
+        store_b.add_peer(3, Arc::new(chan_bc)).await;
+        store_c.add_peer(2, Arc::new(chan_cb)).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A fetches - should go A -> B -> C -> B -> A via forwarding
+        let result = store_a.get(&hash).await.unwrap();
+        assert_eq!(result, Some(data.to_vec()), "Adaptive routing should find data via forwarding");
+
+        // B should have cached it (was on forwarding path)
+        assert!(store_b.local().has_local(&hash), "B should cache forwarded data");
     }
 }

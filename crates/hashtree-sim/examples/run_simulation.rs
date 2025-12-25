@@ -1,7 +1,7 @@
 //! Run a network simulation with benchmarks
 //!
 //! Tests the full stack: HashTree<FloodingStore> for content operations + P2P networking
-//! Compares flooding vs sequential routing strategies.
+//! Compares Flooding vs Adaptive routing strategies (both use multi-hop forwarding).
 //!
 //! Usage: cargo run --example run_simulation -- [OPTIONS]
 //!   --nodes N       Number of nodes (default: 20)
@@ -64,57 +64,58 @@ async fn main() {
     let request_timeout = Duration::from_millis(500 + latency_ms * 10);
     let flooding = flooding_sim.run_benchmark(num_requests, 1024, request_timeout).await;
 
-    // Run sequential simulation (same topology seed)
-    eprintln!("\n=== Running Sequential Simulation ===");
-    let sequential_config = SimConfig {
-        routing_strategy: RoutingStrategy::Sequential,
+    // Run adaptive simulation (Freenet-style: try best peer, learn, fallback)
+    eprintln!("\n=== Running Adaptive Simulation ===");
+    let adaptive_config = SimConfig {
+        routing_strategy: RoutingStrategy::Adaptive,
         ..base_config
     };
-    let sequential_sim = Simulation::new(sequential_config);
-    sequential_sim.run().await;
-    let sequential = sequential_sim.run_benchmark(num_requests, 1024, request_timeout).await;
+    let adaptive_sim = Simulation::new(adaptive_config);
+    adaptive_sim.run().await;
+    let adaptive = adaptive_sim.run_benchmark(num_requests, 1024, request_timeout).await;
 
     // Print topology (same for both since same seed)
     eprintln!("\n=== Topology (shared) ===");
     Simulation::print_topology_stats(&flooding_topology);
 
     // Print detailed results
-    eprintln!("\n=== Flooding vs Sequential Comparison ===");
+    eprintln!("\n=== Flooding vs Adaptive Comparison ===");
     flooding.print();
     eprintln!();
-    sequential.print();
+    adaptive.print();
 
     // Summary comparison
     eprintln!("\n=== Strategy Comparison ===");
-    eprintln!("                      Flooding    Sequential");
+    eprintln!("                      Flooding    Adaptive");
     eprintln!("Success rate:         {:6.1}%      {:6.1}%",
-        flooding.success_rate * 100.0, sequential.success_rate * 100.0);
+        flooding.success_rate * 100.0, adaptive.success_rate * 100.0);
     eprintln!("Avg latency:          {:6.0}ms      {:6.0}ms",
-        flooding.avg_latency_ms, sequential.avg_latency_ms);
+        flooding.avg_latency_ms, adaptive.avg_latency_ms);
     eprintln!("Avg bytes sent:       {:6.0}        {:6.0}",
-        flooding.avg_bytes_sent, sequential.avg_bytes_sent);
+        flooding.avg_bytes_sent, adaptive.avg_bytes_sent);
     eprintln!("Avg bytes recv:       {:6.0}        {:6.0}",
-        flooding.avg_bytes_received, sequential.avg_bytes_received);
+        flooding.avg_bytes_received, adaptive.avg_bytes_received);
 
     // Analysis
     eprintln!("\n=== Analysis ===");
-    eprintln!("Flooding: Multi-hop forwarding, parallel requests to all peers");
-    eprintln!("Sequential: Single-hop only, tries peers one at a time (500ms timeout)");
+    eprintln!("Flooding: Query all peers simultaneously, first response wins");
+    eprintln!("Adaptive: Try best peer first (learned), fallback on failure (Freenet-style)");
     eprintln!();
-    if flooding.success_rate > sequential.success_rate {
-        eprintln!("Flooding has {:.1}% higher success rate (can reach multi-hop neighbors)",
-            (flooding.success_rate - sequential.success_rate) * 100.0);
+
+    if flooding.success_rate > adaptive.success_rate + 0.05 {
+        eprintln!("Flooding has {:.1}% higher success rate (parallel exploration)",
+            (flooding.success_rate - adaptive.success_rate) * 100.0);
+    } else if adaptive.success_rate > flooding.success_rate + 0.05 {
+        eprintln!("Adaptive has {:.1}% higher success rate (smart peer selection)",
+            (adaptive.success_rate - flooding.success_rate) * 100.0);
+    } else {
+        eprintln!("Similar success rates ({:.1}% vs {:.1}%)",
+            flooding.success_rate * 100.0, adaptive.success_rate * 100.0);
     }
-    if sequential.avg_bytes_sent < flooding.avg_bytes_sent && sequential.success_rate > 0.0 {
-        eprintln!("Sequential uses {:.0}x less bandwidth (single-hop, one peer at a time)",
-            flooding.avg_bytes_sent / sequential.avg_bytes_sent.max(1.0));
-    }
-    if sequential.avg_latency_ms < flooding.avg_latency_ms && sequential.success_rate > 0.0 {
-        eprintln!("Sequential is {:.0}ms faster when data is on direct neighbor",
-            flooding.avg_latency_ms - sequential.avg_latency_ms);
-    } else if sequential.avg_latency_ms > flooding.avg_latency_ms && sequential.success_rate > 0.0 {
-        eprintln!("Sequential has {:.0}ms higher latency (waits for timeout before trying next)",
-            sequential.avg_latency_ms - flooding.avg_latency_ms);
+
+    if adaptive.avg_bytes_sent < flooding.avg_bytes_sent * 0.8 && adaptive.success_rate > 0.5 {
+        eprintln!("Adaptive uses {:.1}x less bandwidth (queries fewer peers)",
+            flooding.avg_bytes_sent / adaptive.avg_bytes_sent.max(1.0));
     }
 
     eprintln!("\nDone!");

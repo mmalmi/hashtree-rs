@@ -1,4 +1,4 @@
-//! Large scale benchmark: flooding vs sequential
+//! Large scale benchmark: flooding vs adaptive routing
 
 use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
@@ -42,28 +42,28 @@ async fn main() {
         eprintln!("\nRunning 50 flooding benchmark requests (1KB data)...");
         let flooding = flooding_sim.run_benchmark(50, 1024, Duration::from_secs(5)).await;
 
-        // Run sequential simulation
-        eprintln!("Building sequential network...");
-        let sequential_config = SimConfig {
-            routing_strategy: RoutingStrategy::Sequential,
+        // Run adaptive simulation (Freenet-style)
+        eprintln!("Building adaptive network...");
+        let adaptive_config = SimConfig {
+            routing_strategy: RoutingStrategy::Adaptive,
             ..base_config
         };
-        let sequential_sim = Simulation::new(sequential_config);
-        sequential_sim.run().await;
+        let adaptive_sim = Simulation::new(adaptive_config);
+        adaptive_sim.run().await;
 
-        eprintln!("Running 50 sequential benchmark requests (1KB data)...");
-        let sequential = sequential_sim.run_benchmark(50, 1024, Duration::from_secs(5)).await;
+        eprintln!("Running 50 adaptive benchmark requests (1KB data)...");
+        let adaptive = adaptive_sim.run_benchmark(50, 1024, Duration::from_secs(5)).await;
 
-        eprintln!("\n{:<20} {:>12} {:>12}", "", "Flooding", "Sequential");
+        eprintln!("\n{:<20} {:>12} {:>12}", "", "Flooding", "Adaptive");
         eprintln!("{:-<20} {:->12} {:->12}", "", "", "");
         eprintln!("{:<20} {:>11.1}% {:>11.1}%", "Success rate",
-            flooding.success_rate * 100.0, sequential.success_rate * 100.0);
+            flooding.success_rate * 100.0, adaptive.success_rate * 100.0);
         eprintln!("{:<20} {:>11.0}ms {:>11.0}ms", "Avg latency",
-            flooding.avg_latency_ms, sequential.avg_latency_ms);
+            flooding.avg_latency_ms, adaptive.avg_latency_ms);
         eprintln!("{:<20} {:>12.0} {:>12.0}", "Bytes sent",
-            flooding.avg_bytes_sent, sequential.avg_bytes_sent);
+            flooding.avg_bytes_sent, adaptive.avg_bytes_sent);
         eprintln!("{:<20} {:>12.0} {:>12.0}", "Bytes recv",
-            flooding.avg_bytes_received, sequential.avg_bytes_received);
+            flooding.avg_bytes_received, adaptive.avg_bytes_received);
     }
 
     eprintln!("\nDone!");

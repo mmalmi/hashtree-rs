@@ -346,23 +346,15 @@ impl Simulation {
             current.to_string()
         };
 
-        // Sequential strategy: single-hop only (no forwarding) to avoid cascading timeouts
-        // Flooding strategy: multi-hop forwarding enabled for better coverage
-        let forward_requests = matches!(self.config.routing_strategy, RoutingStrategy::Flooding);
-
+        // Both Flooding and Adaptive use multi-hop forwarding
         let store_config = FloodingConfig {
             max_peers: self.config.max_peers,
             connect_timeout_ms: 5000,
             network_latency_ms: self.config.network_latency_ms,
             routing_strategy: self.config.routing_strategy,
-            forward_requests,
-            // Sequential: short per-peer timeout (500ms) since no forwarding
-            // Flooding: longer timeout (1s) for multi-hop forwarding
-            request_timeout: if forward_requests {
-                Duration::from_secs(1)
-            } else {
-                Duration::from_millis(500)
-            },
+            forward_requests: true, // Both strategies forward
+            // Timeout for multi-hop forwarding (longer to allow propagation)
+            request_timeout: Duration::from_secs(1),
             ..FloodingConfig::default()
         };
 
@@ -703,7 +695,7 @@ impl Simulation {
     ) -> BenchmarkResults {
         let strategy_name = match self.config.routing_strategy {
             RoutingStrategy::Flooding => "Flooding",
-            RoutingStrategy::Sequential => "Sequential",
+            RoutingStrategy::Adaptive => "Adaptive",
         };
         self.benchmark_with_strategy(strategy_name, num_requests, data_size, request_timeout).await
     }
@@ -712,7 +704,7 @@ impl Simulation {
     pub fn strategy_name(&self) -> &'static str {
         match self.config.routing_strategy {
             RoutingStrategy::Flooding => "Flooding",
-            RoutingStrategy::Sequential => "Sequential",
+            RoutingStrategy::Adaptive => "Adaptive",
         }
     }
 
