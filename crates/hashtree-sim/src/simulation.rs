@@ -728,7 +728,8 @@ impl Simulation {
     ) -> BenchmarkResults {
         let mut results = Vec::new();
 
-        let node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        let mut node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        node_ids.sort(); // Deterministic order for reproducible benchmarks
 
         if node_ids.len() < 2 {
             eprintln!("  Not enough nodes for benchmark");
