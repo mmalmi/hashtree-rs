@@ -12,6 +12,9 @@
 //!   --waves N       Number of waves (0=burst mode, >0=wave mode, default: 0)
 //!   --per-wave N    Requests per wave (default: 10)
 //!   --wave-gap MS   Gap between waves in ms (default: 500)
+//!   --max N         Max connections per node (default: 10)
+//!   --satisfied N   Satisfied connections threshold (default: 5)
+//!   --connectivity  Only test network formation, skip benchmarks
 
 use hashtree_sim::{PoolConfig, RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
@@ -22,6 +25,10 @@ fn parse_arg(args: &[String], flag: &str, default: u64) -> u64 {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
 }
 
 /// Stats from a single run
@@ -84,13 +91,18 @@ async fn main() {
     let use_waves = wave_count > 0;
     let per_wave = parse_arg(&args, "--per-wave", 10) as usize;
     let wave_gap_ms = parse_arg(&args, "--wave-gap", 500);
+    let max_connections = parse_arg(&args, "--max", 10) as usize;
+    let satisfied_connections = parse_arg(&args, "--satisfied", 5) as usize;
+    let connectivity_only = has_flag(&args, "--connectivity");
 
     eprintln!("=== Network Simulation ===\n");
 
     eprintln!("Configuration:");
     eprintln!("  Nodes: {}", node_count);
-    eprintln!("  Duration: {}s", duration_secs);
-    if use_waves {
+    eprintln!("  Pool: max={}, satisfied={}", max_connections, satisfied_connections);
+    if connectivity_only {
+        eprintln!("  Mode: Connectivity test only");
+    } else if use_waves {
         eprintln!("  Mode: Waves ({} waves × {} requests, {}ms gaps)", wave_count, per_wave, wave_gap_ms);
     } else {
         eprintln!("  Mode: Burst ({} requests per node)", num_requests);
@@ -112,12 +124,12 @@ async fn main() {
         // Different seed per run for variance
         let seed = 42 + run as u64;
 
-        // Use real WebRTC defaults for peer connections
+        // Use configured pool settings
         let config = SimConfig {
             node_count,
             duration: Duration::from_secs(duration_secs),
             seed,
-            pool: PoolConfig::default(), // Same as real WebRTC: max=10, satisfied=5
+            pool: PoolConfig { max_connections, satisfied_connections },
             discovery_interval_ms: 50, // Faster discovery
             churn_rate: 0.0,
             allow_rejoin: false,
@@ -142,11 +154,16 @@ async fn main() {
             extra_rounds += 1;
         }
 
-        eprintln!("Nodes: {}, Connections: {}, Components: {}",
-            topology.node_count, topology.connection_count, topology.component_count);
+        eprintln!("Nodes: {}, Connections: {}, Components: {}, Extra rounds: {}",
+            topology.node_count, topology.connection_count, topology.component_count, extra_rounds);
 
         if topology.component_count > 1 {
             eprintln!("  Warning: Network has {} disconnected components", topology.component_count);
+        }
+
+        // Skip benchmarks if connectivity-only mode
+        if connectivity_only {
+            continue;
         }
 
         let request_timeout = Duration::from_secs(30);

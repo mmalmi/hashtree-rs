@@ -481,7 +481,12 @@ impl Simulation {
             };
 
             let current_peers = running.store.peer_count().await;
-            if current_peers >= self.config.max_peers() {
+
+            // Use same logic as real WebRTC:
+            // - Below satisfied: actively initiate outbound connections
+            // - Between satisfied and max: only accept inbound (handled by handle_offer)
+            // - At max: reject all
+            if !self.config.pool.needs_peers(current_peers) {
                 continue;
             }
 

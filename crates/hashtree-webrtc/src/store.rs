@@ -449,12 +449,9 @@ impl<S: Store + 'static> WebRTCStore<S> {
                 // Store peer roots
                 peer_roots.write().await.insert(peer_id.clone(), roots.clone());
 
-                // Initiate connection if we need more peers in this pool
-                // Use deterministic tie-breaker: lower peer_id initiates connection
-                use crate::types::should_initiate_connection;
-                let should_initiate = should_initiate_connection(local_peer_id, peer_id.as_str());
-
-                if Self::pool_needs_peers(pool, follows_count, other_count, config) && should_initiate {
+                // Perfect negotiation: send offer if we NEED more peers
+                // Both sides may send offers - collisions handled in offer handler
+                if Self::pool_needs_peers(pool, follows_count, other_count, config) {
                     if let Some(remote_id) = PeerId::from_peer_string(peer_id) {
                         if !peers.read().await.contains_key(peer_id) {
                             if config.debug {

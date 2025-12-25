@@ -4,9 +4,12 @@
 //!
 //! ## Architecture
 //!
+//! The preferred approach is to use `webrtc_sim` which uses the exact same
+//! code as production WebRTCStore with mock transports.
+//!
+//! - `webrtc_sim::Simulation` - uses GenericStore with mock transports (RECOMMENDED)
 //! - `SimStore` - local-only storage (implements hashtree_core::Store)
-//! - `FloodingStore` - complete P2P node with signaling + multi-hop forwarding (like WebRTCStore)
-//! - `SequentialStore` - sends to one peer at a time, forwards if not found locally
+//! - `FloodingStore` - legacy P2P node (DEPRECATED - use webrtc_sim instead)
 //! - `MockRelay` - Nostr-like relay for signaling
 //! - `PeerChannel` trait - abstraction for peer communication
 
@@ -20,6 +23,7 @@ mod relay;
 mod sequential;
 mod simulation;
 mod store;
+pub mod webrtc_sim;
 pub mod ws_relay;
 
 pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};

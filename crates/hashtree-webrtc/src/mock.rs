@@ -40,12 +40,14 @@ impl MockRelay {
     }
 
     /// Create a transport connected to this relay
-    pub fn connect(&self, peer_id: String) -> MockRelayTransport {
+    pub fn create_transport(&self, peer_id: String, pubkey: String) -> MockRelayTransport {
         MockRelayTransport {
             peer_id,
+            pubkey,
             tx: self.tx.clone(),
             rx: tokio::sync::Mutex::new(self.tx.subscribe()),
             buffer: tokio::sync::Mutex::new(Vec::new()),
+            connected: AtomicBool::new(false),
         }
     }
 }
@@ -60,14 +62,40 @@ impl Default for MockRelay {
 /// Mock relay transport using broadcast channels
 pub struct MockRelayTransport {
     peer_id: String,
+    pubkey: String,
     tx: broadcast::Sender<SignalingMessage>,
     rx: tokio::sync::Mutex<broadcast::Receiver<SignalingMessage>>,
     buffer: tokio::sync::Mutex<Vec<SignalingMessage>>,
+    connected: AtomicBool,
+}
+
+impl MockRelayTransport {
+    /// Get our peer ID
+    pub fn peer_id_owned(&self) -> String {
+        self.peer_id.clone()
+    }
+
+    /// Get our pubkey
+    pub fn pubkey_owned(&self) -> String {
+        self.pubkey.clone()
+    }
 }
 
 #[async_trait]
 impl RelayTransport for MockRelayTransport {
+    async fn connect(&self, _relays: &[String]) -> Result<(), TransportError> {
+        self.connected.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn disconnect(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+    }
+
     async fn publish(&self, msg: SignalingMessage) -> Result<(), TransportError> {
+        if !self.connected.load(Ordering::Relaxed) {
+            return Err(TransportError::NotConnected);
+        }
         self.tx
             .send(msg)
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
@@ -127,6 +155,10 @@ impl RelayTransport for MockRelayTransport {
 
     fn peer_id(&self) -> &str {
         &self.peer_id
+    }
+
+    fn pubkey(&self) -> &str {
+        &self.pubkey
     }
 }
 

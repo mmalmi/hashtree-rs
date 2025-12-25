@@ -2,6 +2,24 @@
 
 P2P network simulation for hashtree, testing routing strategies and network behavior.
 
+## Recommended: webrtc_sim
+
+The `webrtc_sim` module uses the **exact same code** as production WebRTCStore,
+just with mock transports. This is the recommended approach for testing:
+
+```rust
+use hashtree_sim::webrtc_sim::{Simulation, SimConfig};
+
+let config = SimConfig {
+    node_count: 100,
+    pool: PoolConfig { max_connections: 10, satisfied_connections: 5 },
+    ..Default::default()
+};
+
+let sim = Simulation::new(config);
+sim.run().await;
+```
+
 ## Shared Code with Production
 
 The simulation uses the **same types and defaults as production WebRTC**:
@@ -34,16 +52,23 @@ In P2P networks, nodes may form disconnected "components" (islands) if there are
 
 The default `max_connections: 10` works well for networks up to ~10K nodes.
 
-### Discovery and Tie-Breaking
+### Discovery with Perfect Negotiation
 
-Nodes discover each other via Hello messages on a mock relay. When two nodes see each other's Hello, they use a **deterministic tie-breaker** to decide who initiates:
+Nodes discover each other via Hello messages on a mock relay. We use the WebRTC **"perfect negotiation"** pattern:
+
+1. When a node sees a Hello and NEEDS more peers (below `satisfied_connections`), it sends an offer
+2. Both peers may send offers simultaneously - this is expected, not an error
+3. On collision (both sent offers), the **"polite" peer** (lower ID) backs off and accepts the incoming offer
+4. The **"impolite" peer** (higher ID) ignores the incoming offer and waits for their answer
 
 ```rust
-// Lower peer_id initiates connection
-let should_initiate = local_peer_id < remote_peer_id;
+// Polite peer backs off on collision
+fn is_polite_peer(local_id: &str, remote_id: &str) -> bool {
+    local_id < remote_id  // Lower ID is polite
+}
 ```
 
-This is the same logic used in production WebRTC (`should_initiate_connection()` in `hashtree-webrtc`).
+**Why perfect negotiation?** With simple tie-breaking, if peer A is "satisfied" and peer B needs connections, B might not be able to connect if A was supposed to initiate. Perfect negotiation solves this: B sends an offer, A accepts it (since A can still accept up to `max_connections`).
 
 ## Routing Strategies
 
@@ -105,4 +130,5 @@ cargo run --example run_simulation -- --bench --runs 5
 2. **Adaptive beats Flooding** for bandwidth efficiency once it learns peer quality
 3. **Latency variation** is important - uniform latency is unrealistic
 4. **Multi-hop forwarding** dramatically increases reach but adds latency
-5. **Tie-breaking** must be deterministic to prevent duplicate connections
+5. **Perfect negotiation beats simple tie-breaking**: With simple "lower ID initiates" tie-breaking, satisfied nodes don't initiate, leaving unsatisfied nodes unable to connect to them. Perfect negotiation (both sides can send offers, collisions resolved by polite/impolite) solves this by letting unsatisfied nodes reach satisfied-but-not-full nodes.
+6. **Use same code for simulation**: Using the exact same signaling code as production ensures simulation behavior matches reality. The `webrtc_sim` module does this.

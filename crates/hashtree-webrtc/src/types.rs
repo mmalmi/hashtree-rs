@@ -126,16 +126,19 @@ impl SignalingMessage {
     }
 }
 
-/// Deterministic tie-breaker for connection initiation
+/// Perfect negotiation: determine if we are the "polite" peer
 ///
-/// When two peers discover each other (via Hello messages), both could try
-/// to initiate a connection. This function provides a deterministic rule
-/// to decide which peer should initiate: the one with the lexicographically
-/// lower peer ID.
+/// In WebRTC perfect negotiation, both peers can send offers simultaneously.
+/// When a collision occurs (we receive an offer while we have a pending offer),
+/// the "polite" peer backs off and accepts the incoming offer instead.
 ///
-/// This ensures exactly one connection attempt per peer pair.
+/// The "impolite" peer (higher ID) keeps their offer and ignores the incoming one.
+///
+/// This pattern ensures connections form even when one peer is "satisfied" -
+/// the unsatisfied peer can still initiate and the satisfied peer will accept.
 #[inline]
-pub fn should_initiate_connection(local_peer_id: &str, remote_peer_id: &str) -> bool {
+pub fn is_polite_peer(local_peer_id: &str, remote_peer_id: &str) -> bool {
+    // Lower ID is "polite" - they back off on collision
     local_peer_id < remote_peer_id
 }
 
@@ -294,11 +297,31 @@ pub struct PoolConfig {
     pub satisfied_connections: usize,
 }
 
+impl PoolConfig {
+    /// Check if we can accept more peers (below max)
+    #[inline]
+    pub fn can_accept(&self, current_count: usize) -> bool {
+        current_count < self.max_connections
+    }
+
+    /// Check if we need more peers (below satisfied)
+    #[inline]
+    pub fn needs_peers(&self, current_count: usize) -> bool {
+        current_count < self.satisfied_connections
+    }
+
+    /// Check if we're satisfied (at or above satisfied threshold)
+    #[inline]
+    pub fn is_satisfied(&self, current_count: usize) -> bool {
+        current_count >= self.satisfied_connections
+    }
+}
+
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_connections: 10,
-            satisfied_connections: 5,
+            max_connections: 20,
+            satisfied_connections: 10,
         }
     }
 }
@@ -318,8 +341,8 @@ impl Default for PoolSettings {
                 satisfied_connections: 10,
             },
             other: PoolConfig {
-                max_connections: 10,
-                satisfied_connections: 5,
+                max_connections: 20,
+                satisfied_connections: 10,
             },
         }
     }

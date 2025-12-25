@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::types::SignalingMessage;
 
 /// Errors from relay transport operations
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum TransportError {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
@@ -22,6 +22,8 @@ pub enum TransportError {
     Timeout,
     #[error("Disconnected")]
     Disconnected,
+    #[error("Not connected")]
+    NotConnected,
 }
 
 /// Relay transport for signaling messages
@@ -30,17 +32,27 @@ pub enum TransportError {
 /// can be shared between real and simulated implementations.
 #[async_trait]
 pub trait RelayTransport: Send + Sync {
+    /// Connect to relays and start listening
+    async fn connect(&self, relays: &[String]) -> Result<(), TransportError>;
+
+    /// Disconnect from relays
+    async fn disconnect(&self);
+
     /// Publish a signaling message to the relay
+    /// If target is Some, message is directed; otherwise broadcast
     async fn publish(&self, msg: SignalingMessage) -> Result<(), TransportError>;
 
-    /// Receive the next signaling message from the relay
+    /// Receive the next signaling message from the relay (blocking)
     async fn recv(&self) -> Option<SignalingMessage>;
 
     /// Try to receive without blocking
     fn try_recv(&self) -> Option<SignalingMessage>;
 
-    /// Get our peer ID
+    /// Get our peer ID (uuid part)
     fn peer_id(&self) -> &str;
+
+    /// Get our public key
+    fn pubkey(&self) -> &str;
 }
 
 /// Data channel for peer-to-peer communication
@@ -115,5 +127,57 @@ impl Default for SignalingConfig {
             roots: Vec::new(),
             debug: false,
         }
+    }
+}
+
+// Blanket implementations for Arc<T> to allow calling trait methods on Arc-wrapped transports
+
+#[async_trait]
+impl<T: RelayTransport + ?Sized> RelayTransport for Arc<T> {
+    async fn connect(&self, relays: &[String]) -> Result<(), TransportError> {
+        (**self).connect(relays).await
+    }
+
+    async fn disconnect(&self) {
+        (**self).disconnect().await
+    }
+
+    async fn publish(&self, msg: SignalingMessage) -> Result<(), TransportError> {
+        (**self).publish(msg).await
+    }
+
+    async fn recv(&self) -> Option<SignalingMessage> {
+        (**self).recv().await
+    }
+
+    fn try_recv(&self) -> Option<SignalingMessage> {
+        (**self).try_recv()
+    }
+
+    fn peer_id(&self) -> &str {
+        (**self).peer_id()
+    }
+
+    fn pubkey(&self) -> &str {
+        (**self).pubkey()
+    }
+}
+
+#[async_trait]
+impl<T: DataChannel + ?Sized> DataChannel for Arc<T> {
+    async fn send(&self, data: Vec<u8>) -> Result<(), TransportError> {
+        (**self).send(data).await
+    }
+
+    async fn recv(&self) -> Option<Vec<u8>> {
+        (**self).recv().await
+    }
+
+    fn is_open(&self) -> bool {
+        (**self).is_open()
+    }
+
+    async fn close(&self) {
+        (**self).close().await
     }
 }

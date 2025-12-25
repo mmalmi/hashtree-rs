@@ -148,6 +148,10 @@ struct IncomingMessage {
 /// - Peer management (connection establishment, channel handling)
 /// - Data transfer (flooding requests, HTL-based forwarding)
 /// - Adaptive peer selection (preferring reliable, fast peers)
+///
+/// DEPRECATED: Use `webrtc_sim::Simulation` with GenericStore instead.
+/// This uses the exact same code as production WebRTCStore.
+#[deprecated(since = "0.2.0", note = "Use webrtc_sim::Simulation with GenericStore instead")]
 pub struct FloodingStore {
     /// Node ID (string for signaling)
     id: String,
@@ -369,7 +373,8 @@ impl FloodingStore {
         if self.pending_outbound.read().await.contains_key(target) {
             return Ok(());
         }
-        if self.peers.read().await.len() >= self.config.max_peers() {
+        // Use same pool logic as real WebRTC
+        if !self.config.pool.can_accept(self.peers.read().await.len()) {
             return Ok(());
         }
 
@@ -419,7 +424,8 @@ impl FloodingStore {
         if self.peers.read().await.contains_key(&from_id) {
             return Ok(());
         }
-        if self.peers.read().await.len() >= self.config.max_peers() {
+        // Use same pool logic as real WebRTC (can_accept for incoming)
+        if !self.config.pool.can_accept(self.peers.read().await.len()) {
             return Ok(());
         }
 
@@ -512,7 +518,15 @@ impl FloodingStore {
         None
     }
 
-    /// Handle incoming hello message - use deterministic tie-breaker for connection
+    /// Handle incoming hello message - perfect negotiation pattern
+    ///
+    /// This uses WebRTC "perfect negotiation" pattern:
+    /// 1. Check if we can accept more peers (below max)
+    /// 2. If we NEED more peers (below satisfied), send an offer
+    /// 3. Both peers may send offers - collisions resolved by polite/impolite pattern
+    ///
+    /// The polite peer (lower ID) backs off on collision and accepts incoming offer.
+    /// This ensures connections form even when one peer is satisfied but can accept.
     async fn handle_hello(self: &Arc<Self>, client: &RelayClient, event: &Event) {
         let from = &event.pubkey;
 
@@ -533,16 +547,16 @@ impl FloodingStore {
             return;
         }
 
-        // At max peers?
-        if self.peers.read().await.len() >= self.config.max_peers() {
+        let peer_count = self.peers.read().await.len();
+
+        // Check pool limits - can we accept at all?
+        if !self.config.pool.can_accept(peer_count) {
             return;
         }
 
-        // Use the same tie-breaker as real WebRTC
-        use hashtree_webrtc::should_initiate_connection;
-        let should_initiate = should_initiate_connection(&self.id, from);
-
-        if should_initiate {
+        // Perfect negotiation: send offer if we NEED more peers
+        // Both sides may send offers - collisions handled in handle_offer
+        if self.config.pool.needs_peers(peer_count) {
             let _ = self.send_offer(client, from).await;
         }
     }
