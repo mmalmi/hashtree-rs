@@ -91,6 +91,7 @@ impl Default for RoutingStrategy {
 /// Configuration for FloodingStore
 #[derive(Clone)]
 pub struct FloodingConfig {
+    // Note: routing_strategy can be overridden at runtime via set_routing_strategy()
     /// Per-peer timeout (Adaptive: per peer, Flooding: overall)
     pub request_timeout: Duration,
     /// Enable multi-hop forwarding (using HTL)
@@ -162,6 +163,8 @@ pub struct FloodingStore {
     msg_tx: mpsc::Sender<IncomingMessage>,
     /// Configuration
     config: FloodingConfig,
+    /// Runtime strategy override (if Some, overrides config.routing_strategy)
+    strategy_override: RwLock<Option<RoutingStrategy>>,
     /// Total bytes sent
     bytes_sent: AtomicU64,
     /// Total bytes received
@@ -205,6 +208,7 @@ impl FloodingStore {
             pending_outbound: RwLock::new(HashMap::new()),
             msg_tx,
             config,
+            strategy_override: RwLock::new(None),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             shutdown_tx,
@@ -239,6 +243,24 @@ impl FloodingStore {
     /// Get local store reference
     pub fn local(&self) -> &Arc<SimStore> {
         &self.local
+    }
+
+    /// Get current routing strategy (respects runtime override)
+    pub async fn routing_strategy(&self) -> RoutingStrategy {
+        self.strategy_override
+            .read()
+            .await
+            .unwrap_or(self.config.routing_strategy)
+    }
+
+    /// Override routing strategy at runtime (for benchmarking same topology with different strategies)
+    pub async fn set_routing_strategy(&self, strategy: RoutingStrategy) {
+        *self.strategy_override.write().await = Some(strategy);
+    }
+
+    /// Clear routing strategy override (use config default)
+    pub async fn clear_routing_strategy_override(&self) {
+        *self.strategy_override.write().await = None;
     }
 
     // ==================== Signaling ====================
@@ -538,7 +560,7 @@ impl FloodingStore {
 
     /// Fetch from peers (optionally excluding one)
     async fn fetch_from_peers(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
-        match self.config.routing_strategy {
+        match self.routing_strategy().await {
             RoutingStrategy::Flooding => self.fetch_from_peers_flooding(hash, exclude).await,
             RoutingStrategy::Adaptive => self.fetch_from_peers_adaptive(hash, exclude).await,
         }

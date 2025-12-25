@@ -659,6 +659,14 @@ impl Simulation {
         self.nodes.read().await.len()
     }
 
+    /// Set routing strategy for all nodes (for benchmarking same topology with different strategies)
+    pub async fn set_routing_strategy(&self, strategy: RoutingStrategy) {
+        let nodes = self.nodes.read().await;
+        for (_, running) in nodes.iter() {
+            running.store.set_routing_strategy(strategy).await;
+        }
+    }
+
     /// Print topology summary
     pub fn print_topology_stats(stats: &TopologyStats) {
         println!("=== Topology Analysis ===");
@@ -699,6 +707,17 @@ impl Simulation {
             RoutingStrategy::Flooding => "Flooding",
             RoutingStrategy::Adaptive => "Adaptive",
         };
+        self.benchmark_with_strategy(strategy_name, num_requests, data_size, request_timeout).await
+    }
+
+    /// Run benchmark with explicit strategy name (for when strategy is overridden at runtime)
+    pub async fn run_benchmark_named(
+        &self,
+        strategy_name: &str,
+        num_requests: usize,
+        data_size: usize,
+        request_timeout: Duration,
+    ) -> BenchmarkResults {
         self.benchmark_with_strategy(strategy_name, num_requests, data_size, request_timeout).await
     }
 

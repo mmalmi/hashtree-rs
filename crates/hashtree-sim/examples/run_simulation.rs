@@ -9,7 +9,7 @@
 //!   --requests N    Number of benchmark requests (default: 10)
 //!   --latency MS    Network latency per hop in ms (default: 10)
 
-use hashtree_sim::{clear_channel_registry, RoutingStrategy, SimConfig, Simulation};
+use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
 
 fn parse_arg(args: &[String], flag: &str, default: u64) -> u64 {
@@ -54,39 +54,27 @@ async fn main() {
         base_config.network_latency_ms,
         base_config.latency_variation * 100.0);
 
-    // Run flooding simulation
-    eprintln!("\n=== Running Flooding Simulation ===");
-    clear_channel_registry().await; // Clear global state for deterministic results
-    let flooding_config = SimConfig {
-        routing_strategy: RoutingStrategy::Flooding,
-        ..base_config
-    };
-    let flooding_sim = Simulation::new(flooding_config);
-    flooding_sim.run().await;
-    let flooding_topology = flooding_sim.analyze_topology().await;
+    // Build ONE network and test both strategies on it (same topology = fair comparison)
+    eprintln!("\n=== Building Network ===");
+    let sim = Simulation::new(base_config);
+    sim.run().await;
+
+    let topology = sim.analyze_topology().await;
+    eprintln!("Nodes: {}, Connections: {}, Components: {}",
+        topology.node_count, topology.connection_count, topology.component_count);
+
     // Timeout should be enough for multi-hop
     let request_timeout = Duration::from_millis(500 + latency_ms * 10);
-    let flooding = flooding_sim.run_benchmark(num_requests, 1024, request_timeout).await;
 
-    // Run adaptive simulation (Freenet-style: try best peer, learn, fallback)
-    eprintln!("\n=== Running Adaptive Simulation ===");
-    clear_channel_registry().await; // Clear global state for deterministic results
-    let adaptive_config = SimConfig {
-        routing_strategy: RoutingStrategy::Adaptive,
-        ..base_config
-    };
-    let adaptive_sim = Simulation::new(adaptive_config);
-    adaptive_sim.run().await;
-    let adaptive = adaptive_sim.run_benchmark(num_requests, 1024, request_timeout).await;
+    // Test flooding strategy on this network
+    eprintln!("\n=== Running Flooding Benchmark ===");
+    sim.set_routing_strategy(RoutingStrategy::Flooding).await;
+    let flooding = sim.run_benchmark_named("Flooding", num_requests, 1024, request_timeout).await;
 
-    // Print both topologies to verify they match
-    let adaptive_topology = adaptive_sim.analyze_topology().await;
-    eprintln!("\n=== Flooding Topology ===");
-    eprintln!("Nodes: {}, Connections: {}, Components: {}",
-        flooding_topology.node_count, flooding_topology.connection_count, flooding_topology.component_count);
-    eprintln!("\n=== Adaptive Topology ===");
-    eprintln!("Nodes: {}, Connections: {}, Components: {}",
-        adaptive_topology.node_count, adaptive_topology.connection_count, adaptive_topology.component_count);
+    // Test adaptive strategy on SAME network
+    eprintln!("\n=== Running Adaptive Benchmark ===");
+    sim.set_routing_strategy(RoutingStrategy::Adaptive).await;
+    let adaptive = sim.run_benchmark_named("Adaptive", num_requests, 1024, request_timeout).await;
 
     // Print detailed results
     eprintln!("\n=== Flooding vs Adaptive Comparison ===");
