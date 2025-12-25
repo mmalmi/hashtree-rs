@@ -37,8 +37,11 @@ pub struct SimConfig {
     pub churn_rate: f64,
     /// Whether departed nodes can rejoin
     pub allow_rejoin: bool,
-    /// Simulated network latency per hop (e.g., 50ms for realistic WebRTC)
+    /// Mean network latency per hop (e.g., 50ms for realistic WebRTC)
     pub network_latency_ms: u64,
+    /// Latency variation coefficient (0.0-1.0) - how much latency varies per link
+    /// 0.0 = all links have same latency, 0.5 = latency varies by ±50%
+    pub latency_variation: f64,
     /// Routing strategy for data requests
     pub routing_strategy: RoutingStrategy,
 }
@@ -54,6 +57,7 @@ impl Default for SimConfig {
             churn_rate: 0.01, // 1% chance per interval
             allow_rejoin: true,
             network_latency_ms: 50, // 50ms simulated network latency per hop
+            latency_variation: 0.3, // ±30% variation by default (realistic variance)
             routing_strategy: RoutingStrategy::Flooding,
         }
     }
@@ -351,6 +355,8 @@ impl Simulation {
             max_peers: self.config.max_peers,
             connect_timeout_ms: 5000,
             network_latency_ms: self.config.network_latency_ms,
+            latency_variation: self.config.latency_variation,
+            latency_seed: self.config.seed, // Use same seed for reproducibility
             routing_strategy: self.config.routing_strategy,
             forward_requests: true, // Both strategies forward
             // Timeout for multi-hop forwarding (longer to allow propagation)
@@ -838,6 +844,7 @@ mod tests {
             churn_rate: 0.0, // No churn for basic test
             allow_rejoin: false,
             network_latency_ms: 0, // No latency for unit tests
+            latency_variation: 0.0,
             routing_strategy: RoutingStrategy::Flooding,
         };
 
@@ -863,6 +870,7 @@ mod tests {
             churn_rate: 0.05, // 5% churn rate
             allow_rejoin: true,
             network_latency_ms: 0,
+            latency_variation: 0.0,
             routing_strategy: RoutingStrategy::Flooding,
         };
 
@@ -891,6 +899,7 @@ mod tests {
             churn_rate: 0.0,
             allow_rejoin: false,
             network_latency_ms: 0,
+            latency_variation: 0.0,
             routing_strategy: RoutingStrategy::Flooding,
         };
 

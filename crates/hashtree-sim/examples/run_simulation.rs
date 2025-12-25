@@ -41,6 +41,7 @@ async fn main() {
         churn_rate: 0.0,
         allow_rejoin: false,
         network_latency_ms: latency_ms,
+        latency_variation: 0.3, // ±30% variation per link
         routing_strategy: RoutingStrategy::Flooding, // Will be overridden
     };
 
@@ -49,7 +50,9 @@ async fn main() {
     eprintln!("  Duration: {:?}", base_config.duration);
     eprintln!("  Requests: {}", num_requests);
     eprintln!("  Max peers: {}", base_config.max_peers);
-    eprintln!("  Network latency: {}ms per hop", base_config.network_latency_ms);
+    eprintln!("  Network latency: {}ms ±{:.0}% per link",
+        base_config.network_latency_ms,
+        base_config.latency_variation * 100.0);
 
     // Run flooding simulation
     eprintln!("\n=== Running Flooding Simulation ===");

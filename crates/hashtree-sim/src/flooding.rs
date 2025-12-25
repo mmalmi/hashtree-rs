@@ -60,10 +60,12 @@ struct PendingConnection {
     our_channel: Arc<MockChannel>,
 }
 
-/// Connected peer with its HTL config
+/// Connected peer with its HTL config and link characteristics
 struct ConnectedPeer {
     channel: Arc<dyn PeerChannel>,
     htl_config: PeerHTLConfig,
+    /// Per-link latency in ms (varies per connection)
+    link_latency_ms: u64,
 }
 
 /// Routing strategy for data requests
@@ -97,13 +99,18 @@ pub struct FloodingConfig {
     pub max_peers: usize,
     /// Connection timeout (ms)
     pub connect_timeout_ms: u64,
-    /// Simulated network latency per hop (ms)
+    /// Mean network latency per hop (ms) - used as center of distribution
     /// Set to 0 for instant delivery (unit tests), ~50ms for realistic WebRTC
     pub network_latency_ms: u64,
+    /// Latency variation coefficient (0.0-1.0) - how much latency varies per link
+    /// 0.0 = all links have same latency, 0.5 = latency varies by ±50%
+    pub latency_variation: f64,
     /// Routing strategy for data requests
     pub routing_strategy: RoutingStrategy,
     /// Peer selection strategy (used by Adaptive routing to order peers)
     pub selection_strategy: SelectionStrategy,
+    /// Random seed for per-link latency generation (reproducible simulations)
+    pub latency_seed: u64,
 }
 
 impl Default for FloodingConfig {
@@ -115,8 +122,10 @@ impl Default for FloodingConfig {
             max_peers: 5,
             connect_timeout_ms: 5000,
             network_latency_ms: 0, // Instant for tests, set to ~50 for realistic simulation
+            latency_variation: 0.0, // No variation by default (uniform latency)
             routing_strategy: RoutingStrategy::Adaptive,
             selection_strategy: SelectionStrategy::Weighted,
+            latency_seed: 42,
         }
     }
 }
@@ -271,15 +280,40 @@ impl FloodingStore {
         client.subscribe("discovery", vec![filter]).await
     }
 
-    /// Send data to a channel with simulated network latency
-    async fn send_with_latency(
+    /// Generate per-link latency based on config and peer IDs
+    /// Deterministic: same node pair always gets same latency (for reproducible comparisons)
+    fn generate_link_latency(&self, peer_id: u64) -> u64 {
+        let base = self.config.network_latency_ms;
+        if base == 0 || self.config.latency_variation <= 0.0 {
+            return base;
+        }
+
+        // Deterministic hash based on both node IDs (order-independent for symmetric latency)
+        // XOR is commutative, so A↔B and B↔A get same latency
+        let link_hash = self.node_id ^ peer_id;
+        // Mix with seed for different runs to produce different (but reproducible) latencies
+        let mixed = link_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(self.config.latency_seed);
+
+        // Convert to variation factor in range [1-variation, 1+variation]
+        let variation = self.config.latency_variation;
+        let normalized = (mixed as f64) / (u64::MAX as f64); // 0.0 to 1.0
+        let factor = 1.0 + variation * (2.0 * normalized - 1.0); // [1-var, 1+var]
+
+        // Ensure latency is at least 1ms and at most 5x base
+        let latency = (base as f64 * factor).round() as u64;
+        latency.max(1).min(base * 5)
+    }
+
+    /// Send data to a channel with per-link latency
+    async fn send_with_link_latency(
         &self,
         channel: &dyn PeerChannel,
         data: Vec<u8>,
+        link_latency_ms: u64,
     ) -> Result<(), crate::channel::ChannelError> {
-        // Simulate network latency (one-way delay)
-        if self.config.network_latency_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(self.config.network_latency_ms)).await;
+        // Simulate network latency (one-way delay) using per-link value
+        if link_latency_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(link_latency_ms)).await;
         }
         channel.send(data).await
     }
@@ -436,9 +470,13 @@ impl FloodingStore {
         // Generate random HTL config for this peer (Freenet-style)
         let htl_config = PeerHTLConfig::random();
 
+        // Generate per-link latency (deterministic based on node pair for reproducibility)
+        let link_latency_ms = self.generate_link_latency(peer_id);
+
         self.peers.write().await.insert(peer_id, ConnectedPeer {
             channel: channel.clone(),
             htl_config,
+            link_latency_ms,
         });
 
         // Register with peer selector for adaptive selection
@@ -519,7 +557,8 @@ impl FloodingStore {
             let outgoing_htl = decrement_htl(MAX_HTL, &peer.htl_config);
             let request_bytes = encode_request(hash, outgoing_htl);
 
-            if self.send_with_latency(peer.channel.as_ref(), request_bytes.clone()).await.is_ok() {
+            // Use per-link latency for this peer
+            if self.send_with_link_latency(peer.channel.as_ref(), request_bytes.clone(), peer.link_latency_ms).await.is_ok() {
                 self.bytes_sent
                     .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
                 sent_to.push(peer_id);
@@ -573,10 +612,10 @@ impl FloodingStore {
 
         // Try each peer in order (best peers first, like Freenet's closerPeer())
         for peer_id in ordered_peer_ids {
-            let (channel, htl_config) = {
+            let (channel, htl_config, link_latency_ms) = {
                 let peers = self.peers.read().await;
                 match peers.get(&peer_id) {
-                    Some(peer) => (peer.channel.clone(), peer.htl_config.clone()),
+                    Some(peer) => (peer.channel.clone(), peer.htl_config.clone(), peer.link_latency_ms),
                     None => continue, // Peer disconnected
                 }
             };
@@ -590,8 +629,8 @@ impl FloodingStore {
             self.peer_selector.write().await.record_request(peer_id, request_size);
             let request_start = std::time::Instant::now();
 
-            // Send request
-            if self.send_with_latency(channel.as_ref(), request_bytes.clone()).await.is_err() {
+            // Send request with per-link latency
+            if self.send_with_link_latency(channel.as_ref(), request_bytes.clone(), link_latency_ms).await.is_err() {
                 self.peer_selector.write().await.record_failure(peer_id);
                 continue; // Try next peer
             }
@@ -680,7 +719,7 @@ impl FloodingStore {
         if let Some(data) = self.local.get_local(&hash) {
             let response = encode_response(&hash, &data);
             if let Some(peer) = self.peers.read().await.get(&from_peer) {
-                if self.send_with_latency(peer.channel.as_ref(), response.clone()).await.is_ok() {
+                if self.send_with_link_latency(peer.channel.as_ref(), response.clone(), peer.link_latency_ms).await.is_ok() {
                     self.bytes_sent
                         .fetch_add(response.len() as u64, Ordering::Relaxed);
                 }
@@ -732,7 +771,7 @@ impl FloodingStore {
                 }
 
                 let request_bytes = encode_request(&hash, outgoing_htl);
-                if self.send_with_latency(peer.channel.as_ref(), request_bytes.clone()).await.is_ok() {
+                if self.send_with_link_latency(peer.channel.as_ref(), request_bytes.clone(), peer.link_latency_ms).await.is_ok() {
                     self.bytes_sent
                         .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
                 }
@@ -776,7 +815,7 @@ impl FloodingStore {
             let peers = self.peers.read().await;
             for requester_id in forwarded.from_peers {
                 if let Some(peer) = peers.get(&requester_id) {
-                    if self.send_with_latency(peer.channel.as_ref(), response.clone()).await.is_ok() {
+                    if self.send_with_link_latency(peer.channel.as_ref(), response.clone(), peer.link_latency_ms).await.is_ok() {
                         self.bytes_sent
                             .fetch_add(response.len() as u64, Ordering::Relaxed);
                     }

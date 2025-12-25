@@ -32,6 +32,7 @@ async fn main() {
             churn_rate: 0.0,
             allow_rejoin: false,
             network_latency_ms: 10,
+            latency_variation: 0.3,
             routing_strategy: RoutingStrategy::Flooding,
         };
 
@@ -69,6 +70,7 @@ async fn main() {
             churn_rate: 0.0,
             allow_rejoin: false,
             network_latency_ms: 10,
+            latency_variation: 0.3,
             routing_strategy: RoutingStrategy::Flooding,
         };
 
@@ -106,6 +108,7 @@ async fn main() {
             churn_rate: 0.0,
             allow_rejoin: false,
             network_latency_ms: 10,
+            latency_variation: 0.3,
             routing_strategy: RoutingStrategy::Flooding,
         };
 
@@ -146,6 +149,7 @@ async fn main() {
             churn_rate: 0.0,
             allow_rejoin: false,
             network_latency_ms: 10,
+            latency_variation: 0.3,
             routing_strategy: RoutingStrategy::Flooding,
         };
 
@@ -185,6 +189,7 @@ async fn main() {
         churn_rate: 0.0,
         allow_rejoin: false,
         network_latency_ms: 50,
+        latency_variation: 0.3,
         routing_strategy: RoutingStrategy::Flooding,
     };
 
