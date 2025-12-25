@@ -104,12 +104,13 @@ pub struct BlossomConfig {
     pub max_upload_mb: u64,
 }
 
+// Keep in sync with hashtree-config/src/lib.rs
 fn default_read_servers() -> Vec<String> {
     vec!["https://cdn.iris.to".to_string(), "https://hashtree.iris.to".to_string()]
 }
 
 fn default_write_servers() -> Vec<String> {
-    vec!["https://hashtree.iris.to".to_string()]
+    vec!["https://upload.iris.to".to_string()]
 }
 
 fn default_max_upload_mb() -> u64 {

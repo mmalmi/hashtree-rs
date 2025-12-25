@@ -15,7 +15,7 @@ pub const DEFAULT_READ_SERVERS: &[&str] = &[
 
 /// Default write-enabled file servers
 pub const DEFAULT_WRITE_SERVERS: &[&str] = &[
-    "https://hashtree.iris.to",
+    "https://upload.iris.to",
 ];
 
 /// Default nostr relays
@@ -353,6 +353,6 @@ write_servers = ["https://custom.server"]
 
         let write = config.all_write_servers();
         assert!(write.contains(&"https://legacy.server".to_string()));
-        assert!(write.contains(&"https://hashtree.iris.to".to_string()));
+        assert!(write.contains(&"https://upload.iris.to".to_string()));
     }
 }
