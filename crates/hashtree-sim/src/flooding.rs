@@ -42,12 +42,18 @@ struct OurRequest {
 }
 
 /// Track forwarded requests to route responses back
-/// Key: hash, Value: (from_peer_id, htl_when_received)
+/// Key: hash, Value: list of peers waiting for response
 struct ForwardedRequest {
-    from_peer: u64,
+    /// All peers who requested this hash (to send response to all)
+    from_peers: Vec<u64>,
+    /// When this request was first received (for TTL expiration)
+    created_at: std::time::Instant,
     #[allow(dead_code)]
     received_htl: u8,
 }
+
+/// Max time to keep a forwarded request entry before expiring (prevents unbounded growth)
+const FORWARDED_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Pending outbound connection (we sent offer, waiting for answer)
 struct PendingConnection {
@@ -139,7 +145,7 @@ pub struct FloodingStore {
     peers: RwLock<HashMap<u64, ConnectedPeer>>,
     /// Pending requests we originated (hash -> response channel)
     our_requests: RwLock<HashMap<[u8; 32], OurRequest>>,
-    /// Forwarded requests (hash -> who to send response back to)
+    /// Forwarded requests (hash -> list of peers waiting for response)
     forwarded_requests: RwLock<HashMap<[u8; 32], ForwardedRequest>>,
     /// Pending outbound connections (we sent offer)
     pending_outbound: RwLock<HashMap<String, PendingConnection>>,
@@ -670,7 +676,7 @@ impl FloodingStore {
 
     /// Handle incoming request from a peer
     async fn handle_request(&self, from_peer: u64, hash: [u8; 32], htl: u8) {
-        // Check local store first
+        // Check local store first - always respond if we have data
         if let Some(data) = self.local.get_local(&hash) {
             let response = encode_response(&hash, &data);
             if let Some(peer) = self.peers.read().await.get(&from_peer) {
@@ -682,21 +688,32 @@ impl FloodingStore {
             return;
         }
 
-        // Not found locally - try forwarding to other peers if HTL allows
-        if self.config.forward_requests && should_forward(htl) {
-            // Check if we're already forwarding this request (prevents loops)
-            {
-                let forwarded = self.forwarded_requests.read().await;
-                if forwarded.contains_key(&hash) {
-                    return; // Already forwarding this hash
-                }
-            }
+        // Not found locally - check if we're already forwarding this request
+        // If so, just add this peer to the list of requesters (they'll all get the response)
+        {
+            let mut forwarded = self.forwarded_requests.write().await;
 
-            // Track the request so we can route response back
+            // Expire old entries to prevent unbounded growth (simple TTL cleanup)
+            let now = std::time::Instant::now();
+            forwarded.retain(|_, req| now.duration_since(req.created_at) < FORWARDED_REQUEST_TTL);
+
+            if let Some(req) = forwarded.get_mut(&hash) {
+                // Already forwarding - add this peer to the list
+                if !req.from_peers.contains(&from_peer) {
+                    req.from_peers.push(from_peer);
+                }
+                return; // Don't forward again, just wait for response
+            }
+        }
+
+        // Try forwarding to other peers if HTL allows
+        if self.config.forward_requests && should_forward(htl) {
+            // Track the request so we can route response back to ALL requesters
             self.forwarded_requests.write().await.insert(
                 hash,
                 ForwardedRequest {
-                    from_peer,
+                    from_peers: vec![from_peer],
+                    created_at: std::time::Instant::now(),
                     received_htl: htl,
                 },
             );
@@ -749,17 +766,20 @@ impl FloodingStore {
             return;
         }
 
-        // Check if we need to forward response back to original requester
+        // Check if we need to forward response back to requesters
         if let Some(forwarded) = self.forwarded_requests.write().await.remove(&hash) {
             // Cache locally before forwarding
             self.local.put_local(hash, data.clone());
 
-            // Send response back to original requester
-            if let Some(peer) = self.peers.read().await.get(&forwarded.from_peer) {
-                let response = encode_response(&hash, &data);
-                if self.send_with_latency(peer.channel.as_ref(), response.clone()).await.is_ok() {
-                    self.bytes_sent
-                        .fetch_add(response.len() as u64, Ordering::Relaxed);
+            // Send response back to ALL requesters (not just the first one)
+            let response = encode_response(&hash, &data);
+            let peers = self.peers.read().await;
+            for requester_id in forwarded.from_peers {
+                if let Some(peer) = peers.get(&requester_id) {
+                    if self.send_with_latency(peer.channel.as_ref(), response.clone()).await.is_ok() {
+                        self.bytes_sent
+                            .fetch_add(response.len() as u64, Ordering::Relaxed);
+                    }
                 }
             }
         }
