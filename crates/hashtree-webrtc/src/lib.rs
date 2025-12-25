@@ -8,6 +8,7 @@
 //! - **Peer Discovery**: Uses Nostr relay network for signaling
 //! - **Data Exchange**: WebRTC data channels for binary data transfer
 //! - **Protocol**: Request/response with hash-based addressing
+//! - **Adaptive Selection**: Intelligent peer selection based on performance
 //!
 //! # Example
 //!
@@ -36,12 +37,16 @@
 //! }
 //! ```
 
+pub mod channel;
 pub mod peer;
+pub mod peer_selector;
 pub mod protocol;
 pub mod store;
 pub mod types;
 
+pub use channel::{ChannelError, LatencyChannel, MockChannel, PeerChannel};
 pub use peer::{ForwardRequestCallback, Peer, PeerError};
+pub use peer_selector::{PeerSelector, PeerStats, SelectionStrategy, SelectorSummary};
 pub use protocol::{
     bytes_to_hash, create_fragment_response, create_request, create_response, encode_request,
     encode_response, hash_to_bytes, hash_to_key, is_fragmented, parse_message, DataMessage,

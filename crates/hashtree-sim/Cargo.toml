@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 # Core hashtree crate
 hashtree-core.workspace = true
+# WebRTC P2P (for PeerChannel trait and PeerSelector)
+hashtree-webrtc = { path = "../hashtree-webrtc" }
 
 # Core
 async-trait.workspace = true
