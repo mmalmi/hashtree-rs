@@ -75,7 +75,7 @@ pub enum SimEvent {
 /// A running node in the simulation
 struct RunningNode {
     /// HashTree for content operations (chunking, merkle trees)
-    tree: HashTree<FloodingStore>,
+    tree: Arc<HashTree<FloodingStore>>,
     /// The underlying FloodingStore for P2P operations (signaling, peer management)
     store: Arc<FloodingStore>,
     /// Relay client for signaling
@@ -358,7 +358,7 @@ impl Simulation {
 
         // Wrap in HashTree for content operations (chunking, merkle trees)
         let tree_config = HashTreeConfig::new(store.clone());
-        let tree = HashTree::new(tree_config);
+        let tree = Arc::new(HashTree::new(tree_config));
 
         let mut client = store.start(&self.relay).await;
 
@@ -719,6 +719,116 @@ impl Simulation {
         request_timeout: Duration,
     ) -> BenchmarkResults {
         self.benchmark_with_strategy(strategy_name, num_requests, data_size, request_timeout).await
+    }
+
+    /// Run parallel benchmark - more realistic, all requests fire simultaneously
+    pub async fn run_benchmark_parallel(
+        &self,
+        strategy_name: &str,
+        num_requests: usize,
+        data_size: usize,
+        timeout: Duration,
+    ) -> BenchmarkResults {
+        use futures::future::join_all;
+
+        let mut node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        node_ids.sort();
+
+        if node_ids.len() < 2 {
+            eprintln!("  Not enough nodes for benchmark");
+            return BenchmarkResults::from_requests(strategy_name, vec![]);
+        }
+
+        // Pre-generate all test cases
+        let mut test_cases: Vec<(String, String, Vec<u8>, [u8; 32])> = Vec::new();
+        for _ in 0..num_requests {
+            let (requester_id, owner_id) = {
+                let mut rng = self.rng.write().await;
+                let req_idx = rng.gen_range(0..node_ids.len());
+                let mut owner_idx = rng.gen_range(0..node_ids.len());
+                while owner_idx == req_idx {
+                    owner_idx = rng.gen_range(0..node_ids.len());
+                }
+                (node_ids[req_idx].clone(), node_ids[owner_idx].clone())
+            };
+
+            let data: Vec<u8> = {
+                let mut rng = self.rng.write().await;
+                (0..data_size).map(|_| rng.gen()).collect()
+            };
+
+            // Store data on owner
+            let hash = {
+                let nodes = self.nodes.read().await;
+                if let Some(owner) = nodes.get(&owner_id) {
+                    match owner.tree.put_file(&data).await {
+                        Ok(result) => result.hash,
+                        Err(_) => continue,
+                    }
+                } else {
+                    continue;
+                }
+            };
+
+            test_cases.push((requester_id, owner_id, data, hash));
+        }
+
+        eprintln!("  {} requests prepared, launching in parallel...", test_cases.len());
+
+        // Launch all requests in parallel
+        let start = Instant::now();
+        let futures: Vec<_> = test_cases.iter().map(|(requester_id, _owner_id, data, hash)| {
+            let requester_id = requester_id.clone();
+            let hash = *hash;
+            let expected_data = data.clone();
+            async move {
+                let (tree, store) = {
+                    let nodes = self.nodes.read().await;
+                    match nodes.get(&requester_id) {
+                        Some(n) => (n.tree.clone(), n.store.clone()),
+                        None => return None,
+                    }
+                };
+
+                let bytes_before = store.bytes_sent();
+                let recv_before = store.bytes_received();
+                let req_start = Instant::now();
+
+                let result = tokio::time::timeout(timeout, tree.read_file(&hash)).await;
+                let latency_ms = req_start.elapsed().as_secs_f64() * 1000.0;
+
+                let result = result.ok().and_then(|r| r.ok()).flatten();
+                let success = result.as_ref().map_or(false, |r| *r == expected_data);
+
+                Some(RequestResult {
+                    success,
+                    latency_ms,
+                    bytes_sent: store.bytes_sent() - bytes_before,
+                    bytes_received: store.bytes_received() - recv_before,
+                    peers_queried: 0,
+                    hops: 0,
+                })
+            }
+        }).collect();
+
+        let results: Vec<RequestResult> = join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let total_time = start.elapsed();
+        eprintln!("  {} requests completed in {:.1}s", results.len(), total_time.as_secs_f64());
+
+        // Clean up all test data
+        for (_requester_id, owner_id, _data, hash) in &test_cases {
+            let nodes = self.nodes.read().await;
+            if let Some(owner) = nodes.get(owner_id) {
+                owner.store.local().delete_local(hash);
+            }
+        }
+
+        BenchmarkResults::from_requests(strategy_name, results)
     }
 
     /// Get the routing strategy name

@@ -36,7 +36,7 @@ async fn main() {
         node_count,
         duration: Duration::from_secs(duration_secs),
         seed: 42,
-        max_peers: 5,
+        max_peers: 8, // Higher for better connectivity (1 component)
         discovery_interval_ms: 100,
         churn_rate: 0.0,
         allow_rejoin: false,
@@ -63,18 +63,18 @@ async fn main() {
     eprintln!("Nodes: {}, Connections: {}, Components: {}",
         topology.node_count, topology.connection_count, topology.component_count);
 
-    // Timeout should be enough for multi-hop
-    let request_timeout = Duration::from_millis(500 + latency_ms * 10);
+    // Long timeout to ensure failures are due to unreachability, not timing
+    let request_timeout = Duration::from_secs(10);
 
-    // Test flooding strategy on this network
+    // Test flooding strategy on this network (parallel requests = realistic load)
     eprintln!("\n=== Running Flooding Benchmark ===");
     sim.set_routing_strategy(RoutingStrategy::Flooding).await;
-    let flooding = sim.run_benchmark_named("Flooding", num_requests, 1024, request_timeout).await;
+    let flooding = sim.run_benchmark_parallel("Flooding", num_requests, 1024, request_timeout).await;
 
     // Test adaptive strategy on SAME network
     eprintln!("\n=== Running Adaptive Benchmark ===");
     sim.set_routing_strategy(RoutingStrategy::Adaptive).await;
-    let adaptive = sim.run_benchmark_named("Adaptive", num_requests, 1024, request_timeout).await;
+    let adaptive = sim.run_benchmark_parallel("Adaptive", num_requests, 1024, request_timeout).await;
 
     // Print detailed results
     eprintln!("\n=== Flooding vs Adaptive Comparison ===");
