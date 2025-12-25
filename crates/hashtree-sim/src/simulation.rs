@@ -46,13 +46,35 @@ pub struct SimConfig {
     pub routing_strategy: RoutingStrategy,
 }
 
+impl SimConfig {
+    /// Calculate recommended max_peers for a given network size
+    ///
+    /// Based on random graph connectivity theory: a random graph with N nodes
+    /// and average degree k is almost certainly connected when k > ln(N).
+    /// We use 2*ln(N) for safety margin, with a minimum of 5.
+    pub fn recommended_max_peers(node_count: usize) -> usize {
+        let ln_n = (node_count as f64).ln();
+        let recommended = (2.0 * ln_n).ceil() as usize;
+        recommended.max(5)
+    }
+
+    /// Create config with max_peers auto-scaled for the network size
+    pub fn with_auto_peers(node_count: usize) -> Self {
+        Self {
+            node_count,
+            max_peers: Self::recommended_max_peers(node_count),
+            ..Default::default()
+        }
+    }
+}
+
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
             node_count: 100,
             duration: Duration::from_secs(60),
             seed: 42,
-            max_peers: 5,
+            max_peers: 10, // Safe default for networks up to ~10K nodes
             discovery_interval_ms: 500,
             churn_rate: 0.01, // 1% chance per interval
             allow_rejoin: true,
