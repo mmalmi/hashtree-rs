@@ -780,6 +780,12 @@ impl Simulation {
         eprintln!("  {} total requests ({} nodes × {} each), launching burst...",
             total_requests, node_ids.len(), requests_per_node);
 
+        // Track total network bytes before
+        let bytes_before: u64 = {
+            let nodes = self.nodes.read().await;
+            nodes.values().map(|n| n.store.bytes_sent() + n.store.bytes_received()).sum()
+        };
+
         // Launch ALL requests simultaneously (burst mode)
         let start = Instant::now();
         let futures: Vec<_> = all_test_cases.iter().map(|(requester_id, _owner_id, data, hash)| {
@@ -821,9 +827,20 @@ impl Simulation {
 
         let total_time = start.elapsed();
         let successful = results.iter().filter(|r| r.success).count();
-        eprintln!("  {}/{} succeeded in {:.1}s ({:.0} req/s)",
-            successful, results.len(), total_time.as_secs_f64(),
-            results.len() as f64 / total_time.as_secs_f64());
+        let success_rate = successful as f64 / results.len() as f64 * 100.0;
+        let successful_per_sec = successful as f64 / total_time.as_secs_f64();
+
+        // Track total network bytes after
+        let bytes_after: u64 = {
+            let nodes = self.nodes.read().await;
+            nodes.values().map(|n| n.store.bytes_sent() + n.store.bytes_received()).sum()
+        };
+        let total_bytes = bytes_after - bytes_before;
+        let bytes_per_success = if successful > 0 { total_bytes / successful as u64 } else { 0 };
+
+        eprintln!("  {}/{} succeeded ({:.0}%) in {:.1}s - {:.0} successful/s, {} bytes/success",
+            successful, results.len(), success_rate, total_time.as_secs_f64(),
+            successful_per_sec, bytes_per_success);
 
         // Clean up all test data
         for (_requester_id, owner_id, _data, hash) in &all_test_cases {
