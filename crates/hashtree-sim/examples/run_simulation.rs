@@ -63,8 +63,8 @@ async fn main() {
     eprintln!("Nodes: {}, Connections: {}, Components: {}",
         topology.node_count, topology.connection_count, topology.component_count);
 
-    // Long timeout to ensure failures are due to unreachability, not timing
-    let request_timeout = Duration::from_secs(10);
+    // Long timeout for parallel/burst requests (network congestion needs time)
+    let request_timeout = Duration::from_secs(30);
 
     // Burst mode: each node fires num_requests requests simultaneously
     let requests_per_node = num_requests;
