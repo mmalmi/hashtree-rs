@@ -27,14 +27,9 @@ use crate::relay::{
 };
 use crate::store::{NetworkStore, SimStore};
 
-/// Signaling content types
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum SignalingContent {
-    Presence { node_id: String },
-    Offer { sdp: String },
-    Answer { sdp: String },
-}
+// Use the same SignalingMessage as real WebRTC - only difference is mock puts
+// channel IDs in sdp field instead of real SDP
+pub use hashtree_webrtc::SignalingMessage;
 
 /// Pending request we originated (waiting for response)
 struct OurRequest {
@@ -269,23 +264,9 @@ impl FloodingStore {
     pub async fn start(self: &Arc<Self>, relay: &Arc<MockRelay>) -> RelayClient {
         let mut client = relay.connect(self.id.clone()).await;
 
-        // Announce presence
-        let presence = Event::new(
-            self.id.clone(),
-            KIND_PRESENCE,
-            serde_json::to_string(&SignalingContent::Presence {
-                node_id: self.id.clone(),
-            })
-            .unwrap(),
-        );
-        let _ = client.publish(presence).await;
-
-        // Consume the OK response
-        while let Some(msg) = client.recv().await {
-            if matches!(msg, RelayMessage::Ok { .. }) {
-                break;
-            }
-        }
+        // Subscribe to ALL presence events (for hello-based discovery)
+        let presence_filter = Filter::new().kinds(vec![KIND_PRESENCE]);
+        let _ = client.subscribe("presence", vec![presence_filter]).await;
 
         // Subscribe to offers and answers directed at us
         let offer_filter = Filter::new()
@@ -297,6 +278,26 @@ impl FloodingStore {
             .kinds(vec![KIND_ANSWER])
             .p_tags(vec![self.id.clone()]);
         let _ = client.subscribe("answers", vec![answer_filter]).await;
+
+        // Announce hello - do this AFTER subscribing so we see our own
+        // and after others have subscribed so they see ours
+        let hello = Event::new(
+            self.id.clone(),
+            KIND_PRESENCE,
+            serde_json::to_string(&SignalingMessage::Hello {
+                peer_id: self.id.clone(),
+                roots: vec![], // No roots to advertise in simulation
+            })
+            .unwrap(),
+        );
+        let _ = client.publish(hello).await;
+
+        // Consume the OK response
+        while let Some(msg) = client.recv().await {
+            if matches!(msg, RelayMessage::Ok { .. }) {
+                break;
+            }
+        }
 
         client
     }
@@ -381,11 +382,15 @@ impl FloodingStore {
             .await
             .insert(channel_id.clone(), Arc::new(their_chan));
 
-        let offer_content = SignalingContent::Offer { sdp: channel_id };
+        let offer_msg = SignalingMessage::Offer {
+            peer_id: self.id.clone(),
+            target_peer_id: target.to_string(),
+            sdp: channel_id, // Mock uses channel ID instead of real SDP
+        };
         let offer = Event::new(
             self.id.clone(),
             KIND_OFFER,
-            serde_json::to_string(&offer_content).unwrap(),
+            serde_json::to_string(&offer_msg).unwrap(),
         )
         .with_p_tag(target);
 
@@ -409,13 +414,13 @@ impl FloodingStore {
             return Ok(());
         }
 
-        // Parse offer content to get channel ID
-        let content: SignalingContent = match serde_json::from_str(&event.content) {
-            Ok(c) => c,
+        // Parse offer to get channel ID (mock puts channel ID in sdp field)
+        let msg: SignalingMessage = match serde_json::from_str(&event.content) {
+            Ok(m) => m,
             Err(_) => return Ok(()),
         };
-        let channel_id = match content {
-            SignalingContent::Offer { sdp } => sdp,
+        let channel_id = match msg {
+            SignalingMessage::Offer { sdp, .. } => sdp,
             _ => return Ok(()),
         };
 
@@ -430,11 +435,15 @@ impl FloodingStore {
         self.add_peer(from_id, channel).await;
 
         // Send answer
-        let answer_content = SignalingContent::Answer { sdp: channel_id };
+        let answer_msg = SignalingMessage::Answer {
+            peer_id: self.id.clone(),
+            target_peer_id: from.clone(),
+            sdp: channel_id, // Echo back the channel ID
+        };
         let answer = Event::new(
             self.id.clone(),
             KIND_ANSWER,
-            serde_json::to_string(&answer_content).unwrap(),
+            serde_json::to_string(&answer_msg).unwrap(),
         )
         .with_p_tag(from);
 
@@ -477,8 +486,12 @@ impl FloodingStore {
                 "answers" => {
                     self.clone().handle_answer(&event).await;
                 }
+                "presence" => {
+                    // Handle hello-based discovery (like real WebRTC)
+                    self.handle_hello(client, &event).await;
+                }
                 "discovery" => {
-                    // Found a peer's presence
+                    // Legacy: just return peer id for external handling
                     if event.pubkey != self.id {
                         return Some(event.pubkey);
                     }
@@ -488,6 +501,41 @@ impl FloodingStore {
             _ => {}
         }
         None
+    }
+
+    /// Handle incoming hello message - use deterministic tie-breaker for connection
+    async fn handle_hello(self: &Arc<Self>, client: &RelayClient, event: &Event) {
+        let from = &event.pubkey;
+
+        // Ignore our own hello
+        if from == &self.id {
+            return;
+        }
+
+        let from_id: u64 = from.parse().unwrap_or(0);
+
+        // Already connected?
+        if self.peers.read().await.contains_key(&from_id) {
+            return;
+        }
+
+        // Already pending?
+        if self.pending_outbound.read().await.contains_key(from) {
+            return;
+        }
+
+        // At max peers?
+        if self.peers.read().await.len() >= self.config.max_peers {
+            return;
+        }
+
+        // Use the same tie-breaker as real WebRTC
+        use hashtree_webrtc::should_initiate_connection;
+        let should_initiate = should_initiate_connection(&self.id, from);
+
+        if should_initiate {
+            let _ = self.send_offer(client, from).await;
+        }
     }
 
     // ==================== Peer Management ====================
@@ -624,21 +672,28 @@ impl FloodingStore {
     /// Adaptive routing: try best peer first, learn from results, fallback on failure
     /// Like Freenet's routing but without location-based selection (we use quality only)
     async fn fetch_from_peers_adaptive(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
-        // Get peer ordering from selector (best peers first)
-        let ordered_peer_ids: Vec<u64> = {
+        // Get peer ordering from selector (best peers first) along with their RTOs
+        let ordered_peers: Vec<(u64, Duration)> = {
             let mut selector = self.peer_selector.write().await;
             selector.select_peers()
                 .into_iter()
                 .filter(|&id| Some(id) != exclude)
+                .map(|id| {
+                    // Use learned RTO per peer, fallback to config timeout
+                    let rto = selector.get_stats(id)
+                        .map(|s| Duration::from_millis(s.rto_ms))
+                        .unwrap_or(self.config.request_timeout);
+                    (id, rto)
+                })
                 .collect()
         };
 
-        if ordered_peer_ids.is_empty() {
+        if ordered_peers.is_empty() {
             return None;
         }
 
         // Try each peer in order (best peers first, like Freenet's closerPeer())
-        for peer_id in ordered_peer_ids {
+        for (peer_id, peer_rto) in ordered_peers {
             let (channel, htl_config, link_latency_ms) = {
                 let peers = self.peers.read().await;
                 match peers.get(&peer_id) {
@@ -670,8 +725,8 @@ impl FloodingStore {
                 .await
                 .insert(*hash, OurRequest { response_tx: tx });
 
-            // Wait for response (with timeout, then try next peer)
-            match tokio::time::timeout(self.config.request_timeout, rx).await {
+            // Wait for response using learned RTO (adaptive timeout per peer)
+            match tokio::time::timeout(peer_rto, rx).await {
                 Ok(Ok(Some(data))) => {
                     // Success! Record metrics for learning
                     let rtt_ms = request_start.elapsed().as_millis() as u64;

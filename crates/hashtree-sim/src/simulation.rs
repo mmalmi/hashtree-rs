@@ -506,6 +506,13 @@ impl Simulation {
         }
     }
 
+    /// Run additional discovery rounds to improve connectivity
+    pub async fn run_discovery_round(&self) {
+        self.process_all_messages().await;
+        self.discover_and_connect(0).await;
+        self.process_all_messages().await;
+    }
+
     /// Analyze the current network topology
     pub async fn analyze_topology(&self) -> TopologyStats {
         let nodes = self.nodes.read().await;
@@ -721,6 +728,142 @@ impl Simulation {
         self.benchmark_with_strategy(strategy_name, num_requests, data_size, request_timeout).await
     }
 
+    /// Run wave benchmark - multiple bursts with gaps for learning
+    /// More realistic: allows Adaptive to learn between waves
+    pub async fn run_benchmark_waves(
+        &self,
+        strategy_name: &str,
+        waves: usize,
+        requests_per_wave: usize,
+        data_size: usize,
+        timeout: Duration,
+        wave_gap: Duration,
+    ) -> BenchmarkResults {
+        use futures::future::join_all;
+
+        let mut node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        node_ids.sort();
+
+        if node_ids.len() < 2 {
+            return BenchmarkResults::from_requests(strategy_name, vec![]);
+        }
+
+        let mut all_results: Vec<RequestResult> = Vec::new();
+        let mut total_bytes: u64 = 0;
+
+        eprintln!("  {} waves × {} requests each...", waves, requests_per_wave);
+
+        for wave in 0..waves {
+            // Generate test cases for this wave
+            let mut test_cases: Vec<(String, String, Vec<u8>, [u8; 32])> = Vec::new();
+            for _ in 0..requests_per_wave {
+                let (requester_id, owner_id) = {
+                    let mut rng = self.rng.write().await;
+                    let req_idx = rng.gen_range(0..node_ids.len());
+                    let mut owner_idx = rng.gen_range(0..node_ids.len());
+                    while owner_idx == req_idx {
+                        owner_idx = rng.gen_range(0..node_ids.len());
+                    }
+                    (node_ids[req_idx].clone(), node_ids[owner_idx].clone())
+                };
+
+                let data: Vec<u8> = {
+                    let mut rng = self.rng.write().await;
+                    (0..data_size).map(|_| rng.gen()).collect()
+                };
+
+                let hash = {
+                    let nodes = self.nodes.read().await;
+                    if let Some(owner) = nodes.get(&owner_id) {
+                        match owner.tree.put_file(&data).await {
+                            Ok(result) => result.hash,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                };
+
+                test_cases.push((requester_id, owner_id, data, hash));
+            }
+
+            // Track bytes for this wave
+            let bytes_before: u64 = {
+                let nodes = self.nodes.read().await;
+                nodes.values().map(|n| n.store.bytes_sent()).sum()
+            };
+
+            // Launch wave
+            let futures: Vec<_> = test_cases.iter().map(|(requester_id, _owner_id, data, hash)| {
+                let requester_id = requester_id.clone();
+                let hash = *hash;
+                let expected_data = data.clone();
+                async move {
+                    let tree = {
+                        let nodes = self.nodes.read().await;
+                        match nodes.get(&requester_id) {
+                            Some(n) => n.tree.clone(),
+                            None => return None,
+                        }
+                    };
+
+                    let req_start = Instant::now();
+                    let result = tokio::time::timeout(timeout, tree.read_file(&hash)).await;
+                    let latency_ms = req_start.elapsed().as_secs_f64() * 1000.0;
+
+                    let result = result.ok().and_then(|r| r.ok()).flatten();
+                    let success = result.as_ref().map_or(false, |r| *r == expected_data);
+
+                    Some(RequestResult {
+                        success,
+                        latency_ms,
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        peers_queried: 0,
+                        hops: 0,
+                    })
+                }
+            }).collect();
+
+            let results: Vec<RequestResult> = join_all(futures)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+
+            let bytes_after: u64 = {
+                let nodes = self.nodes.read().await;
+                nodes.values().map(|n| n.store.bytes_sent()).sum()
+            };
+            total_bytes += bytes_after - bytes_before;
+
+            let wave_success = results.iter().filter(|r| r.success).count();
+            eprint!("  wave {}: {}/{} ", wave + 1, wave_success, results.len());
+
+            all_results.extend(results);
+
+            // Cleanup this wave's data
+            for (_requester_id, owner_id, _data, hash) in &test_cases {
+                let nodes = self.nodes.read().await;
+                if let Some(owner) = nodes.get(owner_id) {
+                    owner.store.local().delete_local(hash);
+                }
+            }
+
+            // Gap between waves (let network settle, Adaptive can learn)
+            if wave < waves - 1 {
+                tokio::time::sleep(wave_gap).await;
+            }
+        }
+
+        let successful = all_results.iter().filter(|r| r.success).count();
+        let bytes_per_success = if successful > 0 { total_bytes / successful as u64 } else { 0 };
+        eprintln!("\n  Total: {}/{} succeeded, {} bytes/success",
+            successful, all_results.len(), bytes_per_success);
+
+        BenchmarkResults::from_requests(strategy_name, all_results)
+    }
+
     /// Run burst benchmark - each node fires requests_per_node requests without waiting
     /// All nodes run in parallel (realistic network load)
     pub async fn run_benchmark_burst(
@@ -780,10 +923,10 @@ impl Simulation {
         eprintln!("  {} total requests ({} nodes × {} each), launching burst...",
             total_requests, node_ids.len(), requests_per_node);
 
-        // Track total network bytes before
+        // Track total network bytes sent before (just sent, not received - avoids double count)
         let bytes_before: u64 = {
             let nodes = self.nodes.read().await;
-            nodes.values().map(|n| n.store.bytes_sent() + n.store.bytes_received()).sum()
+            nodes.values().map(|n| n.store.bytes_sent()).sum()
         };
 
         // Launch ALL requests simultaneously (burst mode)
@@ -830,10 +973,10 @@ impl Simulation {
         let success_rate = successful as f64 / results.len() as f64 * 100.0;
         let successful_per_sec = successful as f64 / total_time.as_secs_f64();
 
-        // Track total network bytes after
+        // Track total network bytes sent after
         let bytes_after: u64 = {
             let nodes = self.nodes.read().await;
-            nodes.values().map(|n| n.store.bytes_sent() + n.store.bytes_received()).sum()
+            nodes.values().map(|n| n.store.bytes_sent()).sum()
         };
         let total_bytes = bytes_after - bytes_before;
         let bytes_per_success = if successful > 0 { total_bytes / successful as u64 } else { 0 };

@@ -94,6 +94,51 @@ pub enum SignalingMessage {
     },
 }
 
+impl SignalingMessage {
+    /// Get the sender's peer ID
+    pub fn peer_id(&self) -> &str {
+        match self {
+            Self::Hello { peer_id, .. } => peer_id,
+            Self::Offer { peer_id, .. } => peer_id,
+            Self::Answer { peer_id, .. } => peer_id,
+            Self::Candidate { peer_id, .. } => peer_id,
+            Self::Candidates { peer_id, .. } => peer_id,
+        }
+    }
+
+    /// Get the target peer ID (if applicable)
+    pub fn target_peer_id(&self) -> Option<&str> {
+        match self {
+            Self::Hello { .. } => None, // Broadcast
+            Self::Offer { target_peer_id, .. } => Some(target_peer_id),
+            Self::Answer { target_peer_id, .. } => Some(target_peer_id),
+            Self::Candidate { target_peer_id, .. } => Some(target_peer_id),
+            Self::Candidates { target_peer_id, .. } => Some(target_peer_id),
+        }
+    }
+
+    /// Check if this message is addressed to a specific peer
+    pub fn is_for(&self, my_peer_id: &str) -> bool {
+        match self.target_peer_id() {
+            Some(target) => target == my_peer_id,
+            None => true, // Broadcasts are for everyone
+        }
+    }
+}
+
+/// Deterministic tie-breaker for connection initiation
+///
+/// When two peers discover each other (via Hello messages), both could try
+/// to initiate a connection. This function provides a deterministic rule
+/// to decide which peer should initiate: the one with the lexicographically
+/// lower peer ID.
+///
+/// This ensures exactly one connection attempt per peer pair.
+#[inline]
+pub fn should_initiate_connection(local_peer_id: &str, remote_peer_id: &str) -> bool {
+    local_peer_id < remote_peer_id
+}
+
 /// ICE candidate for WebRTC connection establishment
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IceCandidate {

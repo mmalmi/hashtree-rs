@@ -6,9 +6,12 @@
 //! Usage: cargo run --example run_simulation -- [OPTIONS]
 //!   --nodes N       Number of nodes (default: 20)
 //!   --duration S    Simulation duration in seconds (default: 5)
-//!   --requests N    Number of requests per node (default: 10)
+//!   --requests N    Number of requests per node in burst mode (default: 10)
 //!   --latency MS    Network latency per hop in ms (default: 10)
 //!   --runs N        Number of runs for variance analysis (default: 1)
+//!   --waves N       Number of waves (0=burst mode, >0=wave mode, default: 0)
+//!   --per-wave N    Requests per wave (default: 10)
+//!   --wave-gap MS   Gap between waves in ms (default: 500)
 
 use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
@@ -77,13 +80,21 @@ async fn main() {
     let num_requests = parse_arg(&args, "--requests", 10) as usize;
     let latency_ms = parse_arg(&args, "--latency", 10);
     let num_runs = parse_arg(&args, "--runs", 1) as usize;
+    let wave_count = parse_arg(&args, "--waves", 0) as usize;
+    let use_waves = wave_count > 0;
+    let per_wave = parse_arg(&args, "--per-wave", 10) as usize;
+    let wave_gap_ms = parse_arg(&args, "--wave-gap", 500);
 
     eprintln!("=== Network Simulation ===\n");
 
     eprintln!("Configuration:");
     eprintln!("  Nodes: {}", node_count);
     eprintln!("  Duration: {}s", duration_secs);
-    eprintln!("  Requests per node: {}", num_requests);
+    if use_waves {
+        eprintln!("  Mode: Waves ({} waves × {} requests, {}ms gaps)", wave_count, per_wave, wave_gap_ms);
+    } else {
+        eprintln!("  Mode: Burst ({} requests per node)", num_requests);
+    }
     eprintln!("  Network latency: {}ms ±30% per link", latency_ms);
     if num_runs > 1 {
         eprintln!("  Runs: {}", num_runs);
@@ -101,12 +112,15 @@ async fn main() {
         // Different seed per run for variance
         let seed = 42 + run as u64;
 
+        // Use higher max_peers for smaller networks to ensure full connectivity
+        let max_peers = if node_count <= 20 { 10 } else if node_count <= 50 { 8 } else { 6 };
+
         let config = SimConfig {
             node_count,
             duration: Duration::from_secs(duration_secs),
             seed,
-            max_peers: 8,
-            discovery_interval_ms: 100,
+            max_peers,
+            discovery_interval_ms: 50, // Faster discovery
             churn_rate: 0.0,
             allow_rejoin: false,
             network_latency_ms: latency_ms,
@@ -114,26 +128,50 @@ async fn main() {
             routing_strategy: RoutingStrategy::Flooding,
         };
 
-        // Build network
+        // Build network - keep running until we have 1 component
         eprintln!("\n=== Building Network ===");
-        let sim = Simulation::new(config);
+        let sim = Simulation::new(config.clone());
         sim.run().await;
 
-        let topology = sim.analyze_topology().await;
+        let mut topology = sim.analyze_topology().await;
+        let mut extra_rounds = 0;
+        while topology.component_count > 1 && extra_rounds < 20 {
+            // Run more discovery rounds
+            for _ in 0..50 {
+                sim.run_discovery_round().await;
+            }
+            topology = sim.analyze_topology().await;
+            extra_rounds += 1;
+        }
+
         eprintln!("Nodes: {}, Connections: {}, Components: {}",
             topology.node_count, topology.connection_count, topology.component_count);
 
+        if topology.component_count > 1 {
+            eprintln!("  Warning: Network has {} disconnected components", topology.component_count);
+        }
+
         let request_timeout = Duration::from_secs(30);
+
+        let wave_gap = Duration::from_millis(wave_gap_ms);
 
         // Test flooding
         eprintln!("\n=== Flooding Benchmark ===");
         sim.set_routing_strategy(RoutingStrategy::Flooding).await;
-        let flooding = sim.run_benchmark_burst("Flooding", num_requests, 1024, request_timeout).await;
+        let flooding = if use_waves {
+            sim.run_benchmark_waves("Flooding", wave_count, per_wave, 1024, request_timeout, wave_gap).await
+        } else {
+            sim.run_benchmark_burst("Flooding", num_requests, 1024, request_timeout).await
+        };
 
         // Test adaptive
         eprintln!("\n=== Adaptive Benchmark ===");
         sim.set_routing_strategy(RoutingStrategy::Adaptive).await;
-        let adaptive = sim.run_benchmark_burst("Adaptive", num_requests, 1024, request_timeout).await;
+        let adaptive = if use_waves {
+            sim.run_benchmark_waves("Adaptive", wave_count, per_wave, 1024, request_timeout, wave_gap).await
+        } else {
+            sim.run_benchmark_burst("Adaptive", num_requests, 1024, request_timeout).await
+        };
 
         // Store stats
         all_runs.push(RunStats {

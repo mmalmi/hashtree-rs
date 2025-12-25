@@ -26,8 +26,10 @@ pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};
 pub use channel::{ChannelError, LatencyChannel, MockChannel, PeerChannel};
 pub use flooding::{
     clear_channel_registry, handle_request as flooding_handle_request, FloodingConfig,
-    FloodingStore, RoutingStrategy, SignalingContent,
+    FloodingStore, RoutingStrategy,
 };
+// Re-export SignalingMessage from hashtree-webrtc for simulation users
+pub use hashtree_webrtc::SignalingMessage;
 pub use message::{
     decrement_htl, encode_request, encode_response, parse, should_forward,
     DataRequest, DataResponse, Hash, ParseError, ParsedMessage, PeerHTLConfig,

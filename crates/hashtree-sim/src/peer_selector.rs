@@ -23,8 +23,8 @@ const MAX_BACKOFF_MS: u64 = 480_000; // 8 minutes max backoff
 
 /// RTO constants (RFC 2988)
 const MIN_RTO_MS: u64 = 50; // Minimum retransmission timeout
-const MAX_RTO_MS: u64 = 60_000; // Maximum RTO (60 seconds)
-const INITIAL_RTO_MS: u64 = 1000; // Initial RTO before any measurements
+const MAX_RTO_MS: u64 = 10_000; // Maximum RTO (10 seconds)
+const INITIAL_RTO_MS: u64 = 200; // Initial RTO before any measurements (fast fail)
 
 /// Per-peer performance statistics
 #[derive(Debug, Clone)]
@@ -875,16 +875,16 @@ mod tests {
     fn test_rto_adaptation() {
         let mut stats = PeerStats::new(1);
 
-        // Initial RTO
-        assert_eq!(stats.rto_ms, 1000);
+        // Initial RTO (INITIAL_RTO_MS = 200)
+        assert_eq!(stats.rto_ms, 200);
 
         // After measuring RTT
         stats.record_request(40);
         stats.record_success(50, 1024); // 50ms RTT
 
         // RTO should adapt based on RTT
-        // RTO = SRTT + max(20, 4*RTTVAR) = 50 + max(20, 4*25) = 50 + 100 = 150
-        assert!(stats.rto_ms < 1000, "RTO should decrease after measuring RTT");
+        // RTO = SRTT + max(G, 4*RTTVAR) where G=20ms
+        assert!(stats.rto_ms < 200, "RTO should decrease after measuring RTT");
         assert!(stats.rto_ms >= 50, "RTO should be at least SRTT");
 
         // Timeout should double RTO

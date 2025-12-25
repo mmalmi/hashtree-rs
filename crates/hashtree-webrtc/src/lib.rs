@@ -38,10 +38,12 @@
 //! ```
 
 pub mod channel;
+pub mod mock;
 pub mod peer;
 pub mod peer_selector;
 pub mod protocol;
 pub mod store;
+pub mod transport;
 pub mod types;
 
 pub use channel::{ChannelError, LatencyChannel, MockChannel, PeerChannel};
@@ -54,8 +56,14 @@ pub use protocol::{
 };
 pub use store::{WebRTCStore, WebRTCStoreError};
 pub use types::{
-    classifier_channel, should_forward, ClassifierRx, ClassifierTx, ClassifyRequest,
-    ForwardRequest, ForwardRx, ForwardTx, IceCandidate, PeerId, PeerHTLConfig, PeerPool,
-    PeerState, PoolConfig, PoolSettings, SignalingMessage, WebRTCStats, WebRTCStoreConfig,
-    DATA_CHANNEL_LABEL, MAX_HTL, NOSTR_KIND_HASHTREE,
+    classifier_channel, should_forward, should_initiate_connection, ClassifierRx, ClassifierTx,
+    ClassifyRequest, ForwardRequest, ForwardRx, ForwardTx, IceCandidate, PeerId, PeerHTLConfig,
+    PeerPool, PeerState, PoolConfig, PoolSettings, SignalingMessage, WebRTCStats,
+    WebRTCStoreConfig, DATA_CHANNEL_LABEL, MAX_HTL, NOSTR_KIND_HASHTREE,
+};
+pub use transport::{
+    DataChannel, PeerConnectionFactory, RelayTransport, SignalingConfig, TransportError,
+};
+pub use mock::{
+    clear_channel_registry, MockConnectionFactory, MockDataChannel, MockRelay, MockRelayTransport,
 };

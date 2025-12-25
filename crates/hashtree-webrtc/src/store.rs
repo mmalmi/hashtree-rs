@@ -451,7 +451,8 @@ impl<S: Store + 'static> WebRTCStore<S> {
 
                 // Initiate connection if we need more peers in this pool
                 // Use deterministic tie-breaker: lower peer_id initiates connection
-                let should_initiate = local_peer_id < peer_id.as_str();
+                use crate::types::should_initiate_connection;
+                let should_initiate = should_initiate_connection(local_peer_id, peer_id.as_str());
 
                 if Self::pool_needs_peers(pool, follows_count, other_count, config) && should_initiate {
                     if let Some(remote_id) = PeerId::from_peer_string(peer_id) {
