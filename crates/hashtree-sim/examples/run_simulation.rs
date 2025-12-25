@@ -9,7 +9,7 @@
 //!   --requests N    Number of benchmark requests (default: 10)
 //!   --latency MS    Network latency per hop in ms (default: 10)
 
-use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
+use hashtree_sim::{clear_channel_registry, RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
 
 fn parse_arg(args: &[String], flag: &str, default: u64) -> u64 {
@@ -56,6 +56,7 @@ async fn main() {
 
     // Run flooding simulation
     eprintln!("\n=== Running Flooding Simulation ===");
+    clear_channel_registry().await; // Clear global state for deterministic results
     let flooding_config = SimConfig {
         routing_strategy: RoutingStrategy::Flooding,
         ..base_config
@@ -69,6 +70,7 @@ async fn main() {
 
     // Run adaptive simulation (Freenet-style: try best peer, learn, fallback)
     eprintln!("\n=== Running Adaptive Simulation ===");
+    clear_channel_registry().await; // Clear global state for deterministic results
     let adaptive_config = SimConfig {
         routing_strategy: RoutingStrategy::Adaptive,
         ..base_config
@@ -77,9 +79,14 @@ async fn main() {
     adaptive_sim.run().await;
     let adaptive = adaptive_sim.run_benchmark(num_requests, 1024, request_timeout).await;
 
-    // Print topology (same for both since same seed)
-    eprintln!("\n=== Topology (shared) ===");
-    Simulation::print_topology_stats(&flooding_topology);
+    // Print both topologies to verify they match
+    let adaptive_topology = adaptive_sim.analyze_topology().await;
+    eprintln!("\n=== Flooding Topology ===");
+    eprintln!("Nodes: {}, Connections: {}, Components: {}",
+        flooding_topology.node_count, flooding_topology.connection_count, flooding_topology.component_count);
+    eprintln!("\n=== Adaptive Topology ===");
+    eprintln!("Nodes: {}, Connections: {}, Components: {}",
+        adaptive_topology.node_count, adaptive_topology.connection_count, adaptive_topology.component_count);
 
     // Print detailed results
     eprintln!("\n=== Flooding vs Adaptive Comparison ===");

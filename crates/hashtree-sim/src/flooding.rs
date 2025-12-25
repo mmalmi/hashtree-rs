@@ -178,6 +178,11 @@ lazy_static::lazy_static! {
     static ref CHANNEL_REGISTRY: RwLock<HashMap<String, Arc<MockChannel>>> = RwLock::new(HashMap::new());
 }
 
+/// Clear the global channel registry (call between independent simulations)
+pub async fn clear_channel_registry() {
+    CHANNEL_REGISTRY.write().await.clear();
+}
+
 impl FloodingStore {
     /// Create a new flooding store
     pub fn new(id: impl Into<String>, config: FloodingConfig) -> Arc<Self> {

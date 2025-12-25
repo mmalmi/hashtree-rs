@@ -275,71 +275,60 @@ impl Simulation {
     }
 
     /// Run the simulation - spawn/remove nodes over time with churn
+    /// Uses tick-based simulation for deterministic topology formation
     pub async fn run(&self) {
         let total_ms = self.config.duration.as_millis() as u64;
+        let tick_ms = self.config.discovery_interval_ms;
+        let total_ticks = total_ms / tick_ms;
 
-        // Generate initial spawn times for all nodes
-        let spawn_times: Vec<u64> = {
+        // Generate initial spawn times for all nodes (in ticks)
+        let spawn_ticks: Vec<u64> = {
             let mut rng = self.rng.write().await;
             (0..self.config.node_count)
-                .map(|_| rng.gen_range(0..total_ms))
+                .map(|_| rng.gen_range(0..total_ticks))
                 .collect()
         };
 
         // Sort spawn times
-        let mut spawn_schedule: Vec<(u64, usize)> = spawn_times
+        let mut spawn_schedule: Vec<(u64, usize)> = spawn_ticks
             .into_iter()
             .enumerate()
             .map(|(i, t)| (t, i))
             .collect();
         spawn_schedule.sort_by_key(|(t, _)| *t);
 
-        let start = std::time::Instant::now();
         let mut next_spawn_idx = 0;
-        let discovery_interval = Duration::from_millis(self.config.discovery_interval_ms);
-        let mut last_tick = std::time::Instant::now();
-        let snapshot_interval = Duration::from_secs(5); // Take topology snapshot every 5s
-        let mut last_snapshot = std::time::Instant::now();
+        let snapshot_interval_ticks = 5000 / tick_ms; // Every ~5s worth of ticks
 
-        // Main simulation loop
-        while start.elapsed() < self.config.duration {
-            let elapsed_ms = start.elapsed().as_millis() as u64;
+        // Deterministic tick-based loop (no real time dependency)
+        for tick in 0..total_ticks {
+            let elapsed_ms = tick * tick_ms;
 
-            // Spawn any nodes scheduled for this time
-            while next_spawn_idx < spawn_schedule.len() && spawn_schedule[next_spawn_idx].0 <= elapsed_ms {
-                let (_, _) = spawn_schedule[next_spawn_idx];
+            // Spawn any nodes scheduled for this tick
+            while next_spawn_idx < spawn_schedule.len() && spawn_schedule[next_spawn_idx].0 <= tick {
                 self.spawn_node(elapsed_ms).await;
                 next_spawn_idx += 1;
             }
 
-            // Periodic tick: discovery, churn, message processing
-            if last_tick.elapsed() >= discovery_interval {
-                self.process_all_messages().await;
-                self.apply_churn(elapsed_ms).await;
-                self.discover_and_connect(elapsed_ms).await;
-                last_tick = std::time::Instant::now();
-            }
+            // Process messages, apply churn, run discovery (every tick)
+            self.process_all_messages().await;
+            self.apply_churn(elapsed_ms).await;
+            self.discover_and_connect(elapsed_ms).await;
 
             // Periodic topology snapshot
-            if last_snapshot.elapsed() >= snapshot_interval {
+            if tick > 0 && tick % snapshot_interval_ticks == 0 {
                 let stats = self.analyze_topology().await;
                 self.stats.write().await.topology_snapshots.push((elapsed_ms, stats));
-                last_snapshot = std::time::Instant::now();
             }
-
-            // Small sleep to avoid busy-waiting
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Final processing and snapshot
+        // Final processing (deterministic number of iterations)
         for _ in 0..10 {
             self.process_all_messages().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         let final_stats = self.analyze_topology().await;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        self.stats.write().await.topology_snapshots.push((elapsed_ms, final_stats));
+        self.stats.write().await.topology_snapshots.push((total_ms, final_stats));
     }
 
     async fn spawn_node(&self, time_ms: u64) {
@@ -458,16 +447,23 @@ impl Simulation {
     }
 
     async fn process_all_messages(&self) {
+        // Sort node IDs for deterministic processing order
+        let mut node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        node_ids.sort();
+
         let mut nodes = self.nodes.write().await;
-        for (_, running) in nodes.iter_mut() {
-            while let Some(msg) = running.client.try_recv() {
-                running.store.process_message(&running.client, msg).await;
+        for node_id in &node_ids {
+            if let Some(running) = nodes.get_mut(node_id) {
+                while let Some(msg) = running.client.try_recv() {
+                    running.store.process_message(&running.client, msg).await;
+                }
             }
         }
     }
 
     async fn discover_and_connect(&self, _time_ms: u64) {
-        let node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        let mut node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        node_ids.sort(); // Deterministic order
 
         for node_id in &node_ids {
             let nodes = self.nodes.read().await;

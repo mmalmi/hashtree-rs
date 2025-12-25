@@ -25,8 +25,8 @@ pub mod ws_relay;
 pub use behavior::{Behavior, Cooperative, Malicious, Probabilistic};
 pub use channel::{ChannelError, LatencyChannel, MockChannel, PeerChannel};
 pub use flooding::{
-    handle_request as flooding_handle_request, FloodingConfig, FloodingStore, RoutingStrategy,
-    SignalingContent,
+    clear_channel_registry, handle_request as flooding_handle_request, FloodingConfig,
+    FloodingStore, RoutingStrategy, SignalingContent,
 };
 pub use message::{
     decrement_htl, encode_request, encode_response, parse, should_forward,
