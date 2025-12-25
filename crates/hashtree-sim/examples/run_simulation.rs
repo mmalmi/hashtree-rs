@@ -66,15 +66,18 @@ async fn main() {
     // Long timeout to ensure failures are due to unreachability, not timing
     let request_timeout = Duration::from_secs(10);
 
-    // Test flooding strategy on this network (parallel requests = realistic load)
+    // Burst mode: each node fires num_requests requests simultaneously
+    let requests_per_node = num_requests;
+
+    // Test flooding strategy on this network
     eprintln!("\n=== Running Flooding Benchmark ===");
     sim.set_routing_strategy(RoutingStrategy::Flooding).await;
-    let flooding = sim.run_benchmark_parallel("Flooding", num_requests, 1024, request_timeout).await;
+    let flooding = sim.run_benchmark_burst("Flooding", requests_per_node, 1024, request_timeout).await;
 
     // Test adaptive strategy on SAME network
     eprintln!("\n=== Running Adaptive Benchmark ===");
     sim.set_routing_strategy(RoutingStrategy::Adaptive).await;
-    let adaptive = sim.run_benchmark_parallel("Adaptive", num_requests, 1024, request_timeout).await;
+    let adaptive = sim.run_benchmark_burst("Adaptive", requests_per_node, 1024, request_timeout).await;
 
     // Print detailed results
     eprintln!("\n=== Flooding vs Adaptive Comparison ===");

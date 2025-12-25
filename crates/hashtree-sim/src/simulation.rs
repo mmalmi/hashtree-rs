@@ -721,6 +721,121 @@ impl Simulation {
         self.benchmark_with_strategy(strategy_name, num_requests, data_size, request_timeout).await
     }
 
+    /// Run burst benchmark - each node fires requests_per_node requests without waiting
+    /// All nodes run in parallel (realistic network load)
+    pub async fn run_benchmark_burst(
+        &self,
+        strategy_name: &str,
+        requests_per_node: usize,
+        data_size: usize,
+        timeout: Duration,
+    ) -> BenchmarkResults {
+        use futures::future::join_all;
+
+        let mut node_ids: Vec<String> = self.nodes.read().await.keys().cloned().collect();
+        node_ids.sort();
+
+        if node_ids.len() < 2 {
+            eprintln!("  Not enough nodes for benchmark");
+            return BenchmarkResults::from_requests(strategy_name, vec![]);
+        }
+
+        // Pre-generate all test cases: each node requests from random other nodes
+        let mut all_test_cases: Vec<(String, String, Vec<u8>, [u8; 32])> = Vec::new();
+        for requester_id in &node_ids {
+            for _ in 0..requests_per_node {
+                // Pick random owner (different from requester)
+                let owner_id = {
+                    let mut rng = self.rng.write().await;
+                    let mut owner_idx = rng.gen_range(0..node_ids.len());
+                    while &node_ids[owner_idx] == requester_id {
+                        owner_idx = rng.gen_range(0..node_ids.len());
+                    }
+                    node_ids[owner_idx].clone()
+                };
+
+                let data: Vec<u8> = {
+                    let mut rng = self.rng.write().await;
+                    (0..data_size).map(|_| rng.gen()).collect()
+                };
+
+                // Store data on owner
+                let hash = {
+                    let nodes = self.nodes.read().await;
+                    if let Some(owner) = nodes.get(&owner_id) {
+                        match owner.tree.put_file(&data).await {
+                            Ok(result) => result.hash,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                };
+
+                all_test_cases.push((requester_id.clone(), owner_id, data, hash));
+            }
+        }
+
+        let total_requests = all_test_cases.len();
+        eprintln!("  {} total requests ({} nodes × {} each), launching burst...",
+            total_requests, node_ids.len(), requests_per_node);
+
+        // Launch ALL requests simultaneously (burst mode)
+        let start = Instant::now();
+        let futures: Vec<_> = all_test_cases.iter().map(|(requester_id, _owner_id, data, hash)| {
+            let requester_id = requester_id.clone();
+            let hash = *hash;
+            let expected_data = data.clone();
+            async move {
+                let tree = {
+                    let nodes = self.nodes.read().await;
+                    match nodes.get(&requester_id) {
+                        Some(n) => n.tree.clone(),
+                        None => return None,
+                    }
+                };
+
+                let req_start = Instant::now();
+                let result = tokio::time::timeout(timeout, tree.read_file(&hash)).await;
+                let latency_ms = req_start.elapsed().as_secs_f64() * 1000.0;
+
+                let result = result.ok().and_then(|r| r.ok()).flatten();
+                let success = result.as_ref().map_or(false, |r| *r == expected_data);
+
+                Some(RequestResult {
+                    success,
+                    latency_ms,
+                    bytes_sent: 0, // Not tracked in burst mode
+                    bytes_received: 0,
+                    peers_queried: 0,
+                    hops: 0,
+                })
+            }
+        }).collect();
+
+        let results: Vec<RequestResult> = join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let total_time = start.elapsed();
+        let successful = results.iter().filter(|r| r.success).count();
+        eprintln!("  {}/{} succeeded in {:.1}s ({:.0} req/s)",
+            successful, results.len(), total_time.as_secs_f64(),
+            results.len() as f64 / total_time.as_secs_f64());
+
+        // Clean up all test data
+        for (_requester_id, owner_id, _data, hash) in &all_test_cases {
+            let nodes = self.nodes.read().await;
+            if let Some(owner) = nodes.get(owner_id) {
+                owner.store.local().delete_local(hash);
+            }
+        }
+
+        BenchmarkResults::from_requests(strategy_name, results)
+    }
+
     /// Run parallel benchmark - more realistic, all requests fire simultaneously
     pub async fn run_benchmark_parallel(
         &self,
