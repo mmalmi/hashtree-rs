@@ -2,6 +2,20 @@
 
 P2P network simulation for hashtree, testing routing strategies and network behavior.
 
+## Shared Code with Production
+
+The simulation uses the **same types and defaults as production WebRTC**:
+
+```rust
+// Uses hashtree_webrtc::PoolConfig - same defaults as real WebRTC
+let config = SimConfig {
+    pool: PoolConfig::default(),  // max_connections: 10, satisfied_connections: 5
+    ..Default::default()
+};
+```
+
+This ensures simulation behavior matches production as closely as possible.
+
 ## Network Connectivity
 
 ### The Component Problem
@@ -10,15 +24,15 @@ In P2P networks, nodes may form disconnected "components" (islands) if there are
 
 **Graph theory**: For N nodes with k connections each, connectivity requires `k > ln(N)`:
 
-| Nodes | ln(N) | Recommended max_peers |
-|-------|-------|----------------------|
-| 50    | 3.9   | 8                    |
-| 100   | 4.6   | 10                   |
-| 200   | 5.3   | 11                   |
-| 500   | 6.2   | 13                   |
-| 1000  | 6.9   | 14                   |
+| Nodes | ln(N) | Real WebRTC default (10) |
+|-------|-------|--------------------------|
+| 50    | 3.9   | Well connected           |
+| 100   | 4.6   | Well connected           |
+| 200   | 5.3   | Well connected           |
+| 1000  | 6.9   | Well connected           |
+| 10000 | 9.2   | Edge case                |
 
-Use `SimConfig::recommended_max_peers(node_count)` or `SimConfig::with_auto_peers(node_count)` for automatic scaling.
+The default `max_connections: 10` works well for networks up to ~10K nodes.
 
 ### Discovery and Tie-Breaking
 

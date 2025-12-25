@@ -13,7 +13,7 @@
 //!   --per-wave N    Requests per wave (default: 10)
 //!   --wave-gap MS   Gap between waves in ms (default: 500)
 
-use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
+use hashtree_sim::{PoolConfig, RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
 
 fn parse_arg(args: &[String], flag: &str, default: u64) -> u64 {
@@ -112,14 +112,12 @@ async fn main() {
         // Different seed per run for variance
         let seed = 42 + run as u64;
 
-        // Use higher max_peers for smaller networks to ensure full connectivity
-        let max_peers = if node_count <= 20 { 10 } else if node_count <= 50 { 8 } else { 6 };
-
+        // Use real WebRTC defaults for peer connections
         let config = SimConfig {
             node_count,
             duration: Duration::from_secs(duration_secs),
             seed,
-            max_peers,
+            pool: PoolConfig::default(), // Same as real WebRTC: max=10, satisfied=5
             discovery_interval_ms: 50, // Faster discovery
             churn_rate: 0.0,
             allow_rejoin: false,

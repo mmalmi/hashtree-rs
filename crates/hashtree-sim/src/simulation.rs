@@ -15,7 +15,7 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use tokio::sync::RwLock;
 
-use crate::flooding::{FloodingConfig, FloodingStore, RoutingStrategy};
+use crate::flooding::{FloodingConfig, FloodingStore, PoolConfig, RoutingStrategy};
 use crate::relay::{MockRelay, RelayClient};
 use crate::store::NetworkStore;
 use hashtree_core::{HashTree, HashTreeConfig};
@@ -29,8 +29,8 @@ pub struct SimConfig {
     pub duration: Duration,
     /// Random seed for reproducibility
     pub seed: u64,
-    /// Max peers per node
-    pub max_peers: usize,
+    /// Peer pool configuration (uses same type as real WebRTC)
+    pub pool: PoolConfig,
     /// How often nodes check for new peers (ms)
     pub discovery_interval_ms: u64,
     /// Churn rate: probability a node leaves per interval (0.0 - 1.0)
@@ -47,24 +47,9 @@ pub struct SimConfig {
 }
 
 impl SimConfig {
-    /// Calculate recommended max_peers for a given network size
-    ///
-    /// Based on random graph connectivity theory: a random graph with N nodes
-    /// and average degree k is almost certainly connected when k > ln(N).
-    /// We use 2*ln(N) for safety margin, with a minimum of 5.
-    pub fn recommended_max_peers(node_count: usize) -> usize {
-        let ln_n = (node_count as f64).ln();
-        let recommended = (2.0 * ln_n).ceil() as usize;
-        recommended.max(5)
-    }
-
-    /// Create config with max_peers auto-scaled for the network size
-    pub fn with_auto_peers(node_count: usize) -> Self {
-        Self {
-            node_count,
-            max_peers: Self::recommended_max_peers(node_count),
-            ..Default::default()
-        }
+    /// Get max peers from pool config
+    pub fn max_peers(&self) -> usize {
+        self.pool.max_connections
     }
 }
 
@@ -74,7 +59,8 @@ impl Default for SimConfig {
             node_count: 100,
             duration: Duration::from_secs(60),
             seed: 42,
-            max_peers: 10, // Safe default for networks up to ~10K nodes
+            // Use same defaults as real WebRTC "other" pool
+            pool: PoolConfig::default(),
             discovery_interval_ms: 500,
             churn_rate: 0.01, // 1% chance per interval
             allow_rejoin: true,
@@ -363,7 +349,7 @@ impl Simulation {
 
         // Both Flooding and Adaptive use multi-hop forwarding
         let store_config = FloodingConfig {
-            max_peers: self.config.max_peers,
+            pool: self.config.pool.clone(),
             connect_timeout_ms: 5000,
             network_latency_ms: self.config.network_latency_ms,
             latency_variation: self.config.latency_variation,
@@ -495,7 +481,7 @@ impl Simulation {
             };
 
             let current_peers = running.store.peer_count().await;
-            if current_peers >= self.config.max_peers {
+            if current_peers >= self.config.max_peers() {
                 continue;
             }
 
@@ -1262,7 +1248,7 @@ mod tests {
             node_count: 10,
             duration: Duration::from_secs(2),
             seed: 42,
-            max_peers: 3,
+            pool: PoolConfig { max_connections: 3, satisfied_connections: 2 },
             discovery_interval_ms: 100,
             churn_rate: 0.0, // No churn for basic test
             allow_rejoin: false,
@@ -1288,7 +1274,7 @@ mod tests {
             node_count: 20,
             duration: Duration::from_secs(3),
             seed: 123,
-            max_peers: 4,
+            pool: PoolConfig { max_connections: 4, satisfied_connections: 2 },
             discovery_interval_ms: 100,
             churn_rate: 0.05, // 5% churn rate
             allow_rejoin: true,
@@ -1317,7 +1303,7 @@ mod tests {
             node_count: 15,
             duration: Duration::from_secs(5),
             seed: 456,
-            max_peers: 3,
+            pool: PoolConfig { max_connections: 3, satisfied_connections: 2 },
             discovery_interval_ms: 100,
             churn_rate: 0.0,
             allow_rejoin: false,

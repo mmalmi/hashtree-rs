@@ -27,9 +27,9 @@ use crate::relay::{
 };
 use crate::store::{NetworkStore, SimStore};
 
-// Use the same SignalingMessage as real WebRTC - only difference is mock puts
-// channel IDs in sdp field instead of real SDP
+// Use the same types as real WebRTC
 pub use hashtree_webrtc::SignalingMessage;
+pub use hashtree_webrtc::{PoolConfig, PoolSettings};
 
 /// Pending request we originated (waiting for response)
 struct OurRequest {
@@ -91,8 +91,9 @@ pub struct FloodingConfig {
     pub request_timeout: Duration,
     /// Enable multi-hop forwarding (using HTL)
     pub forward_requests: bool,
-    /// Max peers to connect to
-    pub max_peers: usize,
+    /// Peer pool configuration (uses same defaults as real WebRTC)
+    /// Simulation uses "other" pool since there's no social graph
+    pub pool: PoolConfig,
     /// Connection timeout (ms)
     pub connect_timeout_ms: u64,
     /// Mean network latency per hop (ms) - used as center of distribution
@@ -109,13 +110,21 @@ pub struct FloodingConfig {
     pub latency_seed: u64,
 }
 
+impl FloodingConfig {
+    /// Get max peers from pool config
+    pub fn max_peers(&self) -> usize {
+        self.pool.max_connections
+    }
+}
+
 impl Default for FloodingConfig {
     fn default() -> Self {
         Self {
             // Per-peer timeout: 1s allows multi-hop forwarding with 50ms latency
             request_timeout: Duration::from_secs(1),
             forward_requests: true,
-            max_peers: 5,
+            // Use same defaults as real WebRTC "other" pool
+            pool: PoolConfig::default(),
             connect_timeout_ms: 5000,
             network_latency_ms: 0, // Instant for tests, set to ~50 for realistic simulation
             latency_variation: 0.0, // No variation by default (uniform latency)
@@ -360,7 +369,7 @@ impl FloodingStore {
         if self.pending_outbound.read().await.contains_key(target) {
             return Ok(());
         }
-        if self.peers.read().await.len() >= self.config.max_peers {
+        if self.peers.read().await.len() >= self.config.max_peers() {
             return Ok(());
         }
 
@@ -410,7 +419,7 @@ impl FloodingStore {
         if self.peers.read().await.contains_key(&from_id) {
             return Ok(());
         }
-        if self.peers.read().await.len() >= self.config.max_peers {
+        if self.peers.read().await.len() >= self.config.max_peers() {
             return Ok(());
         }
 
@@ -525,7 +534,7 @@ impl FloodingStore {
         }
 
         // At max peers?
-        if self.peers.read().await.len() >= self.config.max_peers {
+        if self.peers.read().await.len() >= self.config.max_peers() {
             return;
         }
 
