@@ -56,13 +56,6 @@ impl<S: Store> HashTreeConfig<S> {
     }
 }
 
-/// Result of put_file operation
-#[derive(Debug, Clone)]
-pub struct PutFileResult {
-    pub hash: Hash,
-    pub size: u64,
-}
-
 /// HashTree error type
 #[derive(Debug, thiserror::Error)]
 pub enum HashTreeError {
@@ -521,51 +514,40 @@ impl<S: Store> HashTree<S> {
     }
 
     /// Store a file, chunking if necessary
-    /// Returns root hash and total size
-    pub async fn put_file(&self, data: &[u8]) -> Result<PutFileResult, HashTreeError> {
+    /// Returns Cid with hash, key (if encrypted), and size
+    pub async fn put_file(&self, data: &[u8]) -> Result<Cid, HashTreeError> {
         let size = data.len() as u64;
 
-        // Small file - store as single blob
+        // Small file - store as single chunk
         if data.len() <= self.chunk_size {
-            let hash = self.put_blob(data).await?;
-            return Ok(PutFileResult { hash, size });
+            let (hash, key) = self.put_chunk_internal(data).await?;
+            return Ok(Cid { hash, key, size });
         }
 
         // Large file - chunk it
-        let mut chunk_hashes: Vec<Hash> = Vec::new();
+        let mut links: Vec<Link> = Vec::new();
         let mut offset = 0;
 
         while offset < data.len() {
             let end = (offset + self.chunk_size).min(data.len());
             let chunk = &data[offset..end];
-            let hash = self.put_blob(chunk).await?;
-            chunk_hashes.push(hash);
+            let chunk_size = (end - offset) as u64;
+
+            let (hash, key) = self.put_chunk_internal(chunk).await?;
+            links.push(Link {
+                hash,
+                name: None,
+                size: chunk_size,
+                key,
+                link_type: LinkType::Blob, // Leaf chunk
+                meta: None,
+            });
             offset = end;
         }
 
-        // Build tree from chunks
-        let chunks: Vec<Link> = chunk_hashes
-            .iter()
-            .enumerate()
-            .map(|(i, &hash)| {
-                let chunk_size = if i < chunk_hashes.len() - 1 {
-                    self.chunk_size as u64
-                } else {
-                    (data.len() - i * self.chunk_size) as u64
-                };
-                Link {
-                    hash,
-                    name: None,
-                    size: chunk_size,
-                    key: None,
-                    link_type: LinkType::Blob, // Leaf chunk (raw blob)
-                    meta: None,
-                }
-            })
-            .collect();
-
-        let root_hash = self.build_tree(chunks, Some(size)).await?;
-        Ok(PutFileResult { hash: root_hash, size })
+        // Build tree from chunks (uses encryption if enabled)
+        let (root_hash, root_key) = self.build_tree_internal(links, Some(size)).await?;
+        Ok(Cid { hash: root_hash, key: root_key, size })
     }
 
     /// Build a directory from entries

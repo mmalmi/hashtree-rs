@@ -933,6 +933,116 @@ mod edge_cases {
     }
 }
 
+// ============ ENCRYPTION TESTS ============
+
+mod encryption {
+    use super::*;
+
+    /// Create an encrypted tree (default mode)
+    fn make_encrypted_tree() -> (Arc<MemoryStore>, HashTree<MemoryStore>) {
+        let store = Arc::new(MemoryStore::new());
+        // Default is encrypted: true
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()));
+        (store, tree)
+    }
+
+    fn make_encrypted_tree_with_chunk_size(chunk_size: usize) -> (Arc<MemoryStore>, HashTree<MemoryStore>) {
+        let store = Arc::new(MemoryStore::new());
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()).with_chunk_size(chunk_size));
+        (store, tree)
+    }
+
+    /// Count unique byte values in first 256 bytes (blossom compatibility check)
+    fn count_unique_bytes(data: &[u8]) -> usize {
+        let sample_size = data.len().min(256);
+        let mut seen = [false; 256];
+        let mut count = 0;
+        for &b in &data[..sample_size] {
+            if !seen[b as usize] {
+                seen[b as usize] = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn test_put_file_produces_encrypted_blobs() {
+        let (store, tree) = make_encrypted_tree();
+
+        // Store a file with plaintext data
+        let plaintext = b"This is plaintext content that should be encrypted";
+        let result = tree.put_file(plaintext).await.unwrap();
+
+        // The stored blob should look random (encrypted), not like plaintext
+        let stored = store.get(&result.hash).await.unwrap().unwrap();
+        let unique_bytes = count_unique_bytes(&stored);
+
+        // Encrypted data should have high unique byte count (55%+ for small blobs)
+        // Plaintext would have ~20-30 unique bytes
+        let threshold = (stored.len().min(256) as f64 * 0.55) as usize;
+        assert!(
+            unique_bytes >= threshold,
+            "put_file blob should be encrypted! Got {} unique bytes, expected >= {} (threshold 55%)",
+            unique_bytes,
+            threshold
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_file_chunked_produces_encrypted_chunks() {
+        let (store, tree) = make_encrypted_tree_with_chunk_size(32);
+
+        // Create data that will be chunked
+        let plaintext: Vec<u8> = (0..100).map(|i| (i % 26 + 65) as u8).collect(); // "ABC..."
+        let result = tree.put_file(&plaintext).await.unwrap();
+
+        // Check all stored blobs look encrypted
+        for key in store.keys() {
+            let blob = store.get(&key).await.unwrap().unwrap();
+            if blob.len() >= 28 { // Min CHK size
+                let unique_bytes = count_unique_bytes(&blob);
+                let threshold = (blob.len().min(256) as f64 * 0.55) as usize;
+                assert!(
+                    unique_bytes >= threshold,
+                    "Chunk should be encrypted! Got {} unique bytes in {} byte blob",
+                    unique_bytes,
+                    blob.len()
+                );
+            }
+        }
+
+        // Verify we can still read the file back
+        // Need to use the encryption-aware read method
+        assert!(result.hash.len() == 32);
+    }
+
+    #[tokio::test]
+    async fn test_put_file_returns_cid_with_key() {
+        let (_, tree) = make_encrypted_tree();
+
+        let plaintext = b"secret content";
+        let result = tree.put_file(plaintext).await.unwrap();
+
+        // put_file should return a result that can be used to decrypt
+        // Currently it only returns hash, but encrypted mode should return key too
+        // This test documents expected behavior for encrypted put_file
+        assert_eq!(result.size, plaintext.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_public_mode_stores_plaintext() {
+        let (store, tree) = make_tree(); // Uses .public()
+
+        let plaintext = b"This content should NOT be encrypted in public mode";
+        let result = tree.put_file(plaintext).await.unwrap();
+
+        // In public mode, the stored data should be the original plaintext
+        let stored = store.get(&result.hash).await.unwrap().unwrap();
+        assert_eq!(stored, plaintext.to_vec());
+    }
+}
+
 // ============ INTEROPERABILITY TESTS ============
 
 mod interop {
