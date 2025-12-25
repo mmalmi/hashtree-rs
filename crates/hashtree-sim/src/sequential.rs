@@ -12,14 +12,16 @@ use tokio::sync::RwLock;
 
 use crate::channel::{ChannelError, PeerChannel};
 use crate::message::{encode_request, encode_response, parse, ParsedMessage, MAX_HTL};
+use crate::peer_selector::{PeerSelector, SelectionStrategy, SelectorSummary};
 use crate::store::{NetworkStore, SimStore};
 
 /// Sequential store - tries one peer at a time, waits for response or timeout
+/// Uses adaptive peer selection to prefer reliable, fast peers
 pub struct SequentialStore {
     /// Local storage
     local: Arc<SimStore>,
-    /// Connected peer channels
-    peers: RwLock<Vec<Arc<dyn PeerChannel>>>,
+    /// Connected peer channels (peer_id -> channel)
+    peers: RwLock<Vec<(u64, Arc<dyn PeerChannel>)>>,
     /// Per-peer timeout
     peer_timeout: Duration,
     /// Total bytes sent
@@ -28,6 +30,12 @@ pub struct SequentialStore {
     bytes_received: AtomicU64,
     /// Simulated network latency per send (ms)
     network_latency_ms: u64,
+    /// Adaptive peer selector
+    peer_selector: RwLock<PeerSelector>,
+    /// Enable adaptive selection
+    adaptive_selection: bool,
+    /// Next peer ID for auto-assignment
+    next_peer_id: AtomicU64,
 }
 
 impl SequentialStore {
@@ -39,6 +47,9 @@ impl SequentialStore {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             network_latency_ms: 0,
+            peer_selector: RwLock::new(PeerSelector::with_strategy(SelectionStrategy::Weighted)),
+            adaptive_selection: true,
+            next_peer_id: AtomicU64::new(1),
         }
     }
 
@@ -50,7 +61,34 @@ impl SequentialStore {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             network_latency_ms,
+            peer_selector: RwLock::new(PeerSelector::with_strategy(SelectionStrategy::Weighted)),
+            adaptive_selection: true,
+            next_peer_id: AtomicU64::new(1),
         }
+    }
+
+    /// Create with custom selection strategy
+    pub fn with_strategy(
+        local: Arc<SimStore>,
+        peer_timeout: Duration,
+        strategy: SelectionStrategy,
+    ) -> Self {
+        Self {
+            local,
+            peers: RwLock::new(Vec::new()),
+            peer_timeout,
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            network_latency_ms: 0,
+            peer_selector: RwLock::new(PeerSelector::with_strategy(strategy)),
+            adaptive_selection: true,
+            next_peer_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Enable/disable adaptive selection
+    pub fn set_adaptive_selection(&mut self, enabled: bool) {
+        self.adaptive_selection = enabled;
     }
 
     /// Send data with simulated network latency
@@ -61,14 +99,35 @@ impl SequentialStore {
         peer.send(data).await
     }
 
-    /// Add a peer channel
+    /// Add a peer channel with auto-assigned ID
     pub async fn add_peer(&self, channel: Arc<dyn PeerChannel>) {
-        self.peers.write().await.push(channel);
+        let peer_id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
+        self.peers.write().await.push((peer_id, channel));
+        self.peer_selector.write().await.add_peer(peer_id);
+    }
+
+    /// Add a peer channel with specific ID
+    pub async fn add_peer_with_id(&self, peer_id: u64, channel: Arc<dyn PeerChannel>) {
+        self.peers.write().await.push((peer_id, channel));
+        self.peer_selector.write().await.add_peer(peer_id);
     }
 
     /// Remove disconnected peers
     pub async fn cleanup_peers(&self) {
-        self.peers.write().await.retain(|p| p.is_connected());
+        let mut peers = self.peers.write().await;
+        let mut selector = self.peer_selector.write().await;
+        peers.retain(|(id, p)| {
+            let connected = p.is_connected();
+            if !connected {
+                selector.remove_peer(*id);
+            }
+            connected
+        });
+    }
+
+    /// Get peer selector summary
+    pub async fn peer_selection_summary(&self) -> SelectorSummary {
+        self.peer_selector.read().await.summary()
     }
 }
 
@@ -100,21 +159,48 @@ impl Store for SequentialStore {
 #[async_trait]
 impl NetworkStore for SequentialStore {
     async fn fetch_from_network(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
-        let peers = self.peers.read().await;
-        if peers.is_empty() {
+        // Get ordered peer list based on selector (if adaptive)
+        let ordered_peers: Vec<(u64, Arc<dyn PeerChannel>)> = if self.adaptive_selection {
+            let peer_order = self.peer_selector.write().await.select_peers();
+            let peers = self.peers.read().await;
+
+            // Map ordered IDs to channels
+            peer_order
+                .into_iter()
+                .filter_map(|id| {
+                    peers.iter()
+                        .find(|(pid, _)| *pid == id)
+                        .map(|(pid, ch)| (*pid, ch.clone()))
+                })
+                .collect()
+        } else {
+            self.peers.read().await.clone()
+        };
+
+        if ordered_peers.is_empty() {
             return Ok(None);
         }
 
         // Use MAX_HTL for sequential requests (single-hop, no forwarding)
         let request_bytes = encode_request(hash, MAX_HTL);
+        let request_size = request_bytes.len() as u64;
 
-        // Try each peer sequentially
-        for peer in peers.iter() {
+        // Try each peer in order (best peers first when adaptive)
+        for (peer_id, peer) in ordered_peers {
+            // Track request in selector
+            if self.adaptive_selection {
+                self.peer_selector.write().await.record_request(peer_id, request_size);
+            }
+
+            let request_start = std::time::Instant::now();
+
             // Send request with latency simulation
-            self.bytes_sent
-                .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
+            self.bytes_sent.fetch_add(request_size, Ordering::Relaxed);
 
             if self.send_with_latency(peer.as_ref(), request_bytes.clone()).await.is_err() {
+                if self.adaptive_selection {
+                    self.peer_selector.write().await.record_failure(peer_id);
+                }
                 continue; // Try next peer
             }
 
@@ -130,29 +216,49 @@ impl NetworkStore for SequentialStore {
                                 if h == *hash {
                                     // Verify data matches hash
                                     if hashtree_core::sha256(&res.d) == *hash {
+                                        // Success! Record metrics
+                                        if self.adaptive_selection {
+                                            let rtt_ms = request_start.elapsed().as_millis() as u64;
+                                            self.peer_selector.write().await.record_success(
+                                                peer_id,
+                                                rtt_ms,
+                                                res.d.len() as u64,
+                                            );
+                                        }
                                         // Cache locally and return
                                         let _ = self.local.put(*hash, res.d.clone()).await;
                                         return Ok(Some(res.d));
                                     }
-                                    // Malicious: wrong data, try next peer
+                                    // Malicious: wrong data
+                                    if self.adaptive_selection {
+                                        self.peer_selector.write().await.record_failure(peer_id);
+                                    }
                                 }
                             }
                             // Wrong hash, try next peer
                             continue;
                         }
                         _ => {
-                            // Garbage or wrong message, try next peer
+                            // Garbage or wrong message
+                            if self.adaptive_selection {
+                                self.peer_selector.write().await.record_failure(peer_id);
+                            }
                             continue;
                         }
                     }
                 }
                 Err(ChannelError::Timeout) => {
-                    // Timeout means peer is still searching or doesn't have it
-                    // Try next peer
+                    // Timeout - record and try next peer
+                    if self.adaptive_selection {
+                        self.peer_selector.write().await.record_timeout(peer_id);
+                    }
                     continue;
                 }
                 Err(_) => {
-                    // Disconnected, try next peer
+                    // Disconnected - record failure
+                    if self.adaptive_selection {
+                        self.peer_selector.write().await.record_failure(peer_id);
+                    }
                     continue;
                 }
             }

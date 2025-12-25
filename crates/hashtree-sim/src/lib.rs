@@ -15,6 +15,7 @@ mod channel;
 mod flooding;
 mod message;
 mod peer_agent;
+mod peer_selector;
 mod relay;
 mod sequential;
 mod simulation;
@@ -33,6 +34,7 @@ pub use message::{
     DECREMENT_AT_MAX_PROB, DECREMENT_AT_MIN_PROB, MAX_HTL, MSG_TYPE_REQUEST, MSG_TYPE_RESPONSE,
 };
 pub use peer_agent::{OurRequest, PeerAgent, TheirRequest};
+pub use peer_selector::{PeerSelector, PeerStats, SelectionStrategy, SelectorSummary};
 pub use relay::{
     ClientMessage, Event, Filter, MockRelay, RelayClient, RelayError, RelayMessage,
     KIND_ANSWER, KIND_CANDIDATE, KIND_OFFER, KIND_PRESENCE,

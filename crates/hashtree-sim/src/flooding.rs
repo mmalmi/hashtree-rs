@@ -21,6 +21,7 @@ use crate::message::{
     decrement_htl, encode_request, encode_response, parse, should_forward,
     ParsedMessage, PeerHTLConfig, MAX_HTL,
 };
+use crate::peer_selector::{PeerSelector, SelectionStrategy};
 use crate::relay::{
     Event, Filter, MockRelay, RelayClient, RelayMessage, KIND_ANSWER, KIND_OFFER, KIND_PRESENCE,
 };
@@ -94,6 +95,10 @@ pub struct FloodingConfig {
     pub network_latency_ms: u64,
     /// Routing strategy for data requests
     pub routing_strategy: RoutingStrategy,
+    /// Peer selection strategy (for sequential mode)
+    pub selection_strategy: SelectionStrategy,
+    /// Enable adaptive peer selection
+    pub adaptive_selection: bool,
 }
 
 impl Default for FloodingConfig {
@@ -108,6 +113,8 @@ impl Default for FloodingConfig {
             connect_timeout_ms: 5000,
             network_latency_ms: 0, // Instant for tests, set to ~50 for realistic simulation
             routing_strategy: RoutingStrategy::Flooding,
+            selection_strategy: SelectionStrategy::Weighted,
+            adaptive_selection: true,
         }
     }
 }
@@ -124,6 +131,7 @@ struct IncomingMessage {
 /// - Signaling (relay connection, presence, offers/answers)
 /// - Peer management (connection establishment, channel handling)
 /// - Data transfer (flooding requests, HTL-based forwarding)
+/// - Adaptive peer selection (preferring reliable, fast peers)
 pub struct FloodingStore {
     /// Node ID (string for signaling)
     id: String,
@@ -149,6 +157,8 @@ pub struct FloodingStore {
     bytes_received: AtomicU64,
     /// Shutdown signal sender
     shutdown_tx: broadcast::Sender<()>,
+    /// Adaptive peer selector for intelligent peer selection
+    peer_selector: RwLock<PeerSelector>,
 }
 
 // Global channel registry for signaling
@@ -166,6 +176,9 @@ impl FloodingStore {
         let (msg_tx, msg_rx) = mpsc::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
 
+        // Initialize peer selector with configured strategy
+        let peer_selector = PeerSelector::with_strategy(config.selection_strategy);
+
         let store = Arc::new(Self {
             id,
             node_id,
@@ -179,6 +192,7 @@ impl FloodingStore {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             shutdown_tx,
+            peer_selector: RwLock::new(peer_selector),
         });
 
         // Start message handler loop
@@ -425,6 +439,9 @@ impl FloodingStore {
             htl_config,
         });
 
+        // Register with peer selector for adaptive selection
+        self.peer_selector.write().await.add_peer(peer_id);
+
         // Spawn receiver for this peer
         let store = self.clone();
         let msg_tx = self.msg_tx.clone();
@@ -454,6 +471,12 @@ impl FloodingStore {
     /// Remove a peer
     pub async fn remove_peer(&self, peer_id: u64) {
         self.peers.write().await.remove(&peer_id);
+        self.peer_selector.write().await.remove_peer(peer_id);
+    }
+
+    /// Get peer selector summary stats
+    pub async fn peer_selection_summary(&self) -> crate::peer_selector::SelectorSummary {
+        self.peer_selector.read().await.summary()
     }
 
     /// Get connected peer IDs
@@ -531,35 +554,55 @@ impl FloodingStore {
     }
 
     /// Sequential strategy: try one peer at a time, wait for response before trying next
+    /// Uses adaptive peer selection to prefer reliable, fast peers
     async fn fetch_from_peers_sequential(&self, hash: &[u8; 32], exclude: Option<u64>) -> Option<Vec<u8>> {
-        let peer_list: Vec<(u64, ConnectedPeer)> = {
-            let peers = self.peers.read().await;
-            peers
-                .iter()
-                .filter(|(&id, _)| Some(id) != exclude)
-                .map(|(&id, p)| (id, ConnectedPeer {
-                    channel: p.channel.clone(),
-                    htl_config: p.htl_config.clone(),
-                }))
+        // Get peer ordering from selector (if adaptive selection enabled)
+        let ordered_peer_ids: Vec<u64> = if self.config.adaptive_selection {
+            let mut selector = self.peer_selector.write().await;
+            selector.select_peers()
+                .into_iter()
+                .filter(|&id| Some(id) != exclude)
+                .collect()
+        } else {
+            self.peers.read().await.keys().copied()
+                .filter(|&id| Some(id) != exclude)
                 .collect()
         };
 
-        if peer_list.is_empty() {
+        if ordered_peer_ids.is_empty() {
             return None;
         }
 
-        // Try each peer sequentially
-        for (_peer_id, peer) in peer_list {
+        // Try each peer in order (best peers first)
+        for peer_id in ordered_peer_ids {
+            let (channel, htl_config) = {
+                let peers = self.peers.read().await;
+                match peers.get(&peer_id) {
+                    Some(peer) => (peer.channel.clone(), peer.htl_config.clone()),
+                    None => continue, // Peer disconnected
+                }
+            };
+
             // Decrement HTL when sending
-            let outgoing_htl = decrement_htl(MAX_HTL, &peer.htl_config);
+            let outgoing_htl = decrement_htl(MAX_HTL, &htl_config);
             let request_bytes = encode_request(hash, outgoing_htl);
+            let request_size = request_bytes.len() as u64;
+
+            // Track request in selector
+            if self.config.adaptive_selection {
+                self.peer_selector.write().await.record_request(peer_id, request_size);
+            }
+
+            let request_start = std::time::Instant::now();
 
             // Send request
-            if self.send_with_latency(peer.channel.as_ref(), request_bytes.clone()).await.is_err() {
+            if self.send_with_latency(channel.as_ref(), request_bytes.clone()).await.is_err() {
+                if self.config.adaptive_selection {
+                    self.peer_selector.write().await.record_failure(peer_id);
+                }
                 continue; // Try next peer
             }
-            self.bytes_sent
-                .fetch_add(request_bytes.len() as u64, Ordering::Relaxed);
+            self.bytes_sent.fetch_add(request_size, Ordering::Relaxed);
 
             // Setup response channel
             let (tx, rx) = oneshot::channel();
@@ -571,16 +614,24 @@ impl FloodingStore {
             // Wait for response
             match tokio::time::timeout(self.config.request_timeout, rx).await {
                 Ok(Ok(Some(data))) => {
-                    // Found it! Cache locally and return
+                    // Success! Record metrics
+                    if self.config.adaptive_selection {
+                        let rtt_ms = request_start.elapsed().as_millis() as u64;
+                        self.peer_selector.write().await.record_success(peer_id, rtt_ms, data.len() as u64);
+                    }
+                    // Cache locally and return
                     self.local.put_local(*hash, data.clone());
                     return Some(data);
                 }
                 Ok(Ok(None)) => {
-                    // Peer responded with not found, try next
+                    // Peer responded with not found - not a failure, just doesn't have it
                     continue;
                 }
                 _ => {
-                    // Timeout or error - cleanup and try next peer
+                    // Timeout or error - record and try next peer
+                    if self.config.adaptive_selection {
+                        self.peer_selector.write().await.record_timeout(peer_id);
+                    }
                     self.our_requests.write().await.remove(hash);
                     continue;
                 }
@@ -694,10 +745,22 @@ impl FloodingStore {
     }
 
     /// Handle incoming response
-    async fn handle_response(&self, _from_peer: u64, hash: [u8; 32], data: Vec<u8>) {
+    async fn handle_response(&self, from_peer: u64, hash: [u8; 32], data: Vec<u8>) {
         // Verify hash
         if hashtree_core::sha256(&data) != hash {
+            // Record failure for bad data
+            if self.config.adaptive_selection {
+                self.peer_selector.write().await.record_failure(from_peer);
+            }
             return;
+        }
+
+        // Record success for the peer that responded (even in flooding mode)
+        // This helps identify reliable peers for future sequential queries
+        if self.config.adaptive_selection {
+            // We don't have exact RTT for flooding mode, use a placeholder
+            // The success/failure tracking is still valuable
+            self.peer_selector.write().await.record_success(from_peer, 0, data.len() as u64);
         }
 
         // Check if this is a response to our own request

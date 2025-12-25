@@ -2,32 +2,52 @@
 //!
 //! Tests the full stack: HashTree<FloodingStore> for content operations + P2P networking
 //! Compares flooding vs sequential routing strategies.
+//!
+//! Usage: cargo run --example run_simulation -- [OPTIONS]
+//!   --nodes N       Number of nodes (default: 20)
+//!   --duration S    Simulation duration in seconds (default: 5)
+//!   --requests N    Number of benchmark requests (default: 10)
+//!   --latency MS    Network latency per hop in ms (default: 10)
 
 use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
 use std::time::Duration;
 
+fn parse_arg(args: &[String], flag: &str, default: u64) -> u64 {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    let node_count = parse_arg(&args, "--nodes", 20) as usize;
+    let duration_secs = parse_arg(&args, "--duration", 5);
+    let num_requests = parse_arg(&args, "--requests", 10) as usize;
+    let latency_ms = parse_arg(&args, "--latency", 10);
+
     eprintln!("=== Network Simulation ===\n");
 
     // Base configuration (same seed for fair comparison)
-    // Note: 30s duration gives network time to form connections
-    // With 50 nodes, max_peers=5, we get ~85% in largest component
     let base_config = SimConfig {
-        node_count: 50,
-        duration: Duration::from_secs(30),
+        node_count,
+        duration: Duration::from_secs(duration_secs),
         seed: 42,
-        max_peers: 10, // Good balance for demonstration
-        discovery_interval_ms: 200,
+        max_peers: 5,
+        discovery_interval_ms: 100,
         churn_rate: 0.0,
         allow_rejoin: false,
-        network_latency_ms: 50, // Realistic WebRTC latency per hop
+        network_latency_ms: latency_ms,
         routing_strategy: RoutingStrategy::Flooding, // Will be overridden
     };
 
     eprintln!("Configuration:");
     eprintln!("  Nodes: {}", base_config.node_count);
     eprintln!("  Duration: {:?}", base_config.duration);
+    eprintln!("  Requests: {}", num_requests);
     eprintln!("  Max peers: {}", base_config.max_peers);
     eprintln!("  Network latency: {}ms per hop", base_config.network_latency_ms);
 
@@ -40,8 +60,9 @@ async fn main() {
     let flooding_sim = Simulation::new(flooding_config);
     flooding_sim.run().await;
     let flooding_topology = flooding_sim.analyze_topology().await;
-    // 30 requests with 5s timeout (enough for multi-hop with 50ms latency)
-    let flooding = flooding_sim.run_benchmark(30, 1024, Duration::from_secs(5)).await;
+    // Timeout should be enough for multi-hop
+    let request_timeout = Duration::from_millis(500 + latency_ms * 10);
+    let flooding = flooding_sim.run_benchmark(num_requests, 1024, request_timeout).await;
 
     // Run sequential simulation (same topology seed)
     eprintln!("\n=== Running Sequential Simulation ===");
@@ -51,7 +72,7 @@ async fn main() {
     };
     let sequential_sim = Simulation::new(sequential_config);
     sequential_sim.run().await;
-    let sequential = sequential_sim.run_benchmark(30, 1024, Duration::from_secs(5)).await;
+    let sequential = sequential_sim.run_benchmark(num_requests, 1024, request_timeout).await;
 
     // Print topology (same for both since same seed)
     eprintln!("\n=== Topology (shared) ===");
