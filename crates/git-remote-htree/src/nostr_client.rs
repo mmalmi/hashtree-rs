@@ -477,27 +477,52 @@ impl NostrClient {
             return Ok((HashMap::new(), None, None));
         }
 
-        // Get optional encryption key from "encryptedKey" (private/link-visible) or "key" (public) tag
-        // For private repos, the key is XOR masked and will be unmasked by helper using url_secret
-        let encryption_key = event
+        // Get encryption key and determine visibility type from tag name
+        // - "key": public repo, key is plaintext CHK
+        // - "encryptedKey": link-visible repo, key is XOR-masked with URL secret
+        // - "selfEncryptedKey": private repo, key is NIP-44 encrypted to author
+        let (encryption_key, key_tag_name) = event
             .tags
             .iter()
-            .find(|t| {
+            .find_map(|t| {
                 let slice = t.as_slice();
-                slice.len() >= 2 && (slice[0].as_str() == "encryptedKey" || slice[0].as_str() == "key")
-            })
-            .and_then(|t| {
-                let key_hex = t.as_slice()[1].to_string();
-                hex::decode(&key_hex).ok().and_then(|bytes| {
-                    if bytes.len() == 32 {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&bytes);
-                        Some(key)
-                    } else {
-                        None
+                if slice.len() >= 2 {
+                    let tag_name = slice[0].as_str();
+                    if tag_name == "key" || tag_name == "encryptedKey" || tag_name == "selfEncryptedKey" {
+                        let key_hex = slice[1].to_string();
+                        if let Ok(bytes) = hex::decode(&key_hex) {
+                            if bytes.len() == 32 {
+                                let mut key = [0u8; 32];
+                                key.copy_from_slice(&bytes);
+                                return Some((Some(key), Some(tag_name.to_string())));
+                            }
+                        }
                     }
-                })
-            });
+                }
+                None
+            })
+            .unwrap_or((None, None));
+
+        // Check for access errors based on key type
+        if let Some(ref tag) = key_tag_name {
+            match tag.as_str() {
+                "encryptedKey" if self.url_secret.is_none() => {
+                    anyhow::bail!(
+                        "This repo is link-visible and requires a secret key.\n\
+                         Use: htree://.../{repo_name}#k=<secret>\n\
+                         Ask the repo owner for the full URL with the secret."
+                    );
+                }
+                "selfEncryptedKey" => {
+                    // TODO: Implement NIP-44 decryption for private repos
+                    anyhow::bail!(
+                        "This repo is private (author-only).\n\
+                         Only the repo author can access it using #private in the URL."
+                    );
+                }
+                _ => {}
+            }
+        }
 
         // For link-visible repos: XOR the masked key with url_secret to get the real CHK key
         // For public repos: use the key directly (no masking)

@@ -161,17 +161,22 @@ fn test_link_visible_cannot_clone_without_secret() {
     let clone_stderr = String::from_utf8_lossy(&clone.stderr);
     println!("{}", clone_stderr);
 
-    // Clone should fail - either completely fails, or warns about decryption
-    // The failure might manifest as: empty clone, decryption error, or missing key
+    // Clone should fail with a clear error about needing the secret
     let clone_failed = !clone.status.success()
-        || clone_stderr.contains("error")
-        || clone_stderr.contains("decrypt")
-        || clone_stderr.contains("key")
+        || clone_stderr.contains("link-visible")
+        || clone_stderr.contains("requires a secret")
         || !clone_path.join("README.md").exists();
 
     assert!(
         clone_failed,
-        "Clone without secret should fail. Stderr: {}",
+        "Clone without secret should fail with clear error. Stderr: {}",
+        clone_stderr
+    );
+
+    // Verify we get a helpful error message (not just empty repo)
+    assert!(
+        clone_stderr.contains("link-visible") || clone_stderr.contains("secret"),
+        "Should display helpful error about needing secret. Stderr: {}",
         clone_stderr
     );
 
