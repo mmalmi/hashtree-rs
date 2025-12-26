@@ -676,25 +676,34 @@ impl RemoteHelper {
         debug!(force = has_force_push, "About to call load_existing_remote_state");
 
         if let Err(e) = self.load_existing_remote_state() {
-            if has_force_push {
+            let err_str = e.to_string();
+
+            // Check if this is an access restriction error (changing visibility modes)
+            // These are expected and we should proceed with fresh state
+            let is_access_error = err_str.contains("link-visible")
+                || err_str.contains("private")
+                || err_str.contains("secret key");
+
+            // Check if this might be a new repo (no refs found is OK)
+            let is_likely_new_repo = err_str.contains("No root hash")
+                || err_str.contains("not found")
+                || err_str.contains("timeout");
+
+            if is_access_error {
+                // Changing visibility mode - proceed with fresh state
+                debug!("Cannot access existing repo (visibility change): {}", e);
+            } else if has_force_push {
                 // Force push - proceed without existing state
                 eprintln!("  Warning: Could not load existing remote state: {}", e);
                 eprintln!("  Proceeding with force push (may overwrite other branches)");
+            } else if is_likely_new_repo {
+                debug!("Error loading remote state (likely new repo): {}", e);
+                info!("Could not load existing remote state: {} (likely new repo)", e);
             } else {
-                // Check if this might be a new repo (no refs found is OK)
-                let is_likely_new_repo = e.to_string().contains("No root hash")
-                    || e.to_string().contains("not found")
-                    || e.to_string().contains("timeout");
-
-                if is_likely_new_repo {
-                    debug!("Error loading remote state (likely new repo): {}", e);
-                    info!("Could not load existing remote state: {} (likely new repo)", e);
-                } else {
-                    // There's an existing remote but we can't load it - warn user
-                    eprintln!("  Warning: Could not load existing remote state: {}", e);
-                    eprintln!("  Other branches may be lost. Use 'git push --force' to override.");
-                    eprintln!("  Or check your network connection and try again.");
-                }
+                // There's an existing remote but we can't load it - warn user
+                eprintln!("  Warning: Could not load existing remote state: {}", e);
+                eprintln!("  Other branches may be lost. Use 'git push --force' to override.");
+                eprintln!("  Or check your network connection and try again.");
             }
         }
 
