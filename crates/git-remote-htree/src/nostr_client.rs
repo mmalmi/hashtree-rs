@@ -38,7 +38,6 @@ use anyhow::{Context, Result};
 use hashtree_blossom::BlossomClient;
 use hashtree_core::{decode_tree_node, decrypt_chk, LinkType};
 use nostr_sdk::prelude::*;
-use nostr_sdk::pool::RelaySendOptions;
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -818,8 +817,29 @@ impl NostrClient {
             }
         }
 
-        // Connect with a short timeout - don't block on failing relays
-        tokio::time::timeout(Duration::from_secs(3), client.connect()).await.ok();
+        // Connect to relays - this starts async connection in background
+        client.connect().await;
+
+        // Wait for at least one relay to connect (same pattern as fetch)
+        let connect_timeout = Duration::from_secs(3);
+        let start = std::time::Instant::now();
+        loop {
+            let relays = client.relays().await;
+            let mut any_connected = false;
+            for (_url, relay) in relays.iter() {
+                if relay.is_connected().await {
+                    any_connected = true;
+                    break;
+                }
+            }
+            if any_connected {
+                break;
+            }
+            if start.elapsed() > connect_timeout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         // Build event with tags
         let mut tags = vec![
@@ -848,29 +868,35 @@ impl NostrClient {
             .to_event(keys)
             .map_err(|e| anyhow::anyhow!("Failed to sign event: {}", e))?;
 
-        // Check which relays connected
-        let relays = client.relays().await;
-        for (url, relay) in relays.iter() {
-            let url_str = url.to_string();
-            if relay.is_connected().await {
-                connected.push(url_str);
-            } else if !failed.contains(&url_str) {
-                failed.push(url_str);
-            }
-        }
-
-        // Send event using pool directly with skip_send_confirmation
-        // This sends the event and returns immediately without waiting for relay OK messages
-        let send_opts = RelaySendOptions::new()
-            .skip_send_confirmation(true)
-            .timeout(Some(Duration::from_secs(3)));
-
-        match client.pool().send_event(event.clone(), send_opts).await {
+        // Send event to connected relays
+        match client.send_event(event.clone()).await {
             Ok(output) => {
-                info!("Sent event {} to {} relays", output.id(), connected.len());
+                // Track which relays confirmed
+                for url in output.success.iter() {
+                    let url_str = url.to_string();
+                    if !connected.contains(&url_str) {
+                        connected.push(url_str);
+                    }
+                }
+                // Only mark as failed if we got explicit rejection
+                for (url, err) in output.failed.iter() {
+                    if err.is_some() {
+                        let url_str = url.to_string();
+                        if !failed.contains(&url_str) && !connected.contains(&url_str) {
+                            failed.push(url_str);
+                        }
+                    }
+                }
+                info!("Sent event {} to {} relays ({} failed)", output.id(), output.success.len(), output.failed.len());
             }
             Err(e) => {
                 warn!("Failed to send event: {}", e);
+                // Mark all as failed
+                for relay in &self.relays {
+                    if !failed.contains(relay) {
+                        failed.push(relay.clone());
+                    }
+                }
             }
         };
 

@@ -314,7 +314,7 @@ impl TestEnv {
         // Build config
         let relays = match nostr_relay {
             Some(url) => format!(r#"relays = ["{}"]"#, url),
-            None => r#"relays = ["wss://temp.iris.to", "wss://relay.damus.io"]"#.to_string(),
+            None => r#"relays = ["wss://temp.iris.to", "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]"#.to_string(),
         };
 
         let blossom = match blossom_server {
