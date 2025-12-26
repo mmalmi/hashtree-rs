@@ -737,6 +737,22 @@ impl RemoteHelper {
                     Err(e) => results.push(format!("error {} {}", spec.dst, e)),
                 }
             } else {
+                // Check for non-fast-forward push (unless force)
+                if !spec.force {
+                    if let Some(remote_sha) = self.remote_refs.get(&spec.dst) {
+                        if !self.is_ancestor(remote_sha, &sha) {
+                            results.push(format!(
+                                "error {} non-fast-forward (use --force to override)",
+                                spec.dst
+                            ));
+                            eprintln!(
+                                "  Rejected: remote has commits you don't have. Pull first or use --force."
+                            );
+                            continue;
+                        }
+                    }
+                }
+
                 // Push objects
                 match self.push_objects(&sha, &spec.dst) {
                     Ok(()) => results.push(format!("ok {}", spec.dst)),
@@ -764,6 +780,15 @@ impl RemoteHelper {
         }
 
         eprintln!("  Found {} existing refs", refs.len());
+
+        // Store remote refs for non-fast-forward detection
+        self.remote_refs.clear();
+        for (ref_name, ref_value) in &refs {
+            // Only track branch refs (not HEAD symref)
+            if ref_name.starts_with("refs/") && !ref_value.starts_with("ref: ") {
+                self.remote_refs.insert(ref_name.clone(), ref_value.clone());
+            }
+        }
 
         // Import refs into storage (these will be merged with pushed refs)
         for (ref_name, ref_value) in &refs {
@@ -800,6 +825,19 @@ impl RemoteHelper {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Check if ancestor_sha is an ancestor of descendant_sha
+    fn is_ancestor(&self, ancestor_sha: &str, descendant_sha: &str) -> bool {
+        // git merge-base --is-ancestor returns 0 if true, 1 if false
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor_sha, descendant_sha])
+            .output();
+
+        match output {
+            Ok(o) => o.status.success(),
+            Err(_) => false, // If we can't check, assume not an ancestor (safer)
+        }
     }
 
     /// Push all objects reachable from sha
