@@ -249,36 +249,74 @@ impl BlossomClient {
     }
 
     /// Check if a blob exists on any write server
-    /// (Used before upload to skip if already present)
     pub async fn exists(&self, hash: &str) -> bool {
         for server in &self.write_servers {
-            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
-            debug!("Checking exists: {}", url);
-            if let Ok(resp) = self.http.head(&url).send().await {
-                debug!("  -> status: {}", resp.status());
-                if resp.status().is_success() {
-                    // Verify content-type is binary, not HTML error page
-                    if let Some(ct) = resp.headers().get("content-type") {
-                        if let Ok(ct_str) = ct.to_str() {
-                            if ct_str.starts_with("text/html") {
-                                continue; // Server returned HTML, blob doesn't exist
-                            }
-                        }
-                    }
-                    // Verify content-length > 0 (empty blobs don't count as existing)
-                    if let Some(cl) = resp.headers().get("content-length") {
-                        if let Ok(cl_str) = cl.to_str() {
-                            if cl_str == "0" {
-                                debug!("Blob {} has content-length 0 on {}, skipping", hash, server);
-                                continue;
-                            }
-                        }
-                    }
-                    return true;
-                }
+            if self.exists_on_server(hash, server).await {
+                return true;
             }
         }
         false
+    }
+
+    /// Check if a blob exists on a specific server
+    pub async fn exists_on_server(&self, hash: &str, server: &str) -> bool {
+        let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash);
+        debug!("Checking exists: {}", url);
+        if let Ok(resp) = self.http.head(&url).send().await {
+            debug!("  -> status: {}", resp.status());
+            if resp.status().is_success() {
+                // Verify content-type is binary, not HTML error page
+                if let Some(ct) = resp.headers().get("content-type") {
+                    if let Ok(ct_str) = ct.to_str() {
+                        if ct_str.starts_with("text/html") {
+                            return false;
+                        }
+                    }
+                }
+                // Verify content-length > 0
+                if let Some(cl) = resp.headers().get("content-length") {
+                    if let Ok(cl_str) = cl.to_str() {
+                        if cl_str == "0" {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if server has a tree by sampling hashes (parallel checks)
+    pub async fn server_has_tree_samples(&self, server: &str, hashes: &[&str], sample_size: usize) -> bool {
+        use futures::future::join_all;
+        if hashes.is_empty() {
+            return false;
+        }
+        // Spread samples across the hash list
+        let step = (hashes.len() / sample_size.min(hashes.len())).max(1);
+        let samples: Vec<_> = hashes.iter().step_by(step).take(sample_size).collect();
+        let checks: Vec<_> = samples.iter().map(|h| self.exists_on_server(h, server)).collect();
+        join_all(checks).await.iter().all(|&exists| exists)
+    }
+
+    /// Upload to all write servers in parallel, returns (hash, success_count)
+    pub async fn upload_to_all_servers(&self, data: &[u8]) -> Result<(String, usize), BlossomError> {
+        use futures::future::join_all;
+        if self.write_servers.is_empty() {
+            return Err(BlossomError::NoServers);
+        }
+        let hash = compute_sha256(data);
+        let auth = self.create_upload_auth(&hash).await?;
+        let uploads: Vec<_> = self.write_servers.iter()
+            .map(|s| self.upload_to_server(s, data, &hash, &auth))
+            .collect();
+        let results = join_all(uploads).await;
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        if ok_count == 0 {
+            return Err(BlossomError::UploadFailed("all servers failed".to_string()));
+        }
+        Ok((hash, ok_count))
     }
 
     /// Download data from Blossom servers
@@ -516,5 +554,40 @@ mod tests {
             .with_timeout(Duration::from_secs(60));
 
         assert_eq!(client.servers().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_exists_on_server() {
+        let keys = Keys::generate();
+        let client = BlossomClient::new(keys)
+            .with_servers(vec!["https://example.com".to_string()]);
+
+        // Method should exist and return bool
+        let result = client.exists_on_server("abc123", "https://example.com").await;
+        assert!(!result); // Non-existent hash
+    }
+
+    #[tokio::test]
+    async fn test_server_has_tree_samples() {
+        let keys = Keys::generate();
+        let client = BlossomClient::new(keys)
+            .with_servers(vec!["https://example.com".to_string()]);
+
+        let hashes = vec!["hash1", "hash2", "hash3"];
+        // Method should exist and check samples
+        let result = client.server_has_tree_samples("https://example.com", &hashes, 3).await;
+        assert!(!result); // Non-existent hashes
+    }
+
+    #[tokio::test]
+    async fn test_upload_to_all_servers() {
+        let keys = Keys::generate();
+        let client = BlossomClient::new(keys)
+            .with_servers(vec!["https://example1.com".to_string(), "https://example2.com".to_string()]);
+
+        // Method should exist and return (hash, server_count)
+        // Will fail since servers don't exist, but should compile
+        let result = client.upload_to_all_servers(b"test data").await;
+        assert!(result.is_err()); // Expected to fail - servers don't exist
     }
 }
