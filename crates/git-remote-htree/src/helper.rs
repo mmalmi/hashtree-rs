@@ -1065,7 +1065,16 @@ impl RemoteHelper {
             // Check which servers need full upload (don't have old tree)
             let all_servers: Vec<String> = blossom.write_servers().to_vec();
             let servers_needing_full: Arc<Vec<String>> = if has_old_tree && !all_servers.is_empty() {
-                let sample_hashes: Vec<String> = old_hashes.iter().take(5).map(|h| hex::encode(h)).collect();
+                // Always include the root hash first, then sample additional random hashes
+                // Root is critical - if server doesn't have root, it can't serve the tree
+                let old_root = old_root_bytes.unwrap();
+                let mut sample_hashes = vec![hex::encode(old_root)];
+                // Add up to 4 more random samples from the rest of the tree
+                for hash in old_hashes.iter().take(4) {
+                    if *hash != old_root {
+                        sample_hashes.push(hex::encode(hash));
+                    }
+                }
                 let sample_refs: Vec<&str> = sample_hashes.iter().map(|s| s.as_str()).collect();
                 let mut needs_full = Vec::new();
                 for server in &all_servers {
