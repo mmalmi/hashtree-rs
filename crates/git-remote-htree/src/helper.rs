@@ -92,6 +92,9 @@ pub struct RemoteHelper {
     push_specs: Vec<PushSpec>,
     /// Objects to fetch
     fetch_specs: Vec<FetchSpec>,
+    /// Secret key from URL fragment #k=<hex> (for private repos)
+    /// If set, use this for encryption instead of CHK, and don't publish key in event
+    url_secret: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -108,10 +111,20 @@ struct FetchSpec {
 }
 
 impl RemoteHelper {
-    pub fn new(pubkey: &str, repo_name: &str, secret_key: Option<String>, config: Config) -> Result<Self> {
+    pub fn new(
+        pubkey: &str,
+        repo_name: &str,
+        signing_key: Option<String>,
+        url_secret: Option<[u8; 32]>,
+        config: Config,
+    ) -> Result<Self> {
         // Use shared hashtree storage at ~/.hashtree/data
         let storage = GitStorage::open(get_hashtree_data_dir())?;
-        let nostr = NostrClient::new(pubkey, secret_key, &config)?;
+        let nostr = NostrClient::new(pubkey, signing_key, &config)?;
+
+        if url_secret.is_some() {
+            info!("Private repo: using secret from URL fragment");
+        }
 
         Ok(Self {
             pubkey: pubkey.to_string(),
@@ -123,6 +136,7 @@ impl RemoteHelper {
             remote_refs: HashMap::new(),
             push_specs: Vec::new(),
             fetch_specs: Vec::new(),
+            url_secret,
         })
     }
 
@@ -306,8 +320,22 @@ impl RemoteHelper {
 
     /// Fetch all git objects from hashtree's .git/objects/ directory
     fn fetch_all_git_objects(&self, root_hash: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let encryption_key = self.nostr.get_cached_encryption_key(&self.repo_name).cloned();
-        info!("fetch_all_git_objects: root={}, has encryption_key: {}", &root_hash[..12], encryption_key.is_some());
+        let masked_key = self.nostr.get_cached_encryption_key(&self.repo_name).cloned();
+
+        // For private repos: XOR the masked key with url_secret to get the real CHK key
+        // For public repos: use the key directly (no masking)
+        let encryption_key = if let (Some(masked), Some(secret)) = (masked_key, self.url_secret) {
+            let mut unmasked = [0u8; 32];
+            for i in 0..32 {
+                unmasked[i] = masked[i] ^ secret[i];
+            }
+            Some(unmasked)
+        } else {
+            masked_key
+        };
+
+        info!("fetch_all_git_objects: root={}, has encryption_key: {}, private: {}",
+              &root_hash[..12], encryption_key.is_some(), self.url_secret.is_some());
 
         // Create tokio runtime for async blossom downloads
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -822,17 +850,32 @@ impl RemoteHelper {
         let _ = std::io::stderr().flush();
         let root_cid = self.storage.build_tree()?;
         let root_hash_hex = hex::encode(root_cid.hash);
-        let encryption_key = root_cid.key;
-        eprintln!(" done (encrypted: {})", encryption_key.is_some());
+        let chk_key = root_cid.key;
+        let is_private = self.url_secret.is_some();
+        eprintln!(" done (encrypted: {}, private: {})", chk_key.is_some(), is_private);
+
+        // For private repos: XOR the CHK key with url_secret so only URL holders can decrypt
+        // For public repos: publish the CHK key directly
+        let key_to_publish = if let (Some(chk), Some(secret)) = (chk_key, self.url_secret) {
+            // XOR the keys - to decrypt, recipient XORs with their copy of secret
+            let mut masked = [0u8; 32];
+            for i in 0..32 {
+                masked[i] = chk[i] ^ secret[i];
+            }
+            Some(masked)
+        } else {
+            chk_key
+        };
 
         // Push to file servers (blossom) first
         // This makes content available before we advertise the hash
         let blossom_count = self.push_to_file_servers(&root_hash_hex);
 
         // Then publish to nostr (kind 30078 with hashtree label)
-        // Include encryption key if present
+        // Include masked key (encryptedKey tag) for private or raw CHK key (key tag) for public repos
         // Don't fail push if relay publish fails - it's just distribution
-        let (npub_url, relay_count) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex, encryption_key.as_ref()) {
+        let key_with_privacy = key_to_publish.as_ref().map(|k| (k, is_private));
+        let (npub_url, relay_count) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex, key_with_privacy) {
             Ok((url, count)) => (url, count),
             Err(e) => {
                 warn!("Failed to publish to relays: {}", e);
@@ -842,13 +885,29 @@ impl RemoteHelper {
             }
         };
 
+        // Build full URL with secret fragment if private
+        let full_url = if let Some(secret) = self.url_secret {
+            format!("{}#k={}", npub_url, hex::encode(secret))
+        } else {
+            npub_url.clone()
+        };
+
         // Print summary
         eprintln!("Published to: {} ({} relays, {} blossom servers)",
-            npub_url, relay_count, blossom_count);
+            full_url, relay_count, blossom_count);
 
         // Print web viewer URL
         if let Some(path) = npub_url.strip_prefix("htree://") {
-            eprintln!("View at: https://files.iris.to/#/{}", path);
+            let viewer_url = if let Some(secret) = self.url_secret {
+                format!("https://files.iris.to/#/{}?k={}", path, hex::encode(secret))
+            } else {
+                format!("https://files.iris.to/#/{}", path)
+            };
+            eprintln!("View at: {}", viewer_url);
+        }
+
+        if is_private {
+            eprintln!("Note: This is a private repo. Share the full URL with #k= to grant access.");
         }
 
         Ok(())
@@ -1179,7 +1238,7 @@ mod tests {
 
     fn create_test_helper() -> Option<RemoteHelper> {
         let config = Config::default();
-        RemoteHelper::new(TEST_PUBKEY, "test-repo", None, config).ok()
+        RemoteHelper::new(TEST_PUBKEY, "test-repo", None, None, config).ok()
     }
 
     #[test]

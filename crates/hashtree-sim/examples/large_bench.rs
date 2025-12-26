@@ -1,6 +1,7 @@
 //! Large scale benchmark: flooding vs adaptive routing
 
 use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
+use hashtree_webrtc::types::PoolConfig;
 use std::time::Duration;
 
 #[tokio::main]
@@ -15,7 +16,7 @@ async fn main() {
             node_count,
             duration: Duration::from_secs(10),
             seed: 42,
-            max_peers: 6,
+            pool: PoolConfig { max_connections: 6, satisfied_connections: 3 },
             discovery_interval_ms: 100,
             churn_rate: 0.0,
             allow_rejoin: false,

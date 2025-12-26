@@ -7,7 +7,12 @@
 //! - Duration of simulation
 
 use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
+use hashtree_webrtc::types::PoolConfig;
 use std::time::Duration;
+
+fn pool(max: usize) -> PoolConfig {
+    PoolConfig { max_connections: max, satisfied_connections: max / 2 }
+}
 
 #[tokio::main]
 async fn main() {
@@ -27,7 +32,7 @@ async fn main() {
             node_count: 100,
             duration: Duration::from_secs(8),
             seed: 42,
-            max_peers,
+            pool: pool(max_peers),
             discovery_interval_ms: 100,
             churn_rate: 0.0,
             allow_rejoin: false,
@@ -65,7 +70,7 @@ async fn main() {
             node_count: 100,
             duration: Duration::from_secs(10),
             seed: 42,
-            max_peers: 6,
+            pool: pool(6),
             discovery_interval_ms: interval_ms,
             churn_rate: 0.0,
             allow_rejoin: false,
@@ -103,7 +108,7 @@ async fn main() {
             node_count,
             duration: Duration::from_secs(duration_secs),
             seed: 42,
-            max_peers: 6,
+            pool: pool(6),
             discovery_interval_ms: 100,
             churn_rate: 0.0,
             allow_rejoin: false,
@@ -144,7 +149,7 @@ async fn main() {
             node_count: 500,
             duration: Duration::from_secs(20),
             seed: 42,
-            max_peers,
+            pool: pool(max_peers),
             discovery_interval_ms: 100,
             churn_rate: 0.0,
             allow_rejoin: false,
@@ -184,7 +189,7 @@ async fn main() {
         node_count: 500,
         duration: Duration::from_secs(20),
         seed: 42,
-        max_peers: best_max_peers,
+        pool: pool(best_max_peers),
         discovery_interval_ms: 100,
         churn_rate: 0.0,
         allow_rejoin: false,

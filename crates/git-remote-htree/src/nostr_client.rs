@@ -448,11 +448,15 @@ impl NostrClient {
             return Ok((HashMap::new(), None, None));
         }
 
-        // Get optional encryption key from "key" tag
+        // Get optional encryption key from "encryptedKey" (private/unlisted) or "key" (public) tag
+        // For private repos, the key is XOR masked and will be unmasked by helper using url_secret
         let encryption_key = event
             .tags
             .iter()
-            .find(|t| t.as_slice().len() >= 2 && t.as_slice()[0].as_str() == "key")
+            .find(|t| {
+                let slice = t.as_slice();
+                slice.len() >= 2 && (slice[0].as_str() == "encryptedKey" || slice[0].as_str() == "key")
+            })
             .and_then(|t| {
                 let key_hex = t.as_slice()[1].to_string();
                 hex::decode(&key_hex).ok().and_then(|bytes| {
@@ -717,10 +721,11 @@ impl NostrClient {
     /// Publish repository to nostr as kind 30078 event
     /// Format:
     ///   kind: 30078
-    ///   tags: [["d", repo_name], ["l", "hashtree"], ["hash", root_hash], ["key", encryption_key]]
+    ///   tags: [["d", repo_name], ["l", "hashtree"], ["hash", root_hash], ["key"|"encryptedKey", encryption_key]]
     ///   content: <merkle-root-hash>
     /// Returns: (npub URL, number of relays successfully published to)
-    pub fn publish_repo(&self, repo_name: &str, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> Result<(String, usize)> {
+    /// If is_private is true, uses "encryptedKey" tag (XOR masked); otherwise uses "key" tag (plaintext CHK)
+    pub fn publish_repo(&self, repo_name: &str, root_hash: &str, encryption_key: Option<(&[u8; 32], bool)>) -> Result<(String, usize)> {
         let keys = self.keys.as_ref().context(format!(
             "Cannot push: no secret key for {}. You can only push to your own repos.",
             &self.pubkey[..16]
@@ -743,7 +748,7 @@ impl NostrClient {
         keys: &Keys,
         repo_name: &str,
         root_hash: &str,
-        encryption_key: Option<&[u8; 32]>,
+        encryption_key: Option<(&[u8; 32], bool)>,
     ) -> Result<(String, usize)> {
         // Create nostr-sdk client with our keys
         let client = Client::new(keys.clone());
@@ -766,8 +771,10 @@ impl NostrClient {
         ];
 
         // Add encryption key if present (required for decryption)
-        if let Some(key) = encryption_key {
-            tags.push(Tag::custom(TagKind::custom("key"), vec![hex::encode(key)]));
+        // Use "encryptedKey" for private/unlisted repos (XOR masked), "key" for public
+        if let Some((key, is_private)) = encryption_key {
+            let tag_name = if is_private { "encryptedKey" } else { "key" };
+            tags.push(Tag::custom(TagKind::custom(tag_name), vec![hex::encode(key)]));
         }
 
         // Add directory prefix labels for discoverability

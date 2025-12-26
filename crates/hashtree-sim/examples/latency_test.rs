@@ -1,6 +1,7 @@
 //! Test with simulated network latency
 
 use hashtree_sim::{RoutingStrategy, SimConfig, Simulation};
+use hashtree_webrtc::types::PoolConfig;
 use std::time::Duration;
 
 #[tokio::main]
@@ -11,7 +12,7 @@ async fn main() {
         node_count: 10,
         duration: Duration::from_secs(3),
         seed: 42,
-        max_peers: 4,
+        pool: PoolConfig { max_connections: 4, satisfied_connections: 2 },
         discovery_interval_ms: 100,
         churn_rate: 0.0,
         allow_rejoin: false,

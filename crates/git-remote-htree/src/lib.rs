@@ -66,12 +66,19 @@ fn run() -> Result<()> {
 
     info!("Remote: {}, URL: {}", remote_name, url);
 
-    // Parse URL: htree://<identifier>/<repo-name>
-    let (identifier, repo_name) = parse_htree_url(url)?;
+    // Parse URL: htree://<identifier>/<repo-name>#k=<secret>
+    let parsed = parse_htree_url(url)?;
+    let identifier = parsed.identifier;
+    let repo_name = parsed.repo_name;
+    let url_secret = parsed.secret_key; // Encryption secret from URL fragment
+
+    if url_secret.is_some() {
+        info!("Private repo mode: using secret key from URL");
+    }
 
     // Resolve identifier to pubkey
     // If "self" is used and no keys exist, auto-generate
-    let (pubkey, secret_key) = match resolve_identity(&identifier) {
+    let (pubkey, signing_key) = match resolve_identity(&identifier) {
         Ok(result) => result,
         Err(e) => {
             // If resolution failed and user intended "self", suggest using htree://self/repo
@@ -81,7 +88,7 @@ fn run() -> Result<()> {
         }
     };
 
-    if secret_key.is_some() {
+    if signing_key.is_some() {
         debug!("Found signing key for {}", identifier);
     } else {
         debug!("No signing key for {} (read-only)", identifier);
@@ -105,7 +112,7 @@ fn run() -> Result<()> {
            config.blossom.write_servers.len());
 
     // Create helper and run protocol
-    let mut helper = RemoteHelper::new(&pubkey, &repo_name, secret_key, config)?;
+    let mut helper = RemoteHelper::new(&pubkey, &repo_name, signing_key, url_secret, config)?;
 
     // Read commands from stdin, write responses to stdout
     let stdin = std::io::stdin();
@@ -159,19 +166,47 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Parse htree:// URL into (identifier, repo_name)
-fn parse_htree_url(url: &str) -> Result<(String, String)> {
+/// Parsed htree URL components
+pub struct ParsedUrl {
+    pub identifier: String,
+    pub repo_name: String,
+    /// Secret key from #k=<hex> fragment (for private repos)
+    pub secret_key: Option<[u8; 32]>,
+}
+
+/// Parse htree:// URL into components
+/// Supports: htree://identifier/repo#k=<hex> for private repos
+fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
     let url = url
         .strip_prefix("htree://")
         .context("URL must start with htree://")?;
 
+    // Split off fragment (#k=secret) if present
+    let (url_path, secret_key) = if let Some((path, fragment)) = url.split_once('#') {
+        let key = if let Some(key_hex) = fragment.strip_prefix("k=") {
+            let bytes = hex::decode(key_hex)
+                .context("Invalid secret key hex in URL fragment")?;
+            if bytes.len() != 32 {
+                bail!("Secret key must be 32 bytes (64 hex chars)");
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            Some(key)
+        } else {
+            None
+        };
+        (path, key)
+    } else {
+        (url, None)
+    };
+
     // Split on first /
-    let (identifier, repo) = url
+    let (identifier, repo) = url_path
         .split_once('/')
         .context("URL must be htree://<identifier>/<repo>")?;
 
-    // Handle repo paths like "repo/subpath" - just take the first component as repo name
-    let repo_name = repo.split('/').next().unwrap_or(repo);
+    // Handle repo paths like "repo/subpath" - keep full path as repo name
+    let repo_name = repo.to_string();
 
     if identifier.is_empty() {
         bail!("Identifier cannot be empty");
@@ -180,7 +215,18 @@ fn parse_htree_url(url: &str) -> Result<(String, String)> {
         bail!("Repository name cannot be empty");
     }
 
-    Ok((identifier.to_string(), repo_name.to_string()))
+    Ok(ParsedUrl {
+        identifier: identifier.to_string(),
+        repo_name,
+        secret_key,
+    })
+}
+
+/// Generate a new random secret key for private repos
+pub fn generate_secret_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).expect("Failed to generate random bytes");
+    key
 }
 
 #[cfg(test)]
@@ -189,45 +235,76 @@ mod tests {
 
     #[test]
     fn test_parse_htree_url_pubkey() {
-        let (id, repo) = parse_htree_url(
+        let parsed = parse_htree_url(
             "htree://a9a91ed5f1c405618f63fdd393f9055ab8bac281102cff6b1ac3c74094562dd8/myrepo",
         )
         .unwrap();
         assert_eq!(
-            id,
+            parsed.identifier,
             "a9a91ed5f1c405618f63fdd393f9055ab8bac281102cff6b1ac3c74094562dd8"
         );
-        assert_eq!(repo, "myrepo");
+        assert_eq!(parsed.repo_name, "myrepo");
+        assert!(parsed.secret_key.is_none());
     }
 
     #[test]
     fn test_parse_htree_url_npub() {
-        let (id, repo) =
+        let parsed =
             parse_htree_url("htree://npub1qvmu0aru530g6yu3kmlhw33fh68r75wf3wuml3vk4ekg0p4m4t6s7fuhxx/test")
                 .unwrap();
-        assert!(id.starts_with("npub1"));
-        assert_eq!(repo, "test");
+        assert!(parsed.identifier.starts_with("npub1"));
+        assert_eq!(parsed.repo_name, "test");
+        assert!(parsed.secret_key.is_none());
     }
 
     #[test]
     fn test_parse_htree_url_petname() {
-        let (id, repo) = parse_htree_url("htree://alice/project").unwrap();
-        assert_eq!(id, "alice");
-        assert_eq!(repo, "project");
+        let parsed = parse_htree_url("htree://alice/project").unwrap();
+        assert_eq!(parsed.identifier, "alice");
+        assert_eq!(parsed.repo_name, "project");
+        assert!(parsed.secret_key.is_none());
     }
 
     #[test]
     fn test_parse_htree_url_self() {
-        let (id, repo) = parse_htree_url("htree://self/myrepo").unwrap();
-        assert_eq!(id, "self");
-        assert_eq!(repo, "myrepo");
+        let parsed = parse_htree_url("htree://self/myrepo").unwrap();
+        assert_eq!(parsed.identifier, "self");
+        assert_eq!(parsed.repo_name, "myrepo");
+        assert!(parsed.secret_key.is_none());
     }
 
     #[test]
     fn test_parse_htree_url_with_subpath() {
-        let (id, repo) = parse_htree_url("htree://test/repo/some/path").unwrap();
-        assert_eq!(id, "test");
-        assert_eq!(repo, "repo");
+        let parsed = parse_htree_url("htree://test/repo/some/path").unwrap();
+        assert_eq!(parsed.identifier, "test");
+        assert_eq!(parsed.repo_name, "repo/some/path");
+        assert!(parsed.secret_key.is_none());
+    }
+
+    #[test]
+    fn test_parse_htree_url_with_secret() {
+        let secret_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let url = format!("htree://test/repo#k={}", secret_hex);
+        let parsed = parse_htree_url(&url).unwrap();
+        assert_eq!(parsed.identifier, "test");
+        assert_eq!(parsed.repo_name, "repo");
+        assert!(parsed.secret_key.is_some());
+        let key = parsed.secret_key.unwrap();
+        assert_eq!(hex::encode(key), secret_hex);
+    }
+
+    #[test]
+    fn test_parse_htree_url_invalid_secret_length() {
+        // Secret too short
+        let url = "htree://test/repo#k=0123456789abcdef";
+        assert!(parse_htree_url(url).is_err());
+    }
+
+    #[test]
+    fn test_parse_htree_url_invalid_secret_hex() {
+        // Invalid hex characters
+        let url = "htree://test/repo#k=ghij456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(parse_htree_url(url).is_err());
     }
 
     #[test]
