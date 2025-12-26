@@ -1034,10 +1034,29 @@ impl RemoteHelper {
 
             let has_old_tree = !old_hashes.is_empty();
 
-            // Channel for blobs to upload (bounded to limit memory)
+            // Check which servers need full upload (don't have old tree)
+            let all_servers: Vec<String> = blossom.write_servers().to_vec();
+            let servers_needing_full: Arc<Vec<String>> = if has_old_tree && all_servers.len() > 1 {
+                let sample_hashes: Vec<String> = old_hashes.iter().take(5).map(|h| hex::encode(h)).collect();
+                let sample_refs: Vec<&str> = sample_hashes.iter().map(|s| s.as_str()).collect();
+                let mut needs_full = Vec::new();
+                for server in &all_servers {
+                    if !blossom.server_has_tree_samples(server, &sample_refs, 5).await {
+                        needs_full.push(server.clone());
+                    }
+                }
+                if !needs_full.is_empty() {
+                    eprintln!("  {} of {} servers need full upload", needs_full.len(), all_servers.len());
+                }
+                Arc::new(needs_full)
+            } else {
+                Arc::new(Vec::new())
+            };
+
+            // Channel sends (data, is_from_old_tree) so worker knows which servers to target
             const CHANNEL_SIZE: usize = 100;
             const UPLOAD_CONCURRENCY: usize = 10;
-            let (tx, rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+            let (tx, rx) = mpsc::channel::<(Vec<u8>, bool)>(CHANNEL_SIZE);
 
             // Spawn upload workers
             let upload_handle = {
@@ -1048,6 +1067,7 @@ impl RemoteHelper {
                 let processed = Arc::clone(&processed);
                 let skipped_diff = Arc::clone(&skipped_diff);
                 let has_old_tree = has_old_tree;
+                let servers_needing_full = Arc::clone(&servers_needing_full);
 
                 tokio::spawn(async move {
                     use futures::stream::StreamExt;
@@ -1055,15 +1075,22 @@ impl RemoteHelper {
 
                     let stream = ReceiverStream::new(rx);
                     stream
-                        .map(|data| {
+                        .map(|(data, from_old_tree)| {
                             let blossom = &blossom;
                             let uploaded = Arc::clone(&uploaded);
                             let skipped_server = Arc::clone(&skipped_server);
                             let failed = Arc::clone(&failed);
                             let processed = Arc::clone(&processed);
                             let skipped_diff = Arc::clone(&skipped_diff);
+                            let servers_needing_full = Arc::clone(&servers_needing_full);
                             async move {
-                                match blossom.upload_if_missing(&data).await {
+                                // If from old tree and some servers need full upload, only upload to those
+                                let result = if from_old_tree && !servers_needing_full.is_empty() {
+                                    blossom.upload_to_all_servers(&data).await.map(|(h, c)| (h, c > 0))
+                                } else {
+                                    blossom.upload_if_missing(&data).await
+                                };
+                                match result {
                                     Ok((_, true)) => { uploaded.fetch_add(1, Ordering::Relaxed); }
                                     Ok((_, false)) => { skipped_server.fetch_add(1, Ordering::Relaxed); }
                                     Err(e) => {
@@ -1111,9 +1138,11 @@ impl RemoteHelper {
                 }
                 visited.insert(hash);
 
-                // KEY OPTIMIZATION: Skip if this hash exists in old tree
-                // The entire subtree is identical, so no need to upload or traverse
-                if old_hashes.contains(&hash) {
+                // Check if this hash exists in old tree
+                let from_old_tree = old_hashes.contains(&hash);
+
+                // If from old tree and no servers need full upload, skip entirely
+                if from_old_tree && servers_needing_full.is_empty() {
                     skipped_diff.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -1153,7 +1182,7 @@ impl RemoteHelper {
                 }
 
                 // Send encrypted blob to upload channel (blossom stores ciphertext)
-                if tx.send(data).await.is_err() {
+                if tx.send((data, from_old_tree)).await.is_err() {
                     break; // Channel closed
                 }
                 queued_count += 1;
