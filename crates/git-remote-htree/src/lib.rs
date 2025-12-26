@@ -20,7 +20,20 @@
 //! - **Private**: CHK + NIP-44 to self, `["selfEncryptedKey", "..."]` - author only
 //!
 //! Default is **Public** (CHK encrypted, key in nostr event).
-//! Use `htree://npub/repo#k=<secret>` for link-visible repos.
+//!
+//! ## Creating Link-Visible Repos
+//!
+//! To create a link-visible repo, use `#link-visible` to auto-generate a key:
+//! ```bash
+//! git remote add origin htree://self/repo#link-visible
+//! git push origin main
+//! # After push, you'll see instructions to update the remote URL with the generated key
+//! ```
+//!
+//! Or specify an explicit key with `#k=<secret>`:
+//! ```bash
+//! git remote add origin htree://npub/repo#k=<64-hex-chars>
+//! ```
 
 use anyhow::{bail, Context, Result};
 use nostr_sdk::ToBech32;
@@ -84,8 +97,52 @@ fn run() -> Result<()> {
     let parsed = parse_htree_url(url)?;
     let identifier = parsed.identifier;
     let repo_name = parsed.repo_name;
-    let url_secret = parsed.secret_key; // Encryption secret from URL fragment (link-visible)
     let is_private = parsed.is_private; // Self-only visibility
+
+    // Handle link-visible mode: either explicit key from URL or fail with setup instructions
+    let url_secret = if let Some(key) = parsed.secret_key {
+        // Explicit key from #k=<hex>
+        Some(key)
+    } else if parsed.auto_generate_secret {
+        // #link-visible - generate key and fail with setup instructions
+        let key = generate_secret_key();
+        let secret_hex = hex::encode(key);
+
+        // We need npub for the shareable URL, resolve identity first
+        let npub = match resolve_identity(&identifier) {
+            Ok((pubkey, _)) => {
+                hex::decode(&pubkey)
+                    .ok()
+                    .filter(|b| b.len() == 32)
+                    .and_then(|pk_bytes| nostr_sdk::PublicKey::from_slice(&pk_bytes).ok())
+                    .and_then(|pk| pk.to_bech32().ok())
+                    .unwrap_or(pubkey)
+            }
+            Err(_) => identifier.clone(),
+        };
+
+        let local_url = format!("htree://{}/{}#k={}", identifier, repo_name, secret_hex);
+        let share_url = format!("htree://{}/{}#k={}", npub, repo_name, secret_hex);
+
+        eprintln!();
+        eprintln!("=== Link-Visible Repository Setup ===");
+        eprintln!();
+        eprintln!("A secret key has been generated for this link-visible repository.");
+        eprintln!();
+        eprintln!("Step 1: Update your remote URL with the generated key:");
+        eprintln!("  git remote set-url {} {}", remote_name, local_url);
+        eprintln!();
+        eprintln!("Step 2: Push again (same command you just ran)");
+        eprintln!();
+        eprintln!("Shareable URL (for others to clone):");
+        eprintln!("  {}", share_url);
+        eprintln!();
+
+        // Exit without error code so git doesn't show confusing messages
+        std::process::exit(0);
+    } else {
+        None
+    };
 
     if is_private {
         info!("Private repo mode: only author can decrypt");
@@ -111,16 +168,15 @@ fn run() -> Result<()> {
         debug!("No signing key for {} (read-only)", identifier);
     }
 
-    // Print npub for reference
-    if let Ok(pk_bytes) = hex::decode(&pubkey) {
-        if pk_bytes.len() == 32 {
-            if let Ok(pk) = nostr_sdk::PublicKey::from_slice(&pk_bytes) {
-                if let Ok(npub) = pk.to_bech32() {
-                    info!("Using identity: {}", npub);
-                }
-            }
-        }
-    }
+    // Convert pubkey to npub for display and shareable URLs
+    let npub = hex::decode(&pubkey)
+        .ok()
+        .filter(|b| b.len() == 32)
+        .and_then(|pk_bytes| nostr_sdk::PublicKey::from_slice(&pk_bytes).ok())
+        .and_then(|pk| pk.to_bech32().ok())
+        .unwrap_or_else(|| pubkey.clone());
+
+    info!("Using identity: {}", npub);
 
     // Load config
     let config = Config::load_or_default();
@@ -193,25 +249,31 @@ pub struct ParsedUrl {
     pub secret_key: Option<[u8; 32]>,
     /// Whether this is a private (self-only) repo from #private fragment
     pub is_private: bool,
+    /// Whether to auto-generate a secret key (from #link-visible fragment)
+    pub auto_generate_secret: bool,
 }
 
 /// Parse htree:// URL into components
 /// Supports:
 /// - htree://identifier/repo - public repo
-/// - htree://identifier/repo#k=<hex> - link-visible repo
+/// - htree://identifier/repo#k=<hex> - link-visible repo with explicit key
+/// - htree://identifier/repo#link-visible - link-visible repo (auto-generate key)
 /// - htree://identifier/repo#private - private (self-only) repo
 fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
     let url = url
         .strip_prefix("htree://")
         .context("URL must start with htree://")?;
 
-    // Split off fragment (#k=secret or #private) if present
-    let (url_path, secret_key, is_private) = if let Some((path, fragment)) = url.split_once('#') {
+    // Split off fragment (#k=secret, #link-visible, or #private) if present
+    let (url_path, secret_key, is_private, auto_generate_secret) = if let Some((path, fragment)) = url.split_once('#') {
         if fragment == "private" {
             // #private - self-only visibility
-            (path, None, true)
+            (path, None, true, false)
+        } else if fragment == "link-visible" {
+            // #link-visible - auto-generate key on push
+            (path, None, false, true)
         } else if let Some(key_hex) = fragment.strip_prefix("k=") {
-            // #k=<hex> - link-visible
+            // #k=<hex> - link-visible with explicit key
             let bytes = hex::decode(key_hex)
                 .context("Invalid secret key hex in URL fragment")?;
             if bytes.len() != 32 {
@@ -219,13 +281,13 @@ fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
-            (path, Some(key), false)
+            (path, Some(key), false, false)
         } else {
             // Unknown fragment - ignore
-            (path, None, false)
+            (path, None, false, false)
         }
     } else {
-        (url, None, false)
+        (url, None, false, false)
     };
 
     // Split on first /
@@ -248,6 +310,7 @@ fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
         repo_name,
         secret_key,
         is_private,
+        auto_generate_secret,
     })
 }
 
@@ -383,5 +446,35 @@ mod tests {
         let parsed = parse_htree_url("htree://test/repo").unwrap();
         assert!(!parsed.is_private);
         assert!(parsed.secret_key.is_none());
+        assert!(!parsed.auto_generate_secret);
+    }
+
+    #[test]
+    fn test_parse_htree_url_link_visible_auto() {
+        // #link-visible = auto-generate key
+        let parsed = parse_htree_url("htree://self/myrepo#link-visible").unwrap();
+        assert_eq!(parsed.identifier, "self");
+        assert_eq!(parsed.repo_name, "myrepo");
+        assert!(!parsed.is_private);
+        assert!(parsed.secret_key.is_none()); // Key will be generated at runtime
+        assert!(parsed.auto_generate_secret);
+    }
+
+    #[test]
+    fn test_parse_htree_url_link_visible_explicit_key() {
+        // #k=<hex> = explicit key, not auto-generate
+        let secret_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let url = format!("htree://test/repo#k={}", secret_hex);
+        let parsed = parse_htree_url(&url).unwrap();
+        assert!(parsed.secret_key.is_some());
+        assert!(!parsed.auto_generate_secret); // Not auto-generated
+    }
+
+    #[test]
+    fn test_parse_htree_url_private_not_auto_generate() {
+        // #private is not auto_generate_secret
+        let parsed = parse_htree_url("htree://self/myrepo#private").unwrap();
+        assert!(parsed.is_private);
+        assert!(!parsed.auto_generate_secret);
     }
 }
