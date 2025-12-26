@@ -316,23 +316,36 @@ impl RemoteHelper {
         if let Some(ref root) = root_hash {
             // Fetch all git objects from the hashtree structure
             let objects = self.fetch_all_git_objects(root)?;
-            info!("Downloaded {} git objects from hashtree", objects.len());
+            info!("Loaded {} git objects from hashtree", objects.len());
 
-            // Store in local git with progress
-            let store_start = std::time::Instant::now();
-            let total = objects.len();
-            for (i, (oid, data)) in objects.into_iter().enumerate() {
-                self.write_git_object(&oid, &data)?;
-                let count = i + 1;
-                // Update every 50 items or show elapsed time every second
-                if count % 50 == 0 || count == total || count == 1 {
-                    let elapsed = store_start.elapsed().as_secs();
-                    eprint!("\r  Storing: {}/{} ({}s)    ", count, total, elapsed);
-                    let _ = std::io::stderr().flush();
+            // Batch check which objects git already has
+            let existing = self.git_batch_check_objects(objects.iter().map(|(oid, _)| oid.as_str()))?;
+
+            // Filter to only objects git doesn't have
+            let to_write: Vec<_> = objects.into_iter()
+                .filter(|(oid, _)| !existing.contains(oid))
+                .collect();
+
+            let total = to_write.len();
+            let skipped = existing.len();
+
+            if total == 0 {
+                eprintln!("  Writing to .git: 0 new, {} cached    ", skipped);
+            } else {
+                for (i, (oid, data)) in to_write.into_iter().enumerate() {
+                    self.write_git_object(&oid, &data)?;
+                    let count = i + 1;
+                    if count % 50 == 0 || count == total || count == 1 {
+                        eprint!("\r  Writing to .git: {}/{}    ", count, total);
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+                if skipped > 0 {
+                    eprintln!("\r  Writing to .git: {} new, {} cached    ", total, skipped);
+                } else {
+                    eprintln!("\r  Writing to .git: {}/{}    ", total, total);
                 }
             }
-            let store_elapsed = store_start.elapsed();
-            eprintln!("\r  Storing: {}/{} ({:.1?})    ", total, total, store_elapsed);
         } else {
             bail!("No root hash found for repository - cannot fetch");
         }
@@ -540,7 +553,7 @@ impl RemoteHelper {
                 }
                 let count = downloaded_clone.load(Ordering::Relaxed);
                 let elapsed = download_start_clone.elapsed().as_secs();
-                eprint!("\r  Downloading: {}/{} ({}s)    ", count, total_for_timer, elapsed);
+                eprint!("\r  Loading: {}/{}    ", count, total_for_timer);
                 let _ = std::io::stderr().flush();
             }
         });
@@ -581,7 +594,7 @@ impl RemoteHelper {
         }
 
         let success_count = objects.len();
-        eprintln!("\r  Downloading: {}/{}    ", success_count, total_objects);
+        eprintln!("\r  Loading: {}/{}    ", success_count, total_objects);
 
         // Retry failed downloads sequentially
         let mut missing_objects: Vec<(String, String)> = Vec::new(); // (oid, hash)
@@ -624,6 +637,42 @@ impl RemoteHelper {
 
         info!("Fetched {} git objects from hashtree", objects.len());
         Ok(objects)
+    }
+
+    /// Batch check which objects git already has (returns set of existing oids)
+    fn git_batch_check_objects<'a>(&self, oids: impl Iterator<Item = &'a str>) -> Result<HashSet<String>> {
+        let mut existing = HashSet::new();
+        let oids: Vec<_> = oids.collect();
+
+        // Process in chunks to avoid memory issues with huge repos
+        const BATCH_SIZE: usize = 1000;
+        for chunk in oids.chunks(BATCH_SIZE) {
+            let mut child = Command::new("git")
+                .args(["cat-file", "--batch-check=%(objectname)"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("Failed to spawn git cat-file")?;
+
+            {
+                let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
+                for oid in chunk {
+                    writeln!(stdin, "{}", oid)?;
+                }
+            }
+
+            let output = child.wait_with_output().context("Failed to read git cat-file output")?;
+
+            // Parse output - valid objects return just the oid, missing ones return "oid missing"
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let line = line.trim();
+                if line.len() == 40 && !line.contains(' ') {
+                    existing.insert(line.to_string());
+                }
+            }
+        }
+        Ok(existing)
     }
 
     /// Write loose object to local git object store
