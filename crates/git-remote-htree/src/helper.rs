@@ -1046,7 +1046,10 @@ impl RemoteHelper {
                     }
                 }
                 if !needs_full.is_empty() {
-                    eprintln!("  {} of {} servers need full upload", needs_full.len(), all_servers.len());
+                    let server_names: Vec<_> = needs_full.iter()
+                        .map(|s| s.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or(s))
+                        .collect();
+                    eprintln!("  Full upload needed: {} (missing old tree)", server_names.join(", "));
                 }
                 Arc::new(needs_full)
             } else {
