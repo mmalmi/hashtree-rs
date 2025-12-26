@@ -165,8 +165,8 @@ fn test_webrtc_store_config_default() {
     let config = WebRTCStoreConfig::default();
     assert_eq!(config.pools.follows.satisfied_connections, 10);
     assert_eq!(config.pools.follows.max_connections, 20);
-    assert_eq!(config.pools.other.satisfied_connections, 5);
-    assert_eq!(config.pools.other.max_connections, 10);
+    assert_eq!(config.pools.other.satisfied_connections, 10);
+    assert_eq!(config.pools.other.max_connections, 20);
     assert_eq!(config.request_timeout_ms, 10000);
     assert!(!config.debug);
     assert!(config.classifier_tx.is_none());

@@ -133,6 +133,7 @@ fn find_htree_binary() -> PathBuf {
 }
 
 #[test]
+#[ignore = "long-running network test (120s) - run manually with --ignored"]
 fn test_crosslang_peer() {
     let htree_bin = find_htree_binary();
     let htree_bin_str = htree_bin.to_str().unwrap();

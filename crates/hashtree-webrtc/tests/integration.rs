@@ -67,6 +67,7 @@ async fn test_connect_to_local_relay() {
 
 /// Test that two stores can discover each other via signaling.
 #[tokio::test]
+#[ignore = "requires ICE/STUN connectivity - run manually with --ignored"]
 async fn test_peer_discovery() {
     // Start local relay
     let mut relay = WsRelay::new();
@@ -176,6 +177,7 @@ async fn test_peer_discovery() {
 /// Topology: A <-> B <-> C (A and C are not directly connected)
 /// A has data, C requests it, B forwards the request to A
 #[tokio::test]
+#[ignore = "requires ICE/STUN connectivity - run manually with --ignored"]
 async fn test_three_node_forwarding() {
     use hashtree_core::{sha256, Store};
 
@@ -323,6 +325,7 @@ async fn test_three_node_forwarding() {
 
 /// Test that data can be transferred between peers via WebRTC.
 #[tokio::test]
+#[ignore = "requires ICE/STUN connectivity - run manually with --ignored"]
 async fn test_data_transfer_between_peers() {
     use hashtree_core::{sha256, Store};
 
