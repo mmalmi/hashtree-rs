@@ -758,7 +758,13 @@ impl NostrClient {
             .build()
             .context("Failed to create tokio runtime")?;
 
-        rt.block_on(self.publish_repo_async(keys, repo_name, root_hash, encryption_key))
+        let result = rt.block_on(self.publish_repo_async(keys, repo_name, root_hash, encryption_key));
+
+        // Give nostr-sdk background tasks time to clean up gracefully
+        // This prevents "runtime is shutting down" panics from timer tasks
+        rt.shutdown_timeout(std::time::Duration::from_millis(500));
+
+        result
     }
 
     async fn publish_repo_async(
@@ -843,8 +849,9 @@ impl NostrClient {
             .map(|npub| format!("htree://{}/{}", npub, repo_name))
             .unwrap_or_else(|_| format!("htree://{}/{}", &self.pubkey[..16], repo_name));
 
-        // Disconnect
+        // Disconnect and give time for cleanup
         let _ = client.disconnect().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         Ok((npub_url, relay_count))
     }

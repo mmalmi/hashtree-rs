@@ -370,7 +370,20 @@ For identical repos:
   No changes detected (same root hash)
 ```
 
+### Testing
+
+4. **`crates/git-remote-htree/tests/git_roundtrip.rs`**
+   - Added local in-memory nostr relay (`TestRelay`) for testing without network
+   - Added local blossom server (`TestServer`) using temp directories
+   - `test_git_push_and_clone_local` - full roundtrip with local servers
+   - `test_diff_based_push` - verifies diff optimization reduces uploads
+
+5. **`crates/git-remote-htree/src/nostr_client.rs`**
+   - Added `shutdown_timeout()` for graceful runtime cleanup
+   - Prevents "runtime shutting down" panics from nostr-sdk timers
+
 ### Not Implemented (Future Work)
 
 - **Server coverage detection**: Upload full tree to servers that don't have old root
 - **Bloom filter**: For very large trees (>100k nodes) to reduce memory
+- **Deterministic tree building**: Index file timestamps cause minor hash variations

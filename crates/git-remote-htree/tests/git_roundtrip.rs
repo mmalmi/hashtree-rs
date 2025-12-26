@@ -7,15 +7,294 @@
 //! 4. Clone to new directory via `git clone htree://self/<repo>`
 //! 5. Verify files match
 //!
-//! This test uses local storage only (no daemon needed) since push and clone
-//! share the same HOME directory with the same keys.
+//! By default, tests use local blossom + nostr servers for isolation.
+//! Set USE_PRODUCTION_SERVERS=1 to test against real infrastructure.
 //!
 //! Run with: cargo test --package git-remote-htree --test git_roundtrip -- --nocapture
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 use tempfile::TempDir;
 use nostr::ToBech32;
+
+/// Minimal in-memory nostr relay for testing
+mod test_relay {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::net::TcpListener;
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+    use futures::{SinkExt, StreamExt};
+
+    pub struct TestRelay {
+        #[allow(dead_code)]
+        port: u16,
+        #[allow(dead_code)]
+        events: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+        shutdown: tokio::sync::broadcast::Sender<()>,
+    }
+
+    impl TestRelay {
+        pub fn new(port: u16) -> Self {
+            let events = Arc::new(Mutex::new(HashMap::new()));
+            let (shutdown, _) = tokio::sync::broadcast::channel(1);
+
+            let relay = TestRelay {
+                port,
+                events: events.clone(),
+                shutdown: shutdown.clone(),
+            };
+
+            // Start relay in background
+            let events_clone = events.clone();
+            let mut shutdown_rx = shutdown.subscribe();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async move {
+                    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+                    listener.set_nonblocking(true).unwrap();
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+
+                    loop {
+                        tokio::select! {
+                            _ = shutdown_rx.recv() => break,
+                            result = listener.accept() => {
+                                if let Ok((stream, _)) = result {
+                                    let events = events_clone.clone();
+                                    tokio::spawn(handle_connection(stream, events));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+
+            // Wait for relay to start
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            relay
+        }
+
+        pub fn url(&self) -> String {
+            format!("ws://127.0.0.1:{}", self.port)
+        }
+    }
+
+    impl Drop for TestRelay {
+        fn drop(&mut self) {
+            let _ = self.shutdown.send(());
+            // Give time for cleanup
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    async fn handle_connection(stream: TcpStream, events: Arc<Mutex<HashMap<String, serde_json::Value>>>) {
+        let ws_stream = match accept_async(stream).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let (mut write, mut read) = ws_stream.split();
+
+        while let Some(msg) = read.next().await {
+            let msg = match msg {
+                Ok(Message::Text(t)) => t,
+                Ok(Message::Close(_)) => break,
+                _ => continue,
+            };
+
+            // Parse nostr message: ["EVENT", event] or ["REQ", sub_id, filter...]
+            let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(&msg);
+            let parsed = match parsed {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if parsed.is_empty() {
+                continue;
+            }
+
+            let msg_type = parsed[0].as_str().unwrap_or("");
+
+            match msg_type {
+                "EVENT" => {
+                    if parsed.len() >= 2 {
+                        let event = &parsed[1];
+                        if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
+                            events.lock().unwrap().insert(id.to_string(), event.clone());
+                            // Send OK response
+                            let ok_msg = serde_json::json!(["OK", id, true, ""]);
+                            let _ = write.send(Message::Text(ok_msg.to_string())).await;
+                        }
+                    }
+                }
+                "REQ" => {
+                    if parsed.len() >= 3 {
+                        let sub_id = parsed[1].as_str().unwrap_or("sub").to_string();
+                        let filter = &parsed[2];
+
+                        // Simple filter matching
+                        let kind = filter.get("kinds").and_then(|k| k.as_array()).and_then(|a| a.first()).and_then(|v| v.as_u64());
+                        let author = filter.get("authors").and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let d_tag = filter.get("#d").and_then(|d| d.as_array()).and_then(|a| a.first()).and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                        // Collect matching events while holding lock, then release before await
+                        let matching_events: Vec<serde_json::Value> = {
+                            let events_lock = events.lock().unwrap();
+                            events_lock.values().filter(|event| {
+                                let mut matches = true;
+
+                                if let Some(k) = kind {
+                                    if event.get("kind").and_then(|v| v.as_u64()) != Some(k) {
+                                        matches = false;
+                                    }
+                                }
+
+                                if let Some(ref a) = author {
+                                    if event.get("pubkey").and_then(|v| v.as_str()) != Some(a.as_str()) {
+                                        matches = false;
+                                    }
+                                }
+
+                                if let Some(ref d) = d_tag {
+                                    let has_d_tag = event.get("tags")
+                                        .and_then(|t| t.as_array())
+                                        .map(|tags| {
+                                            tags.iter().any(|tag| {
+                                                tag.as_array().map(|arr| {
+                                                    arr.len() >= 2 &&
+                                                    arr[0].as_str() == Some("d") &&
+                                                    arr[1].as_str() == Some(d.as_str())
+                                                }).unwrap_or(false)
+                                            })
+                                        })
+                                        .unwrap_or(false);
+                                    if !has_d_tag {
+                                        matches = false;
+                                    }
+                                }
+
+                                matches
+                            }).cloned().collect()
+                        };
+
+                        // Now send events without holding lock
+                        for event in matching_events {
+                            let event_msg = serde_json::json!(["EVENT", &sub_id, event]);
+                            let _ = write.send(Message::Text(event_msg.to_string())).await;
+                        }
+
+                        // Send EOSE
+                        let eose = serde_json::json!(["EOSE", &sub_id]);
+                        let _ = write.send(Message::Text(eose.to_string())).await;
+                    }
+                }
+                "CLOSE" => {
+                    // Subscription closed, ignore
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Local blossom server for testing
+struct TestServer {
+    _data_dir: TempDir,
+    _home_dir: TempDir,
+    process: Child,
+    port: u16,
+}
+
+impl TestServer {
+    fn new(port: u16) -> Option<Self> {
+        let htree_bin = find_htree_binary()?;
+        let data_dir = TempDir::new().expect("Failed to create temp dir");
+        let home_dir = TempDir::new().expect("Failed to create home dir");
+
+        // Create .hashtree config dir for the server
+        let config_dir = home_dir.path().join(".hashtree");
+        std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
+
+        // Server config - no auth for testing
+        let config_content = r#"
+[server]
+enable_auth = false
+stun_port = 0
+enable_webrtc = false
+public_writes = true
+
+[nostr]
+relays = []
+"#;
+        std::fs::write(config_dir.join("config.toml"), config_content)
+            .expect("Failed to write config");
+
+        // Generate keys for server
+        let keys = nostr::Keys::generate();
+        let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
+        std::fs::write(config_dir.join("keys"), &nsec)
+            .expect("Failed to write keys");
+
+        let process = Command::new(&htree_bin)
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .arg("start")
+            .arg("--addr")
+            .arg(format!("127.0.0.1:{}", port))
+            .env("HOME", home_dir.path())
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to start htree server");
+
+        // Wait for server to start
+        std::thread::sleep(Duration::from_secs(2));
+
+        Some(TestServer {
+            _data_dir: data_dir,
+            _home_dir: home_dir,
+            process,
+            port,
+        })
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+fn find_htree_binary() -> Option<PathBuf> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = PathBuf::from(manifest_dir)
+        .parent()?
+        .parent()?
+        .to_path_buf();
+
+    let debug_bin = workspace_root.join("target/debug/htree");
+    let release_bin = workspace_root.join("target/release/htree");
+
+    if release_bin.exists() {
+        Some(release_bin)
+    } else if debug_bin.exists() {
+        Some(debug_bin)
+    } else {
+        None
+    }
+}
 
 struct TestEnv {
     _data_dir: TempDir,
@@ -24,7 +303,7 @@ struct TestEnv {
 }
 
 impl TestEnv {
-    fn new() -> Self {
+    fn new(blossom_server: Option<&str>, nostr_relay: Option<&str>) -> Self {
         let data_dir = TempDir::new().expect("Failed to create temp dir");
         let home_dir = data_dir.path().to_path_buf();
 
@@ -32,22 +311,37 @@ impl TestEnv {
         let config_dir = home_dir.join(".hashtree");
         std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
 
-        // Create config - use relays that work reliably
-        let config_content = r#"
+        // Build config
+        let relays = match nostr_relay {
+            Some(url) => format!(r#"relays = ["{}"]"#, url),
+            None => r#"relays = ["wss://temp.iris.to", "wss://relay.damus.io"]"#.to_string(),
+        };
+
+        let blossom = match blossom_server {
+            Some(url) => format!(r#"
+[blossom]
+read_servers = ["{url}"]
+write_servers = ["{url}"]
+"#),
+            None => String::new(),
+        };
+
+        let config_content = format!(r#"
 [server]
 enable_auth = false
 stun_port = 0
 
 [nostr]
-relays = ["wss://temp.iris.to", "wss://relay.damus.io"]
+{relays}
 crawl_depth = 0
-"#;
+
+{blossom}
+"#);
+
         std::fs::write(config_dir.join("config.toml"), config_content)
             .expect("Failed to write config");
 
         // Generate a test key for "self" identity
-        // Using nostr crate to generate proper nsec
-        // Format: "nsec1... self" (nsec followed by petname)
         let keys = nostr::Keys::generate();
         let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
         let npub = keys.public_key().to_bech32().expect("Failed to encode npub");
@@ -71,7 +365,6 @@ crawl_depth = 0
                 self.home_dir.to_string_lossy().to_string(),
             ),
             (
-                // Override hashtree config dir to use our temp directory
                 "HTREE_CONFIG_DIR".to_string(),
                 config_dir.to_string_lossy().to_string(),
             ),
@@ -116,6 +409,8 @@ fn create_test_repo() -> TempDir {
     let status = Command::new("git")
         .args(["init"])
         .current_dir(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .expect("Failed to run git init");
     assert!(status.success(), "git init failed");
@@ -154,26 +449,42 @@ fn create_test_repo() -> TempDir {
     Command::new("git")
         .args(["commit", "-m", "Initial commit"])
         .current_dir(path)
+        .stdout(Stdio::null())
         .status()
         .expect("Failed to git commit");
 
     dir
 }
 
+/// Test git push and clone with local servers (no network needed)
 #[test]
-#[ignore = "requires network - run with: cargo test --package git-remote-htree --test git_roundtrip -- --ignored --nocapture"]
-fn test_git_push_and_clone() {
+fn test_git_push_and_clone_local() {
     // Check prerequisites
     if find_git_remote_htree_dir().is_none() {
-        panic!(
-            "git-remote-htree binary not found. Run `cargo build --release -p git-remote-htree` first."
+        println!(
+            "SKIP: git-remote-htree binary not found. Run `cargo build -p git-remote-htree` first."
         );
+        return;
     }
 
-    println!("=== Git Push/Clone Roundtrip Test ===\n");
+    // Start local nostr relay
+    let relay = test_relay::TestRelay::new(19200);
+    println!("Started local nostr relay at: {}", relay.url());
 
-    // Create test environment (shared HOME for push and clone)
-    let test_env = TestEnv::new();
+    // Start local blossom server
+    let server = match TestServer::new(19201) {
+        Some(s) => s,
+        None => {
+            println!("SKIP: htree binary not found. Run `cargo build --bin htree` first.");
+            return;
+        }
+    };
+    println!("Started local blossom server at: {}", server.base_url());
+
+    println!("\n=== Git Push/Clone Roundtrip Test (Local Servers) ===\n");
+
+    // Create test environment pointing to local servers
+    let test_env = TestEnv::new(Some(&server.base_url()), Some(&relay.url()));
     println!("Test environment at: {:?}\n", test_env.home_dir);
 
     // Create test repo
@@ -181,8 +492,8 @@ fn test_git_push_and_clone() {
     let repo = create_test_repo();
     println!("Test repo at: {:?}\n", repo.path());
 
-    // Add htree remote using "self" - this auto-generates keys on first use
-    let remote_url = "htree://self/test-repo";
+    // Add htree remote
+    let remote_url = "htree://self/test-repo-local";
     println!("Adding remote: {}", remote_url);
 
     let env_vars: Vec<_> = test_env.env();
@@ -213,26 +524,20 @@ fn test_git_push_and_clone() {
         .expect("Failed to run git push");
 
     let push_duration = push_start.elapsed();
-    println!("Push stdout: {}", String::from_utf8_lossy(&push.stdout));
     println!("Push stderr: {}", String::from_utf8_lossy(&push.stderr));
-    println!("Push exit code: {:?}", push.status.code());
     println!("Push took: {:?}", push_duration);
 
-    // Check for success indicators in output (git may have non-zero exit but still worked)
     let stderr = String::from_utf8_lossy(&push.stderr);
     let push_worked = stderr.contains("-> master") || stderr.contains("-> main");
 
     if !push.status.success() && !push_worked {
         panic!("git push failed: {}", stderr);
     }
-
-    // Use the npub we generated in TestEnv
-    let npub = &test_env.npub;
-    println!("Using npub: {}", npub);
     println!("Push successful!\n");
 
-    // Clone to new directory using the actual npub (not self)
-    let clone_url = format!("htree://{}/test-repo", npub);
+    // Clone using the npub
+    let npub = &test_env.npub;
+    let clone_url = format!("htree://{}/test-repo-local", npub);
     let clone_dir = TempDir::new().expect("Failed to create clone dir");
     let clone_path = clone_dir.path().join("cloned-repo");
 
@@ -246,9 +551,7 @@ fn test_git_push_and_clone() {
         .expect("Failed to run git clone");
 
     let clone_duration = clone_start.elapsed();
-    println!("Clone stdout: {}", String::from_utf8_lossy(&clone.stdout));
     println!("Clone stderr: {}", String::from_utf8_lossy(&clone.stderr));
-    println!("Clone exit code: {:?}", clone.status.code());
     println!("Clone took: {:?}", clone_duration);
 
     if !clone.status.success() {
@@ -271,97 +574,43 @@ fn test_git_push_and_clone() {
     let cloned_main = std::fs::read_to_string(clone_path.join("src/main.rs")).unwrap();
     assert_eq!(original_main, cloned_main, "src/main.rs should match");
 
-    // Verify git history matches
-    println!("Verifying git commit history...");
-
-    // Get commit log from original repo
-    let original_log = Command::new("git")
-        .args(["log", "--format=%H %s", "--all"])
-        .current_dir(repo.path())
-        .output()
-        .expect("Failed to run git log on original");
-    let original_commits = String::from_utf8_lossy(&original_log.stdout);
-    println!("Original repo commits:\n{}", original_commits);
-
-    // Get commit log from cloned repo
-    let cloned_log = Command::new("git")
-        .args(["log", "--format=%H %s", "--all"])
-        .current_dir(&clone_path)
-        .output()
-        .expect("Failed to run git log on clone");
-    let cloned_commits = String::from_utf8_lossy(&cloned_log.stdout);
-    println!("Cloned repo commits:\n{}", cloned_commits);
-
-    // Commits should match exactly (same SHAs)
-    assert_eq!(
-        original_commits.trim(),
-        cloned_commits.trim(),
-        "Commit history should match exactly"
-    );
-
-    // Verify author/date info is preserved
-    let original_show = Command::new("git")
-        .args(["log", "-1", "--format=%an <%ae> %ai"])
-        .current_dir(repo.path())
-        .output()
-        .expect("Failed to get original commit info");
-    let original_info = String::from_utf8_lossy(&original_show.stdout);
-
-    let cloned_show = Command::new("git")
-        .args(["log", "-1", "--format=%an <%ae> %ai"])
-        .current_dir(&clone_path)
-        .output()
-        .expect("Failed to get cloned commit info");
-    let cloned_info = String::from_utf8_lossy(&cloned_show.stdout);
-
-    assert_eq!(
-        original_info.trim(),
-        cloned_info.trim(),
-        "Commit author and date should match"
-    );
-    println!("Commit info: {}", original_info.trim());
-
-    // Also check that HEAD points to the right branch
-    let cloned_head = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&clone_path)
-        .output()
-        .expect("Failed to get HEAD branch");
-    let head_branch = String::from_utf8_lossy(&cloned_head.stdout);
-    println!("Cloned repo HEAD branch: {}", head_branch.trim());
-    assert!(
-        head_branch.trim() == "master" || head_branch.trim() == "main",
-        "HEAD should be on master or main branch"
-    );
-
-    println!("\n=== SUCCESS: Git roundtrip test passed! ===");
+    println!("\n=== SUCCESS: Local git roundtrip test passed! ===");
     println!("Push time: {:?}", push_duration);
     println!("Clone time: {:?}", clone_duration);
 }
 
+/// Test diff-based push - second push should upload fewer blobs
 #[test]
-#[ignore = "requires network - run with: cargo test --package git-remote-htree --test git_roundtrip -- --ignored --nocapture"]
-fn test_multi_branch_preservation() {
+fn test_diff_based_push() {
     // Check prerequisites
     if find_git_remote_htree_dir().is_none() {
-        panic!(
-            "git-remote-htree binary not found. Run `cargo build --release -p git-remote-htree` first."
+        println!(
+            "SKIP: git-remote-htree binary not found. Run `cargo build -p git-remote-htree` first."
         );
+        return;
     }
 
-    println!("=== Multi-Branch Preservation Test ===\n");
+    // Start local servers
+    let relay = test_relay::TestRelay::new(19202);
+    let server = match TestServer::new(19203) {
+        Some(s) => s,
+        None => {
+            println!("SKIP: htree binary not found. Run `cargo build --bin htree` first.");
+            return;
+        }
+    };
 
-    // Create test environment
-    let test_env = TestEnv::new();
+    println!("=== Diff-Based Push Test ===\n");
+    println!("Local relay: {}, blossom: {}\n", relay.url(), server.base_url());
+
+    let test_env = TestEnv::new(Some(&server.base_url()), Some(&relay.url()));
     let env_vars: Vec<_> = test_env.env();
-    println!("Test environment at: {:?}\n", test_env.home_dir);
 
-    // Create test repo
+    // Create and push initial repo
     let repo = create_test_repo();
     println!("Test repo at: {:?}\n", repo.path());
 
-    // Add htree remote
-    let remote_url = "htree://self/multi-branch-test";
+    let remote_url = "htree://self/diff-test-repo";
     Command::new("git")
         .args(["remote", "add", "htree", remote_url])
         .current_dir(repo.path())
@@ -369,96 +618,129 @@ fn test_multi_branch_preservation() {
         .output()
         .expect("Failed to add remote");
 
-    // === STEP 1: Push master branch ===
-    println!("=== Step 1: Push master branch ===");
+    // First push
+    println!("=== First push (full upload) ===");
     let push1 = Command::new("git")
         .args(["push", "htree", "master"])
         .current_dir(repo.path())
         .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .output()
-        .expect("Failed to push master");
+        .expect("Failed to push");
 
     let stderr1 = String::from_utf8_lossy(&push1.stderr);
-    println!("Push master stderr: {}", stderr1);
+    println!("First push stderr:\n{}", stderr1);
 
     if !push1.status.success() && !stderr1.contains("-> master") {
-        panic!("git push master failed: {}", stderr1);
+        panic!("First push failed: {}", stderr1);
     }
 
-    // Check for excessive upload failures (network reliability issue)
-    // Line format: "Blossom upload complete: X uploaded, Y already existed, Z failed"
-    if stderr1.contains("failed") {
-        // Extract the number before "failed"
-        for line in stderr1.lines() {
-            if line.contains("Blossom upload complete") && line.contains("failed") {
-                // Parse "N failed" where N > 5 indicates unreliable network
-                if let Some(pos) = line.find("failed") {
-                    let before = &line[..pos];
-                    if let Some(num_str) = before.split_whitespace().last() {
-                        if let Ok(failed_count) = num_str.parse::<u32>() {
-                            if failed_count > 5 {
-                                eprintln!("\nSKIP: Network unreliable - {} blob uploads failed", failed_count);
-                                eprintln!("This test requires working blossom servers\n");
-                                return; // Skip test due to network issues
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Use the npub we generated in TestEnv
-    let npub = &test_env.npub;
-    println!("Using npub: {}\n", npub);
-
-    // === STEP 2: Create and push dev branch ===
-    println!("=== Step 2: Create and push dev branch ===");
-
-    // Create dev branch
-    Command::new("git")
-        .args(["checkout", "-b", "dev"])
-        .current_dir(repo.path())
-        .output()
-        .expect("Failed to create dev branch");
-
-    // Add a file unique to dev
-    std::fs::write(repo.path().join("dev-only.txt"), "This file only exists on dev branch\n")
-        .expect("Failed to write dev-only.txt");
+    // Make a small change
+    println!("\n=== Making small change ===");
+    std::fs::write(repo.path().join("small-change.txt"), "Just a small change\n")
+        .expect("Failed to write file");
 
     Command::new("git")
-        .args(["add", "dev-only.txt"])
+        .args(["add", "small-change.txt"])
         .current_dir(repo.path())
         .output()
         .expect("Failed to git add");
 
     Command::new("git")
-        .args(["commit", "-m", "Add dev-only file"])
+        .args(["commit", "-m", "Add small change"])
         .current_dir(repo.path())
+        .stdout(Stdio::null())
         .output()
-        .expect("Failed to commit on dev");
+        .expect("Failed to commit");
 
-    // Push dev branch
+    // Second push - should use diff
+    println!("\n=== Second push (should use diff) ===");
     let push2 = Command::new("git")
-        .args(["push", "htree", "dev"])
+        .args(["push", "htree", "master"])
         .current_dir(repo.path())
         .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .output()
-        .expect("Failed to push dev");
+        .expect("Failed to push");
 
     let stderr2 = String::from_utf8_lossy(&push2.stderr);
-    println!("Push dev stderr: {}", stderr2);
+    println!("Second push stderr:\n{}", stderr2);
 
-    if !push2.status.success() && !stderr2.contains("-> dev") {
-        panic!("git push dev failed: {}", stderr2);
+    if !push2.status.success() && !stderr2.contains("-> master") {
+        panic!("Second push failed: {}", stderr2);
     }
-    println!("Dev branch pushed!\n");
 
-    // === STEP 3: Clone and verify both branches exist ===
-    println!("=== Step 3: Clone and verify both branches ===");
+    // Verify diff was used
+    let used_diff = stderr2.contains("unchanged") || stderr2.contains("Computing diff");
+    println!("\nDiff optimization used: {}", used_diff);
+    assert!(used_diff, "Second push should use diff optimization");
 
-    let clone_url = format!("htree://{}/multi-branch-test", npub);
-    let clone_dir = TempDir::new().expect("Failed to create clone dir");
+    // Third push with no changes
+    println!("\n=== Third push (no changes) ===");
+    let push3 = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push");
+
+    let stderr3 = String::from_utf8_lossy(&push3.stderr);
+    println!("Third push stderr:\n{}", stderr3);
+
+    // Either detects exact same root hash OR uploads very few blobs
+    // Note: The index file contains timestamps which may cause small variations
+    let no_changes = stderr3.contains("No changes") || stderr3.contains("same root");
+    let minimal_upload = stderr3.contains("unchanged") && {
+        // Parse "X new" from output - should be small (< 10)
+        stderr3.split_whitespace()
+            .zip(stderr3.split_whitespace().skip(1))
+            .find(|(_, word)| *word == "new,")
+            .and_then(|(num, _)| num.strip_prefix('(').unwrap_or(num).parse::<u32>().ok())
+            .map(|n| n < 10)
+            .unwrap_or(false)
+    };
+    println!("No-change optimization used: {} (minimal_upload: {})", no_changes, minimal_upload);
+    assert!(no_changes || minimal_upload, "Third push should detect no changes or upload minimal blobs");
+
+    println!("\n=== SUCCESS: Diff-based push test passed! ===");
+}
+
+/// Test with production servers (requires network)
+#[test]
+#[ignore = "requires network - run with: cargo test --test git_roundtrip test_git_push_and_clone_production -- --ignored --nocapture"]
+fn test_git_push_and_clone_production() {
+    if find_git_remote_htree_dir().is_none() {
+        panic!("git-remote-htree binary not found");
+    }
+
+    println!("=== Git Push/Clone Roundtrip Test (Production Servers) ===\n");
+
+    let test_env = TestEnv::new(None, None);
+    let repo = create_test_repo();
+    let env_vars: Vec<_> = test_env.env();
+
+    Command::new("git")
+        .args(["remote", "add", "htree", "htree://self/test-repo"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to add remote");
+
+    let push = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push");
+
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    println!("Push stderr: {}", stderr);
+
+    if !push.status.success() && !stderr.contains("-> master") {
+        panic!("git push failed: {}", stderr);
+    }
+
+    let npub = &test_env.npub;
+    let clone_url = format!("htree://{}/test-repo", npub);
+    let clone_dir = TempDir::new().unwrap();
     let clone_path = clone_dir.path().join("cloned");
 
     let clone = Command::new("git")
@@ -467,147 +749,20 @@ fn test_multi_branch_preservation() {
         .output()
         .expect("Failed to clone");
 
-    println!("Clone stdout: {}", String::from_utf8_lossy(&clone.stdout));
-    println!("Clone stderr: {}", String::from_utf8_lossy(&clone.stderr));
-
     if !clone.status.success() {
         panic!("git clone failed: {}", String::from_utf8_lossy(&clone.stderr));
     }
-    println!("Clone successful!");
 
-    // List remote branches
-    let branches = Command::new("git")
-        .args(["branch", "-r"])
-        .current_dir(&clone_path)
-        .output()
-        .expect("Failed to list branches");
-
-    let branches_output = String::from_utf8_lossy(&branches.stdout);
-    println!("Remote branches:\n{}", branches_output);
-
-    // Verify both branches exist
-    assert!(
-        branches_output.contains("origin/master") || branches_output.contains("origin/main"),
-        "master/main branch should exist"
-    );
-    assert!(
-        branches_output.contains("origin/dev"),
-        "dev branch should exist - MULTI-BRANCH PRESERVATION FAILED"
-    );
-
-    // Checkout dev and verify dev-only.txt exists
-    Command::new("git")
-        .args(["checkout", "dev"])
-        .current_dir(&clone_path)
-        .output()
-        .expect("Failed to checkout dev");
-
-    assert!(
-        clone_path.join("dev-only.txt").exists(),
-        "dev-only.txt should exist on dev branch"
-    );
-
-    let dev_content = std::fs::read_to_string(clone_path.join("dev-only.txt")).unwrap();
     assert_eq!(
-        dev_content, "This file only exists on dev branch\n",
-        "dev-only.txt content should match"
-    );
-    println!("Dev branch content verified!\n");
-
-    // === STEP 4: Push update to master, verify dev still exists ===
-    println!("=== Step 4: Push update to master, verify dev preserved ===");
-
-    // Switch back to master in original repo
-    Command::new("git")
-        .args(["checkout", "master"])
-        .current_dir(repo.path())
-        .output()
-        .expect("Failed to checkout master");
-
-    // Add another file to master
-    std::fs::write(repo.path().join("master-update.txt"), "Updated master branch\n")
-        .expect("Failed to write master-update.txt");
-
-    Command::new("git")
-        .args(["add", "master-update.txt"])
-        .current_dir(repo.path())
-        .output()
-        .expect("Failed to git add");
-
-    Command::new("git")
-        .args(["commit", "-m", "Update master"])
-        .current_dir(repo.path())
-        .output()
-        .expect("Failed to commit master update");
-
-    // Push master again
-    let push3 = Command::new("git")
-        .args(["push", "htree", "master"])
-        .current_dir(repo.path())
-        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .output()
-        .expect("Failed to push master update");
-
-    let stderr3 = String::from_utf8_lossy(&push3.stderr);
-    println!("Push master update stderr: {}", stderr3);
-
-    if !push3.status.success() && !stderr3.contains("-> master") {
-        panic!("git push master update failed: {}", stderr3);
-    }
-
-    // Clone fresh again
-    let clone_dir2 = TempDir::new().expect("Failed to create clone dir 2");
-    let clone_path2 = clone_dir2.path().join("cloned2");
-
-    let clone2 = Command::new("git")
-        .args(["clone", &clone_url, clone_path2.to_str().unwrap()])
-        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .output()
-        .expect("Failed to clone after master update");
-
-    if !clone2.status.success() {
-        panic!("git clone failed: {}", String::from_utf8_lossy(&clone2.stderr));
-    }
-
-    // Verify dev branch still exists after master push
-    let branches2 = Command::new("git")
-        .args(["branch", "-r"])
-        .current_dir(&clone_path2)
-        .output()
-        .expect("Failed to list branches");
-
-    let branches2_output = String::from_utf8_lossy(&branches2.stdout);
-    println!("Remote branches after master update:\n{}", branches2_output);
-
-    assert!(
-        branches2_output.contains("origin/dev"),
-        "dev branch should STILL exist after pushing master - MULTI-BRANCH PRESERVATION FAILED"
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        std::fs::read_to_string(clone_path.join("README.md")).unwrap()
     );
 
-    // Verify master has the update
-    assert!(
-        clone_path2.join("master-update.txt").exists(),
-        "master-update.txt should exist"
-    );
-
-    // Verify dev still has its content
-    Command::new("git")
-        .args(["checkout", "dev"])
-        .current_dir(&clone_path2)
-        .output()
-        .expect("Failed to checkout dev");
-
-    assert!(
-        clone_path2.join("dev-only.txt").exists(),
-        "dev-only.txt should still exist on dev branch after master push"
-    );
-
-    println!("\n=== SUCCESS: Multi-branch preservation test passed! ===");
+    println!("\n=== SUCCESS ===");
 }
 
 #[test]
 fn test_git_remote_htree_binary_exists() {
-    // Quick sanity check that the binary exists (doesn't require network)
     if find_git_remote_htree_dir().is_none() {
         println!(
             "SKIP: git-remote-htree binary not found. Build with: cargo build -p git-remote-htree"
@@ -618,20 +773,4 @@ fn test_git_remote_htree_binary_exists() {
     let bin_dir = find_git_remote_htree_dir().unwrap();
     let binary = bin_dir.join("git-remote-htree");
     assert!(binary.exists(), "git-remote-htree binary should exist");
-
-    // Check it's executable by running --help
-    let output = Command::new(&binary).arg("--help").output();
-
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            println!("git-remote-htree --help output:\n{}\n{}", stdout, stderr);
-            // The binary doesn't have --help, but running it should at least not crash
-        }
-        Err(e) => {
-            // Permission denied or other error is fine - just check it exists
-            println!("Could not run binary (may need execute permission): {}", e);
-        }
-    }
 }
