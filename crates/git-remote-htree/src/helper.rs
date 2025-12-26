@@ -1094,6 +1094,7 @@ impl RemoteHelper {
         });
 
         let verbose = self.is_slow(); // Capture before async block
+        let force_upload = self.config.blossom.force_upload;
         let success = rt.block_on(async {
             use std::sync::atomic::{AtomicUsize, Ordering};
             use std::sync::Arc;
@@ -1154,8 +1155,12 @@ impl RemoteHelper {
             let has_old_tree = !old_hashes.is_empty();
 
             // Check which servers need full upload (don't have old tree)
+            // If force_upload is true, all servers get full upload (skip server-has check)
             let all_servers: Vec<String> = blossom.write_servers().to_vec();
-            let servers_needing_full: Arc<Vec<String>> = if has_old_tree && !all_servers.is_empty() {
+            let servers_needing_full: Arc<Vec<String>> = if force_upload {
+                // Force upload to all servers
+                Arc::new(all_servers.clone())
+            } else if has_old_tree && !all_servers.is_empty() {
                 // Always include the root hash first, then sample additional random hashes
                 // Root is critical - if server doesn't have root, it can't serve the tree
                 let old_root = old_root_bytes.unwrap();

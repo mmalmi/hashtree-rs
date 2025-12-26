@@ -155,6 +155,9 @@ pub struct BlossomConfig {
     /// Max upload size in MB
     #[serde(default = "default_max_upload_mb")]
     pub max_upload_mb: u64,
+    /// Force upload all blobs, skipping "server already has" check
+    #[serde(default)]
+    pub force_upload: bool,
 }
 
 impl Default for BlossomConfig {
@@ -164,6 +167,7 @@ impl Default for BlossomConfig {
             read_servers: default_read_servers(),
             write_servers: default_write_servers(),
             max_upload_mb: default_max_upload_mb(),
+            force_upload: false,
         }
     }
 }
