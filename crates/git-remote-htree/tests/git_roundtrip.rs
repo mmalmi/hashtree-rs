@@ -341,19 +341,14 @@ crawl_depth = 0
         std::fs::write(config_dir.join("config.toml"), config_content)
             .expect("Failed to write config");
 
-        // Use a deterministic test key so repeated test runs don't spam blossom servers
-        // Same key → same CHK encryption → same blob hashes → upload_if_missing skips
-        // This is a throwaway test-only key, not used for anything real
-        let test_secret_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let secret_bytes = hex::decode(test_secret_hex).expect("Invalid test key hex");
-        let secret = nostr::SecretKey::from_slice(&secret_bytes).expect("Invalid test secret");
-        let keys = nostr::Keys::new(secret);
+        // Generate a random test key for isolation
+        let keys = nostr::Keys::generate();
         let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
         let npub = keys.public_key().to_bech32().expect("Failed to encode npub");
         let key_line = format!("{} self\n", nsec);
         std::fs::write(config_dir.join("keys"), &key_line)
             .expect("Failed to write keys");
-        println!("Using deterministic test key: {} (petname: self)", &nsec[..20]);
+        println!("Using test key: {} (petname: self)", &nsec[..20]);
 
         TestEnv {
             _data_dir: data_dir,
