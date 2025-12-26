@@ -98,6 +98,14 @@ nsec1abc123... work
 git remote add origin htree://work/myproject
 git push origin main
 git clone htree://npub1.../repo-name
+
+# Link-visible repo (encrypted, shareable via secret URL)
+git remote add origin htree://self/myrepo#link-visible
+git push origin main
+# Follow the instructions to set the generated key, then push again
+
+# Clone with secret key
+git clone htree://npub1.../repo#k=<64-hex-chars>
 ```
 
 ## Configuration
