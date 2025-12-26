@@ -92,9 +92,11 @@ pub struct RemoteHelper {
     push_specs: Vec<PushSpec>,
     /// Objects to fetch
     fetch_specs: Vec<FetchSpec>,
-    /// Secret key from URL fragment #k=<hex> (for private repos)
+    /// Secret key from URL fragment #k=<hex> (for link-visible repos)
     /// If set, use this for encryption instead of CHK, and don't publish key in event
     url_secret: Option<[u8; 32]>,
+    /// Whether this is a private (author-only) repo using NIP-44 encryption
+    is_private: bool,
 }
 
 #[derive(Debug)]
@@ -116,15 +118,18 @@ impl RemoteHelper {
         repo_name: &str,
         signing_key: Option<String>,
         url_secret: Option<[u8; 32]>,
+        is_private: bool,
         config: Config,
     ) -> Result<Self> {
         // Use shared hashtree storage at ~/.hashtree/data
         let data_dir = get_hashtree_data_dir();
         debug!(?data_dir, "RemoteHelper::new");
         let storage = GitStorage::open(&data_dir)?;
-        let nostr = NostrClient::new(pubkey, signing_key, url_secret, &config)?;
+        let nostr = NostrClient::new(pubkey, signing_key, url_secret, is_private, &config)?;
 
-        if url_secret.is_some() {
+        if is_private {
+            info!("Private repo: using NIP-44 encryption (author-only)");
+        } else if url_secret.is_some() {
             info!("Link-visible repo: using secret from URL fragment");
         }
 
@@ -139,6 +144,7 @@ impl RemoteHelper {
             push_specs: Vec::new(),
             fetch_specs: Vec::new(),
             url_secret,
+            is_private,
         })
     }
 
@@ -892,8 +898,8 @@ impl RemoteHelper {
         let root_cid = self.storage.build_tree()?;
         let root_hash_hex = hex::encode(root_cid.hash);
         let chk_key = root_cid.key;
-        let is_private = self.url_secret.is_some();
-        eprintln!(" done (encrypted: {}, private: {})", chk_key.is_some(), is_private);
+        let is_link_visible = self.url_secret.is_some();
+        eprintln!(" done (encrypted: {}, link_visible: {}, private: {})", chk_key.is_some(), is_link_visible, self.is_private);
 
         // For private repos: XOR the CHK key with url_secret so only URL holders can decrypt
         // For public repos: publish the CHK key directly
@@ -923,7 +929,7 @@ impl RemoteHelper {
         // Then publish to nostr (kind 30078 with hashtree label)
         // Include masked key (encryptedKey tag) for private or raw CHK key (key tag) for public repos
         // Don't fail push if relay publish fails - it's just distribution
-        let key_with_privacy = key_to_publish.as_ref().map(|k| (k, is_private));
+        let key_with_privacy = key_to_publish.as_ref().map(|k| (k, is_link_visible, self.is_private));
         let (npub_url, relay_result) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex, key_with_privacy) {
             Ok((url, result)) => (url, result),
             Err(e) => {
@@ -1474,7 +1480,7 @@ mod tests {
 
     fn create_test_helper() -> Option<RemoteHelper> {
         let config = Config::default();
-        RemoteHelper::new(TEST_PUBKEY, "test-repo", None, None, config).ok()
+        RemoteHelper::new(TEST_PUBKEY, "test-repo", None, None, false, config).ok()
     }
 
     #[test]

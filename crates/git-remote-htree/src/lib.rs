@@ -185,9 +185,7 @@ fn run() -> Result<()> {
            config.blossom.write_servers.len());
 
     // Create helper and run protocol
-    // TODO: implement is_private support in RemoteHelper
-    let _ = is_private; // Will be used when #private encryption is implemented
-    let mut helper = RemoteHelper::new(&pubkey, &repo_name, signing_key, url_secret, config)?;
+    let mut helper = RemoteHelper::new(&pubkey, &repo_name, signing_key, url_secret, is_private, config)?;
 
     // Read commands from stdin, write responses to stdout
     let stdin = std::io::stdin();
@@ -283,8 +281,15 @@ fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
             key.copy_from_slice(&bytes);
             (path, Some(key), false, false)
         } else {
-            // Unknown fragment - ignore
-            (path, None, false, false)
+            // Unknown fragment - error to prevent accidental public push
+            bail!(
+                "Unknown URL fragment '#{}'. Valid options:\n\
+                 - #k=<64-hex-chars>  Link-visible with explicit key\n\
+                 - #link-visible      Link-visible with auto-generated key\n\
+                 - #private           Author-only (NIP-44 encrypted)\n\
+                 - (no fragment)      Public",
+                fragment
+            );
         }
     } else {
         (url, None, false, false)

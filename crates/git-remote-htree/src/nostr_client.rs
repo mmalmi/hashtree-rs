@@ -270,11 +270,13 @@ pub struct NostrClient {
     /// URL secret for link-visible repos (#k=<hex>)
     /// If set, encryption keys from nostr are XOR-masked and need unmasking
     url_secret: Option<[u8; 32]>,
+    /// Whether this is a private (author-only) repo using NIP-44 encryption
+    is_private: bool,
 }
 
 impl NostrClient {
-    /// Create a new client with pubkey, optional secret key, url secret, and config
-    pub fn new(pubkey: &str, secret_key: Option<String>, url_secret: Option<[u8; 32]>, config: &Config) -> Result<Self> {
+    /// Create a new client with pubkey, optional secret key, url secret, is_private flag, and config
+    pub fn new(pubkey: &str, secret_key: Option<String>, url_secret: Option<[u8; 32]>, is_private: bool, config: &Config) -> Result<Self> {
         // Use provided secret, or try environment variable
         let secret_key = secret_key.or_else(|| std::env::var("NOSTR_SECRET_KEY").ok());
 
@@ -306,6 +308,7 @@ impl NostrClient {
             cached_root_hash: HashMap::new(),
             cached_encryption_key: HashMap::new(),
             url_secret,
+            is_private,
         })
     }
 
@@ -478,62 +481,106 @@ impl NostrClient {
         }
 
         // Get encryption key and determine visibility type from tag name
-        // - "key": public repo, key is plaintext CHK
-        // - "encryptedKey": link-visible repo, key is XOR-masked with URL secret
-        // - "selfEncryptedKey": private repo, key is NIP-44 encrypted to author
-        let (encryption_key, key_tag_name) = event
+        // - "key": public repo, key is plaintext CHK (hex)
+        // - "encryptedKey": link-visible repo, key is XOR-masked (hex)
+        // - "selfEncryptedKey": private repo, key is NIP-44 ciphertext (base64)
+        let (encryption_key, key_tag_name, self_encrypted_ciphertext) = event
             .tags
             .iter()
             .find_map(|t| {
                 let slice = t.as_slice();
                 if slice.len() >= 2 {
                     let tag_name = slice[0].as_str();
-                    if tag_name == "key" || tag_name == "encryptedKey" || tag_name == "selfEncryptedKey" {
-                        let key_hex = slice[1].to_string();
-                        if let Ok(bytes) = hex::decode(&key_hex) {
+                    let tag_value = slice[1].to_string();
+
+                    if tag_name == "selfEncryptedKey" {
+                        // NIP-44 ciphertext - don't parse as hex, save for later decryption
+                        return Some((None, Some(tag_name.to_string()), Some(tag_value)));
+                    } else if tag_name == "key" || tag_name == "encryptedKey" {
+                        // Hex-encoded key
+                        if let Ok(bytes) = hex::decode(&tag_value) {
                             if bytes.len() == 32 {
                                 let mut key = [0u8; 32];
                                 key.copy_from_slice(&bytes);
-                                return Some((Some(key), Some(tag_name.to_string())));
+                                return Some((Some(key), Some(tag_name.to_string()), None));
                             }
                         }
                     }
                 }
                 None
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
 
-        // Check for access errors based on key type
-        if let Some(ref tag) = key_tag_name {
-            match tag.as_str() {
-                "encryptedKey" if self.url_secret.is_none() => {
+        // Process encryption key based on tag type
+        let unmasked_key = match key_tag_name.as_deref() {
+            Some("encryptedKey") => {
+                // Link-visible: XOR the masked key with url_secret
+                if let (Some(masked), Some(secret)) = (encryption_key, self.url_secret) {
+                    let mut unmasked = [0u8; 32];
+                    for i in 0..32 {
+                        unmasked[i] = masked[i] ^ secret[i];
+                    }
+                    Some(unmasked)
+                } else {
                     anyhow::bail!(
                         "This repo is link-visible and requires a secret key.\n\
                          Use: htree://.../{repo_name}#k=<secret>\n\
                          Ask the repo owner for the full URL with the secret."
                     );
                 }
-                "selfEncryptedKey" => {
-                    // TODO: Implement NIP-44 decryption for private repos
+            }
+            Some("selfEncryptedKey") => {
+                // Private: only decrypt if #private is in the URL
+                if !self.is_private {
                     anyhow::bail!(
                         "This repo is private (author-only).\n\
-                         Only the repo author can access it using #private in the URL."
+                         Use: htree://.../{repo_name}#private\n\
+                         Only the author can access this repo."
                     );
                 }
-                _ => {}
-            }
-        }
 
-        // For link-visible repos: XOR the masked key with url_secret to get the real CHK key
-        // For public repos: use the key directly (no masking)
-        let unmasked_key = if let (Some(masked), Some(secret)) = (encryption_key, self.url_secret) {
-            let mut unmasked = [0u8; 32];
-            for i in 0..32 {
-                unmasked[i] = masked[i] ^ secret[i];
+                // Decrypt with NIP-44 using our secret key
+                if let Some(keys) = &self.keys {
+                    if let Some(ciphertext) = self_encrypted_ciphertext {
+                        // Decrypt with NIP-44 (encrypted to self)
+                        let pubkey = keys.public_key();
+                        match nip44::decrypt(keys.secret_key(), &pubkey, &ciphertext) {
+                            Ok(key_hex) => {
+                                let key_bytes = hex::decode(&key_hex)
+                                    .context("Invalid decrypted key hex")?;
+                                if key_bytes.len() != 32 {
+                                    anyhow::bail!("Decrypted key wrong length");
+                                }
+                                let mut key = [0u8; 32];
+                                key.copy_from_slice(&key_bytes);
+                                Some(key)
+                            }
+                            Err(e) => {
+                                anyhow::bail!(
+                                    "Failed to decrypt private repo key: {}\n\
+                                     This repo is private (author-only). You may not be the author.",
+                                    e
+                                );
+                            }
+                        }
+                    } else {
+                        anyhow::bail!("selfEncryptedKey tag has invalid format");
+                    }
+                } else {
+                    anyhow::bail!(
+                        "This repo is private (author-only).\n\
+                         You need the author's secret key to access it."
+                    );
+                }
             }
-            Some(unmasked)
-        } else {
-            encryption_key
+            Some("key") | None => {
+                // Public: use key directly
+                encryption_key
+            }
+            Some(other) => {
+                warn!("Unknown key tag type: {}", other);
+                encryption_key
+            }
         };
 
         info!("Found root hash {} for {} (encrypted: {}, link_visible: {})",
@@ -812,7 +859,7 @@ impl NostrClient {
     ///   content: <merkle-root-hash>
     /// Returns: (npub URL, relay result with connected/failed details)
     /// If is_private is true, uses "encryptedKey" tag (XOR masked); otherwise uses "key" tag (plaintext CHK)
-    pub fn publish_repo(&self, repo_name: &str, root_hash: &str, encryption_key: Option<(&[u8; 32], bool)>) -> Result<(String, RelayResult)> {
+    pub fn publish_repo(&self, repo_name: &str, root_hash: &str, encryption_key: Option<(&[u8; 32], bool, bool)>) -> Result<(String, RelayResult)> {
         let keys = self.keys.as_ref().context(format!(
             "Cannot push: no secret key for {}. You can only push to your own repos.",
             &self.pubkey[..16]
@@ -841,7 +888,7 @@ impl NostrClient {
         keys: &Keys,
         repo_name: &str,
         root_hash: &str,
-        encryption_key: Option<(&[u8; 32], bool)>,
+        encryption_key: Option<(&[u8; 32], bool, bool)>,
     ) -> Result<(String, RelayResult)> {
         // Create nostr-sdk client with our keys
         let client = Client::new(keys.clone());
@@ -890,10 +937,29 @@ impl NostrClient {
         ];
 
         // Add encryption key if present (required for decryption)
-        // Use "encryptedKey" for private/link-visible repos (XOR masked), "key" for public
-        if let Some((key, is_private)) = encryption_key {
-            let tag_name = if is_private { "encryptedKey" } else { "key" };
-            tags.push(Tag::custom(TagKind::custom(tag_name), vec![hex::encode(key)]));
+        // Key modes:
+        // - selfEncryptedKey: NIP-44 encrypted to self (author-only private)
+        // - encryptedKey: XOR masked with URL secret (link-visible)
+        // - key: plaintext CHK (public)
+        if let Some((key, is_link_visible, is_self_private)) = encryption_key {
+            if is_self_private {
+                // NIP-44 encrypt to self
+                let pubkey = keys.public_key();
+                let key_hex = hex::encode(key);
+                let encrypted = nip44::encrypt(
+                    keys.secret_key(),
+                    &pubkey,
+                    &key_hex,
+                    nip44::Version::V2
+                ).map_err(|e| anyhow::anyhow!("NIP-44 encryption failed: {}", e))?;
+                tags.push(Tag::custom(TagKind::custom("selfEncryptedKey"), vec![encrypted]));
+            } else if is_link_visible {
+                // XOR masked key
+                tags.push(Tag::custom(TagKind::custom("encryptedKey"), vec![hex::encode(key)]));
+            } else {
+                // Public: plaintext CHK
+                tags.push(Tag::custom(TagKind::custom("key"), vec![hex::encode(key)]));
+            }
         }
 
         // Add directory prefix labels for discoverability
@@ -1003,7 +1069,7 @@ mod tests {
     #[test]
     fn test_new_client() {
         let config = test_config();
-        let client = NostrClient::new(TEST_PUBKEY, None, None, &config).unwrap();
+        let client = NostrClient::new(TEST_PUBKEY, None, None, false, &config).unwrap();
         assert!(!client.relays.is_empty());
         assert!(!client.can_sign());
     }
@@ -1012,14 +1078,14 @@ mod tests {
     fn test_new_client_with_secret() {
         let config = test_config();
         let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let client = NostrClient::new(TEST_PUBKEY, Some(secret.to_string()), None, &config).unwrap();
+        let client = NostrClient::new(TEST_PUBKEY, Some(secret.to_string()), None, false, &config).unwrap();
         assert!(client.can_sign());
     }
 
     #[test]
     fn test_fetch_refs_empty() {
         let config = test_config();
-        let mut client = NostrClient::new(TEST_PUBKEY, None, None, &config).unwrap();
+        let mut client = NostrClient::new(TEST_PUBKEY, None, None, false, &config).unwrap();
         // This will timeout/return empty without real relays
         let refs = client.cached_refs.get("new-repo");
         assert!(refs.is_none());
@@ -1028,7 +1094,7 @@ mod tests {
     #[test]
     fn test_update_ref() {
         let config = test_config();
-        let mut client = NostrClient::new(TEST_PUBKEY, None, None, &config).unwrap();
+        let mut client = NostrClient::new(TEST_PUBKEY, None, None, false, &config).unwrap();
 
         client
             .update_ref("repo", "refs/heads/main", "abc123")
@@ -1086,5 +1152,96 @@ mod tests {
     fn test_resolve_identity_unknown_petname() {
         let result = resolve_identity("nonexistent_petname_xyz");
         assert!(result.is_err());
+    }
+
+    /// Verify that private repo encryption (NIP-44) produces ciphertext, not plaintext CHK
+    #[test]
+    fn test_private_key_is_nip44_encrypted_not_plaintext() {
+        use nostr_sdk::prelude::{Keys, nip44};
+
+        // Create test keys
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Test CHK key (32 bytes)
+        let chk_key: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        ];
+        let plaintext_hex = hex::encode(&chk_key);
+
+        // Encrypt with NIP-44 (same as publish_repo does for is_self_private=true)
+        let encrypted = nip44::encrypt(
+            keys.secret_key(),
+            &pubkey,
+            &plaintext_hex,
+            nip44::Version::V2
+        ).expect("NIP-44 encryption should succeed");
+
+        // Critical security check: encrypted value must NOT be plaintext
+        assert_ne!(
+            encrypted, plaintext_hex,
+            "NIP-44 encrypted value must differ from plaintext CHK hex"
+        );
+
+        // Encrypted value should not contain the raw hex (even as substring)
+        assert!(
+            !encrypted.contains(&plaintext_hex),
+            "Encrypted value should not contain plaintext hex"
+        );
+
+        // Verify we can decrypt it back (round-trip)
+        let decrypted = nip44::decrypt(
+            keys.secret_key(),
+            &pubkey,
+            &encrypted
+        ).expect("NIP-44 decryption should succeed");
+
+        assert_eq!(
+            decrypted, plaintext_hex,
+            "Decrypted value should match original plaintext hex"
+        );
+    }
+
+    /// Verify that different encryption modes produce different tag values
+    #[test]
+    fn test_encryption_modes_produce_different_values() {
+        use nostr_sdk::prelude::{Keys, nip44};
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Test CHK key
+        let chk_key: [u8; 32] = [0xaa; 32];
+        let plaintext_hex = hex::encode(&chk_key);
+
+        // Mode 1: Public (plaintext hex)
+        let public_value = plaintext_hex.clone();
+
+        // Mode 2: Link-visible (XOR masked - in practice, the key passed to publish_repo
+        // is already XOR'd with url_secret, so we just store hex of that)
+        let link_visible_value = plaintext_hex.clone(); // Same format, different actual key
+
+        // Mode 3: Private (NIP-44 encrypted)
+        let private_value = nip44::encrypt(
+            keys.secret_key(),
+            &pubkey,
+            &plaintext_hex,
+            nip44::Version::V2
+        ).expect("NIP-44 encryption should succeed");
+
+        // Private value must be different from public
+        assert_ne!(
+            private_value, public_value,
+            "Private (NIP-44) value must differ from public (plaintext) value"
+        );
+
+        // Private value is base64 (NIP-44 output), not hex
+        assert!(
+            private_value.len() != 64,
+            "NIP-44 output should not be 64 chars like hex CHK"
+        );
     }
 }

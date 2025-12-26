@@ -268,3 +268,154 @@ fn test_link_visible_cannot_clone_with_wrong_secret() {
 
     println!("\n=== SUCCESS: Cannot clone link-visible repo with wrong secret! ===");
 }
+
+/// Test that private repos (#private) can be pushed and cloned by the author
+#[test]
+fn test_private_push_and_clone_as_author() {
+    if skip_if_no_binary() {
+        return;
+    }
+
+    let relay = TestRelay::new(19406);
+    let server = match TestServer::new(19407) {
+        Some(s) => s,
+        None => {
+            println!("SKIP: htree binary not found.");
+            return;
+        }
+    };
+
+    println!("\n=== Private Repo Test: Push and Clone as Author ===\n");
+
+    let test_env = TestEnv::new(Some(&server.base_url()), Some(&relay.url()));
+    let env_vars: Vec<_> = test_env.env();
+
+    let repo = create_test_repo();
+    let remote_url = "htree://self/private-test#private";
+
+    println!("Remote URL: {}", remote_url);
+
+    // Add remote with #private
+    Command::new("git")
+        .args(["remote", "add", "htree", remote_url])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to add remote");
+
+    // Push
+    println!("\nPushing private repo...");
+    let push = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push");
+
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    println!("{}", stderr);
+    assert!(
+        push.status.success() || stderr.contains("-> master"),
+        "Push should succeed"
+    );
+
+    // Clone as author (using self which resolves to same npub)
+    let clone_url = "htree://self/private-test#private";
+    let clone_dir = TempDir::new().unwrap();
+    let clone_path = clone_dir.path().join("cloned");
+
+    println!("\nCloning as author with #private...");
+    let clone = Command::new("git")
+        .args(["clone", clone_url, clone_path.to_str().unwrap()])
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to clone");
+
+    let clone_stderr = String::from_utf8_lossy(&clone.stderr);
+    println!("{}", clone_stderr);
+    assert!(clone.status.success(), "Clone as author should succeed");
+
+    // Verify files
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        std::fs::read_to_string(clone_path.join("README.md")).unwrap(),
+        "Files should match"
+    );
+
+    println!("\n=== SUCCESS: Private repo works for author! ===");
+}
+
+/// Test that private repos CANNOT be cloned without #private (as non-author)
+#[test]
+fn test_private_cannot_clone_without_private_flag() {
+    if skip_if_no_binary() {
+        return;
+    }
+
+    let relay = TestRelay::new(19408);
+    let server = match TestServer::new(19409) {
+        Some(s) => s,
+        None => {
+            println!("SKIP: htree binary not found.");
+            return;
+        }
+    };
+
+    println!("\n=== Private Repo Test: Cannot Clone Without #private ===\n");
+
+    let test_env = TestEnv::new(Some(&server.base_url()), Some(&relay.url()));
+    let env_vars: Vec<_> = test_env.env();
+
+    let repo = create_test_repo();
+    let remote_url = "htree://self/private-noaccess#private";
+
+    // Push with #private
+    Command::new("git")
+        .args(["remote", "add", "htree", remote_url])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to add remote");
+
+    let push = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push");
+
+    assert!(
+        push.status.success() || String::from_utf8_lossy(&push.stderr).contains("-> master"),
+        "Push should succeed"
+    );
+
+    // Try to clone WITHOUT #private (public URL)
+    let npub = &test_env.npub;
+    let public_clone_url = format!("htree://{}/private-noaccess", npub);
+    let clone_dir = TempDir::new().unwrap();
+    let clone_path = clone_dir.path().join("cloned-public");
+
+    println!("\nTrying to clone without #private (should fail)...");
+    let clone = Command::new("git")
+        .args(["clone", &public_clone_url, clone_path.to_str().unwrap()])
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to run clone");
+
+    let clone_stderr = String::from_utf8_lossy(&clone.stderr);
+    println!("{}", clone_stderr);
+
+    // Clone should fail with an error about private repo
+    let clone_failed = !clone.status.success()
+        || clone_stderr.contains("private")
+        || clone_stderr.contains("author")
+        || !clone_path.join("README.md").exists();
+
+    assert!(
+        clone_failed,
+        "Clone without #private should fail. Stderr: {}",
+        clone_stderr
+    );
+
+    println!("\n=== SUCCESS: Cannot clone private repo without #private! ===");
+}
