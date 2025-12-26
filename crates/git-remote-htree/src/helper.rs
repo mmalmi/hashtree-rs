@@ -872,7 +872,15 @@ impl RemoteHelper {
 
         // Push to file servers (blossom) first
         // This makes content available before we advertise the hash
-        let blossom_count = self.push_to_file_servers(&root_hash_hex, chk_key.as_ref());
+        // Get old root hash if it exists (for efficient diff-based upload)
+        let old_root_hash = self.nostr.get_cached_root_hash(&self.repo_name).cloned();
+        let old_encryption_key = self.nostr.get_cached_encryption_key(&self.repo_name).copied();
+        let blossom_count = self.push_to_file_servers_with_diff(
+            &root_hash_hex,
+            chk_key.as_ref(),
+            old_root_hash.as_deref(),
+            old_encryption_key.as_ref(),
+        );
 
         // Then publish to nostr (kind 30078 with hashtree label)
         // Include masked key (encryptedKey tag) for private or raw CHK key (key tag) for public repos
@@ -916,10 +924,20 @@ impl RemoteHelper {
         Ok(())
     }
 
-    /// Push content to file servers (blossom)
-    /// Walks the merkle tree from root_hash and uploads blobs as it discovers them
+    /// Push content to file servers (blossom) with efficient diff-based upload
+    ///
+    /// When an old root hash is provided, computes the diff and only uploads
+    /// hashes that don't exist in the old tree. This significantly reduces
+    /// upload time for incremental pushes.
+    ///
     /// Returns the number of blossom servers successfully used
-    fn push_to_file_servers(&self, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> usize {
+    fn push_to_file_servers_with_diff(
+        &self,
+        root_hash: &str,
+        encryption_key: Option<&[u8; 32]>,
+        old_root_hash: Option<&str>,
+        old_encryption_key: Option<&[u8; 32]>,
+    ) -> usize {
         use hashtree_core::try_decode_tree_node;
         use hashtree_core::crypto::decrypt_chk;
 
@@ -952,15 +970,69 @@ impl RemoteHelper {
             }
         };
 
+        // Parse old root hash if provided
+        let old_root_bytes: Option<[u8; 32]> = old_root_hash.and_then(|h| {
+            hex::decode(h).ok().and_then(|b| {
+                if b.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    Some(arr)
+                } else {
+                    None
+                }
+            })
+        });
+
         let success = rt.block_on(async {
             use std::sync::atomic::{AtomicUsize, Ordering};
             use std::sync::Arc;
             use tokio::sync::mpsc;
+            use hashtree_core::{HashTree, HashTreeConfig, Cid, collect_hashes};
 
             let uploaded = Arc::new(AtomicUsize::new(0));
-            let skipped = Arc::new(AtomicUsize::new(0));
+            let skipped_diff = Arc::new(AtomicUsize::new(0)); // Skipped due to diff (already in old tree)
+            let skipped_server = Arc::new(AtomicUsize::new(0)); // Skipped due to server already having it
             let failed = Arc::new(AtomicUsize::new(0));
             let processed = Arc::new(AtomicUsize::new(0));
+
+            // Collect old tree hashes if we have an old root
+            let old_hashes: HashSet<[u8; 32]> = if let Some(old_root) = old_root_bytes {
+                // Check if old and new root are the same (no changes)
+                if old_root == root_bytes {
+                    eprintln!("  No changes detected (same root hash)");
+                    return true;
+                }
+
+                eprint!("  Computing diff from previous tree...");
+                let _ = std::io::stderr().flush();
+
+                // Create a HashTree for the store to use collect_hashes
+                let cached_store = cached_store::CachedStore::new(
+                    store.clone(),
+                    hashtree_blossom::BlossomStore::new(blossom.clone()),
+                );
+                let tree = HashTree::new(HashTreeConfig::new(Arc::new(cached_store)));
+                let old_cid = Cid {
+                    hash: old_root,
+                    key: old_encryption_key.copied(),
+                };
+
+                match collect_hashes(&tree, &old_cid, 32).await {
+                    Ok(hashes) => {
+                        eprintln!(" {} hashes in old tree", hashes.len());
+                        hashes
+                    }
+                    Err(e) => {
+                        eprintln!(" failed: {}", e);
+                        eprintln!("  Falling back to full upload");
+                        HashSet::new()
+                    }
+                }
+            } else {
+                HashSet::new()
+            };
+
+            let has_old_tree = !old_hashes.is_empty();
 
             // Channel for blobs to upload (bounded to limit memory)
             const CHANNEL_SIZE: usize = 100;
@@ -971,9 +1043,11 @@ impl RemoteHelper {
             let upload_handle = {
                 let blossom = blossom.clone();
                 let uploaded = Arc::clone(&uploaded);
-                let skipped = Arc::clone(&skipped);
+                let skipped_server = Arc::clone(&skipped_server);
                 let failed = Arc::clone(&failed);
                 let processed = Arc::clone(&processed);
+                let skipped_diff = Arc::clone(&skipped_diff);
+                let has_old_tree = has_old_tree;
 
                 tokio::spawn(async move {
                     use futures::stream::StreamExt;
@@ -984,13 +1058,14 @@ impl RemoteHelper {
                         .map(|data| {
                             let blossom = &blossom;
                             let uploaded = Arc::clone(&uploaded);
-                            let skipped = Arc::clone(&skipped);
+                            let skipped_server = Arc::clone(&skipped_server);
                             let failed = Arc::clone(&failed);
                             let processed = Arc::clone(&processed);
+                            let skipped_diff = Arc::clone(&skipped_diff);
                             async move {
                                 match blossom.upload_if_missing(&data).await {
                                     Ok((_, true)) => { uploaded.fetch_add(1, Ordering::Relaxed); }
-                                    Ok((_, false)) => { skipped.fetch_add(1, Ordering::Relaxed); }
+                                    Ok((_, false)) => { skipped_server.fetch_add(1, Ordering::Relaxed); }
                                     Err(e) => {
                                         failed.fetch_add(1, Ordering::Relaxed);
                                         eprintln!("\n  Upload failed ({} bytes): {}", data.len(), e);
@@ -998,10 +1073,19 @@ impl RemoteHelper {
                                 }
                                 let count = processed.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count == 1 || count % 10 == 0 {
-                                    eprint!("\r  Uploading: {} ({} new, {} exist)",
-                                        count,
-                                        uploaded.load(Ordering::Relaxed),
-                                        skipped.load(Ordering::Relaxed));
+                                    let diff_skipped = skipped_diff.load(Ordering::Relaxed);
+                                    if has_old_tree && diff_skipped > 0 {
+                                        eprint!("\r  Uploading: {} ({} new, {} unchanged, {} exist on server)",
+                                            count,
+                                            uploaded.load(Ordering::Relaxed),
+                                            diff_skipped,
+                                            skipped_server.load(Ordering::Relaxed));
+                                    } else {
+                                        eprint!("\r  Uploading: {} ({} new, {} exist)",
+                                            count,
+                                            uploaded.load(Ordering::Relaxed),
+                                            skipped_server.load(Ordering::Relaxed));
+                                    }
                                     let _ = std::io::stderr().flush();
                                 }
                             }
@@ -1026,6 +1110,13 @@ impl RemoteHelper {
                     continue;
                 }
                 visited.insert(hash);
+
+                // KEY OPTIMIZATION: Skip if this hash exists in old tree
+                // The entire subtree is identical, so no need to upload or traverse
+                if old_hashes.contains(&hash) {
+                    skipped_diff.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
 
                 // Load blob from store (stored encrypted)
                 let data = match store.get_sync(&hash) {
@@ -1077,24 +1168,37 @@ impl RemoteHelper {
             let _ = upload_handle.await;
 
             let final_uploaded = uploaded.load(Ordering::Relaxed);
-            let final_skipped = skipped.load(Ordering::Relaxed);
+            let final_skipped_diff = skipped_diff.load(Ordering::Relaxed);
+            let final_skipped_server = skipped_server.load(Ordering::Relaxed);
             let final_failed = failed.load(Ordering::Relaxed);
             let final_processed = processed.load(Ordering::Relaxed);
 
             // Final progress
-            if final_failed > 0 {
-                eprint!("\r  Uploading: {} ({} new, {} exist, {} FAILED)", final_processed, final_uploaded, final_skipped, final_failed);
+            if has_old_tree {
+                if final_failed > 0 {
+                    eprint!("\r  Uploading: {} ({} new, {} unchanged, {} exist, {} FAILED)",
+                        final_processed, final_uploaded, final_skipped_diff, final_skipped_server, final_failed);
+                } else {
+                    eprint!("\r  Uploading: {} ({} new, {} unchanged, {} exist)",
+                        final_processed, final_uploaded, final_skipped_diff, final_skipped_server);
+                }
             } else {
-                eprint!("\r  Uploading: {} ({} new, {} exist)", final_processed, final_uploaded, final_skipped);
+                if final_failed > 0 {
+                    eprint!("\r  Uploading: {} ({} new, {} exist, {} FAILED)",
+                        final_processed, final_uploaded, final_skipped_server, final_failed);
+                } else {
+                    eprint!("\r  Uploading: {} ({} new, {} exist)",
+                        final_processed, final_uploaded, final_skipped_server);
+                }
             }
             eprintln!();
 
             info!(
-                "Blossom upload complete: {} uploaded, {} already existed, {} failed",
-                final_uploaded, final_skipped, final_failed
+                "Blossom upload complete: {} uploaded, {} unchanged (diff), {} already on server, {} failed",
+                final_uploaded, final_skipped_diff, final_skipped_server, final_failed
             );
 
-            final_uploaded > 0 || final_skipped > 0
+            final_uploaded > 0 || final_skipped_server > 0 || final_skipped_diff > 0
         });
 
         if success { blossom_server_count } else { 0 }
