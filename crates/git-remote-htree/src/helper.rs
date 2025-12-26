@@ -746,7 +746,8 @@ impl RemoteHelper {
                                 spec.dst
                             ));
                             eprintln!(
-                                "  Rejected: remote has commits you don't have. Pull first or use --force."
+                                "  Rejected: {} has commits you don't have. Pull first or use --force.",
+                                spec.dst
                             );
                             continue;
                         }
