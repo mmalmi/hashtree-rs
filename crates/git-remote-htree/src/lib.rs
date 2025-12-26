@@ -3,11 +3,24 @@
 //! This crate provides a git remote helper that allows pushing/pulling
 //! git repositories via nostr and hashtree.
 //!
-//! Usage:
-//!   git remote add origin htree://<pubkey>/<repo-name>
-//!   git remote add origin htree://<petname>/<repo-name>
-//!   git push origin main
-//!   git pull origin main
+//! ## Usage
+//!
+//! ```bash
+//! git remote add origin htree://<pubkey>/<repo-name>
+//! git remote add origin htree://<petname>/<repo-name>
+//! git push origin main
+//! git pull origin main
+//! ```
+//!
+//! ## Encryption Modes
+//!
+//! - **Unencrypted**: No CHK, just hash - anyone with hash can read
+//! - **Public**: CHK encrypted, `["key", "<hex>"]` in event - anyone can decrypt
+//! - **Unlisted**: CHK + XOR mask, `["encryptedKey", XOR(key,secret)]` - need `#k=<secret>` URL
+//! - **Private**: CHK + NIP-44 to self, `["selfEncryptedKey", "..."]` - author only
+//!
+//! Default is **Public** (CHK encrypted, key in nostr event).
+//! Use `htree://npub/repo#k=<secret>` for unlisted/link-visible repos.
 
 use anyhow::{bail, Context, Result};
 use nostr_sdk::ToBech32;
