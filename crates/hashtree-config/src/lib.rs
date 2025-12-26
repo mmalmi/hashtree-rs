@@ -20,8 +20,8 @@ pub const DEFAULT_WRITE_SERVERS: &[&str] = &[
 
 /// Default nostr relays
 pub const DEFAULT_RELAYS: &[&str] = &[
+    "wss://temp.iris.to",
     "wss://relay.damus.io",
-    "wss://relay.snort.social",
     "wss://nos.lol",
     "wss://relay.primal.net",
 ];

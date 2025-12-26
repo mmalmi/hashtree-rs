@@ -910,6 +910,8 @@ impl RemoteHelper {
         // Print relay details
         if !relay_result.connected.is_empty() {
             eprintln!("  Relays: {}", relay_result.connected.join(", "));
+        } else {
+            eprintln!("  Relays: none");
         }
         if !relay_result.failed.is_empty() {
             eprintln!("  Relays failed: {}", relay_result.failed.join(", "));
