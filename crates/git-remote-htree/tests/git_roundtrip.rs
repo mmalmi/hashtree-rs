@@ -761,6 +761,72 @@ fn test_git_push_and_clone_production() {
     println!("\n=== SUCCESS ===");
 }
 
+/// Test diff-based push with production servers
+#[test]
+#[ignore = "requires network - run with: cargo test --test git_roundtrip test_diff_based_push_production -- --ignored --nocapture"]
+fn test_diff_based_push_production() {
+    if find_git_remote_htree_dir().is_none() {
+        panic!("git-remote-htree binary not found");
+    }
+
+    println!("=== Diff-Based Push Test (Production Servers) ===\n");
+
+    let test_env = TestEnv::new(None, None);
+    let repo = create_test_repo();
+    let env_vars: Vec<_> = test_env.env();
+
+    let remote_url = "htree://self/diff-test-prod";
+    Command::new("git")
+        .args(["remote", "add", "htree", remote_url])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to add remote");
+
+    // First push
+    println!("=== First push (full upload) ===");
+    let push1 = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push");
+
+    let stderr1 = String::from_utf8_lossy(&push1.stderr);
+    println!("{}", stderr1);
+    if !push1.status.success() && !stderr1.contains("-> master") {
+        panic!("First push failed: {}", stderr1);
+    }
+
+    // Make small change
+    println!("\n=== Making small change ===");
+    std::fs::write(repo.path().join("new-file.txt"), "Small change\n").unwrap();
+    Command::new("git").args(["add", "."]).current_dir(repo.path()).output().unwrap();
+    Command::new("git").args(["commit", "-m", "Add file"]).current_dir(repo.path())
+        .stdout(Stdio::null()).output().unwrap();
+
+    // Second push - should use diff
+    println!("\n=== Second push (should use diff) ===");
+    let push2 = Command::new("git")
+        .args(["push", "htree", "master"])
+        .current_dir(repo.path())
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .expect("Failed to push");
+
+    let stderr2 = String::from_utf8_lossy(&push2.stderr);
+    println!("{}", stderr2);
+    if !push2.status.success() && !stderr2.contains("-> master") {
+        panic!("Second push failed: {}", stderr2);
+    }
+
+    let used_diff = stderr2.contains("unchanged") || stderr2.contains("Computing diff");
+    println!("\nDiff optimization used: {}", used_diff);
+    assert!(used_diff, "Second push should use diff optimization");
+
+    println!("\n=== SUCCESS ===");
+}
+
 #[test]
 fn test_git_remote_htree_binary_exists() {
     if find_git_remote_htree_dir().is_none() {
