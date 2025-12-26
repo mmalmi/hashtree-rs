@@ -225,6 +225,7 @@ impl GitStorage {
     }
 
     /// Check if a ref exists
+    #[cfg(test)]
     pub fn has_ref(&self, name: &str) -> Result<bool> {
         let refs = self.refs.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
@@ -232,6 +233,7 @@ impl GitStorage {
     }
 
     /// Get count of objects in storage
+    #[cfg(test)]
     pub fn object_count(&self) -> Result<usize> {
         let objects = self.objects.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;

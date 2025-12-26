@@ -66,7 +66,8 @@ pub type SimStore = GenericStore<MemoryStore, MockRelayTransport, MockConnection
 
 /// A running node in the simulation
 struct RunningNode {
-    /// HashTree for content operations
+    /// HashTree for content operations (stored for future use)
+    #[allow(dead_code)]
     tree: Arc<HashTree<SimStore>>,
     /// The underlying store for P2P operations
     store: Arc<SimStore>,

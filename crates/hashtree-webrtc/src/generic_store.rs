@@ -194,7 +194,6 @@ where
 
         match parsed {
             DataMessage::Request(req) => {
-                let hash_key = hash_to_key(&req.h);
                 let hash = match crate::protocol::bytes_to_hash(&req.h) {
                     Some(h) => h,
                     None => return,

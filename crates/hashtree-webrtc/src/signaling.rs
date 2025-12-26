@@ -32,7 +32,8 @@ pub struct PeerEntry {
 pub struct SignalingManager<R: RelayTransport, F: PeerConnectionFactory> {
     /// Our peer ID (pubkey:uuid format)
     peer_id: String,
-    /// Our pubkey
+    /// Our pubkey (stored for future use in debugging/logging)
+    #[allow(dead_code)]
     pubkey: String,
     /// Relay transport for signaling
     relay: Arc<R>,

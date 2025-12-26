@@ -591,61 +591,6 @@ impl<S: Store> HashTree<S> {
         Ok(cid)
     }
 
-    /// Build a balanced tree from links
-    async fn build_tree(&self, links: Vec<Link>, total_size: Option<u64>) -> Result<Hash, HashTreeError> {
-        // Single link with matching size - return it directly
-        if links.len() == 1 {
-            if let Some(ts) = total_size {
-                if links[0].size == ts {
-                    return Ok(links[0].hash);
-                }
-            }
-        }
-
-        // Fits in one node
-        if links.len() <= self.max_links {
-            let node = TreeNode {
-                node_type: LinkType::File,
-                links,
-            };
-            let (data, hash) = encode_and_hash(&node)?;
-            self.store
-                .put(hash, data)
-                .await
-                .map_err(|e| HashTreeError::Store(e.to_string()))?;
-            return Ok(hash);
-        }
-
-        // Need to split into sub-trees
-        let mut sub_trees: Vec<Link> = Vec::new();
-
-        for batch in links.chunks(self.max_links) {
-            let batch_size: u64 = batch.iter().map(|l| l.size).sum();
-
-            let node = TreeNode {
-                node_type: LinkType::File,
-                links: batch.to_vec(),
-            };
-            let (data, hash) = encode_and_hash(&node)?;
-            self.store
-                .put(hash, data)
-                .await
-                .map_err(|e| HashTreeError::Store(e.to_string()))?;
-
-            sub_trees.push(Link {
-                hash,
-                name: None,
-                size: batch_size,
-                key: None,
-                link_type: LinkType::File, // Internal tree node
-                meta: None,
-            });
-        }
-
-        // Recursively build parent level
-        Box::pin(self.build_tree(sub_trees, total_size)).await
-    }
-
     /// Create a tree node with custom links
     pub async fn put_tree_node(
         &self,
