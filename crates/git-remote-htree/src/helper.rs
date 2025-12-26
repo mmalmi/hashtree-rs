@@ -120,7 +120,7 @@ impl RemoteHelper {
     ) -> Result<Self> {
         // Use shared hashtree storage at ~/.hashtree/data
         let data_dir = get_hashtree_data_dir();
-        eprintln!("  [DEBUG] RemoteHelper::new data_dir={:?}", data_dir);
+        debug!(?data_dir, "RemoteHelper::new");
         let storage = GitStorage::open(&data_dir)?;
         let nostr = NostrClient::new(pubkey, signing_key, &config)?;
 
@@ -677,13 +677,13 @@ impl RemoteHelper {
 
     /// Execute queued push operations
     fn execute_push(&mut self) -> Result<Option<Vec<String>>> {
-        eprintln!("  [DEBUG] execute_push called with {} refs", self.push_specs.len());
+        debug!(refs_count = self.push_specs.len(), "execute_push called");
         info!("Pushing {} refs", self.push_specs.len());
 
         // First, load existing refs and objects from remote to preserve other branches
         // Check if any push is a force push
         let has_force_push = self.push_specs.iter().any(|s| s.force);
-        eprintln!("  [DEBUG] About to call load_existing_remote_state (force={})", has_force_push);
+        debug!(force = has_force_push, "About to call load_existing_remote_state");
 
         if let Err(e) = self.load_existing_remote_state() {
             if has_force_push {
@@ -697,7 +697,7 @@ impl RemoteHelper {
                     || e.to_string().contains("timeout");
 
                 if is_likely_new_repo {
-                    eprintln!("  [DEBUG] Error loading remote state (likely new repo): {}", e);
+                    debug!("Error loading remote state (likely new repo): {}", e);
                     info!("Could not load existing remote state: {} (likely new repo)", e);
                 } else {
                     // There's an existing remote but we can't load it - warn user

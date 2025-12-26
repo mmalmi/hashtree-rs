@@ -420,7 +420,7 @@ impl NostrClient {
         let _ = client.disconnect().await;
 
         // Find the most recent event with "hashtree" label
-        eprintln!("  [DEBUG] Got {} events from relays", events.len());
+        debug!("Got {} events from relays", events.len());
         let event = events
             .iter()
             .filter(|e| {
@@ -435,7 +435,7 @@ impl NostrClient {
         let Some(event) = event else {
             anyhow::bail!("Repository '{}' not found (no hashtree event published by {})", repo_name, &self.pubkey[..12]);
         };
-        eprintln!("  [DEBUG] Found event with root hash: {}", &event.content[..12.min(event.content.len())]);
+        debug!("Found event with root hash: {}", &event.content[..12.min(event.content.len())]);
 
         // Get root hash from content or "hash" tag
         let root_hash = event
@@ -511,12 +511,12 @@ impl NostrClient {
     /// Structure: root -> .git/ -> refs/ -> heads/main -> <sha>
     async fn fetch_refs_from_hashtree(&self, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> Result<HashMap<String, String>> {
         let mut refs = HashMap::new();
-        eprintln!("  [DEBUG] fetch_refs_from_hashtree: downloading root {}", &root_hash[..12]);
+        debug!("fetch_refs_from_hashtree: downloading root {}", &root_hash[..12]);
 
         // Download root directory from Blossom - propagate errors properly
         let root_data = match self.blossom.download(root_hash).await {
             Ok(data) => {
-                eprintln!("  [DEBUG] Downloaded {} bytes from blossom", data.len());
+                debug!("Downloaded {} bytes from blossom", data.len());
                 data
             }
             Err(e) => {
@@ -527,25 +527,25 @@ impl NostrClient {
         // Parse root as directory node (decrypt if needed)
         let root_node = match self.decrypt_and_decode(&root_data, encryption_key) {
             Some(node) => {
-                eprintln!("  [DEBUG] Decoded root node with {} links", node.links.len());
+                debug!("Decoded root node with {} links", node.links.len());
                 node
             }
             None => {
-                eprintln!("  [DEBUG] Failed to decode root node (encryption_key: {})", encryption_key.is_some());
+                debug!("Failed to decode root node (encryption_key: {})", encryption_key.is_some());
                 return Ok(refs);
             }
         };
 
         // Find .git directory
-        eprintln!("  [DEBUG] Root links: {:?}", root_node.links.iter().map(|l| l.name.as_deref()).collect::<Vec<_>>());
+        debug!("Root links: {:?}", root_node.links.iter().map(|l| l.name.as_deref()).collect::<Vec<_>>());
         let git_link = root_node.links.iter().find(|l| l.name.as_deref() == Some(".git"));
         let (git_hash, git_key) = match git_link {
             Some(link) => {
-                eprintln!("  [DEBUG] Found .git link with key: {}", link.key.is_some());
+                debug!("Found .git link with key: {}", link.key.is_some());
                 (hex::encode(link.hash), link.key)
             }
             None => {
-                eprintln!("  [DEBUG] No .git directory in hashtree root");
+                debug!("No .git directory in hashtree root");
                 return Ok(refs);
             }
         };
@@ -560,11 +560,11 @@ impl NostrClient {
 
         let git_node = match self.decrypt_and_decode(&git_data, git_key.as_ref()) {
             Some(node) => {
-                eprintln!("  [DEBUG] Decoded .git node with {} links: {:?}", node.links.len(), node.links.iter().map(|l| l.name.as_deref()).collect::<Vec<_>>());
+                debug!("Decoded .git node with {} links: {:?}", node.links.len(), node.links.iter().map(|l| l.name.as_deref()).collect::<Vec<_>>());
                 node
             }
             None => {
-                eprintln!("  [DEBUG] Failed to decode .git node (key: {})", git_key.is_some());
+                debug!("Failed to decode .git node (key: {})", git_key.is_some());
                 return Ok(refs);
             }
         };
