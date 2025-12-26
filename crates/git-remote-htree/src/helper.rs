@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use tracing::{debug, info, warn};
 
 use hashtree_config::Config;
-use crate::nostr_client::NostrClient;
+use crate::nostr_client::{BlossomResult, NostrClient, RelayResult};
 
 // CachedStore: LMDB first, then Blossom fallback
 mod cached_store {
@@ -872,19 +872,20 @@ impl RemoteHelper {
 
         // Push to file servers (blossom) first
         // This makes content available before we advertise the hash
-        let blossom_count = self.push_to_file_servers(&root_hash_hex, chk_key.as_ref());
+        let blossom_result = self.push_to_file_servers(&root_hash_hex, chk_key.as_ref());
 
         // Then publish to nostr (kind 30078 with hashtree label)
         // Include masked key (encryptedKey tag) for private or raw CHK key (key tag) for public repos
         // Don't fail push if relay publish fails - it's just distribution
         let key_with_privacy = key_to_publish.as_ref().map(|k| (k, is_private));
-        let (npub_url, relay_count) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex, key_with_privacy) {
-            Ok((url, count)) => (url, count),
+        let (npub_url, relay_result) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex, key_with_privacy) {
+            Ok((url, result)) => (url, result),
             Err(e) => {
                 warn!("Failed to publish to relays: {}", e);
                 // Construct URL anyway for display using npub
                 let url = format!("htree://{}/{}", self.nostr.npub(), &self.repo_name);
-                (url, 0)
+                let configured = self.nostr.relay_urls();
+                (url, RelayResult { configured: configured.clone(), connected: vec![], failed: configured })
             }
         };
 
@@ -896,8 +897,23 @@ impl RemoteHelper {
         };
 
         // Print summary
-        eprintln!("Published to: {} ({} relays, {} blossom servers)",
-            full_url, relay_count, blossom_count);
+        eprintln!("Published to: {}", full_url);
+
+        // Print relay details
+        if !relay_result.connected.is_empty() {
+            eprintln!("  Relays: {}", relay_result.connected.join(", "));
+        }
+        if !relay_result.failed.is_empty() {
+            eprintln!("  Relays failed: {}", relay_result.failed.join(", "));
+        }
+
+        // Print blossom details
+        if !blossom_result.succeeded.is_empty() {
+            eprintln!("  Blossom: {}", blossom_result.succeeded.join(", "));
+        }
+        if !blossom_result.failed.is_empty() {
+            eprintln!("  Blossom failed: {}", blossom_result.failed.join(", "));
+        }
 
         // Print web viewer URL
         if let Some(path) = npub_url.strip_prefix("htree://") {
@@ -918,14 +934,14 @@ impl RemoteHelper {
 
     /// Push content to file servers (blossom)
     /// Walks the merkle tree from root_hash and uploads blobs as it discovers them
-    /// Returns the number of blossom servers successfully used
-    fn push_to_file_servers(&self, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> usize {
+    /// Returns BlossomResult with server details
+    fn push_to_file_servers(&self, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> BlossomResult {
         use hashtree_core::try_decode_tree_node;
         use hashtree_core::crypto::decrypt_chk;
 
         let store = self.storage.store();
         let blossom = self.nostr.blossom();
-        let blossom_server_count = blossom.write_servers().len();
+        let configured: Vec<String> = blossom.write_servers().to_vec();
 
         // Create runtime for async uploads
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -935,7 +951,11 @@ impl RemoteHelper {
             Ok(rt) => rt,
             Err(e) => {
                 warn!("Failed to create runtime for blossom upload: {}", e);
-                return 0;
+                return BlossomResult {
+                    configured: configured.clone(),
+                    succeeded: vec![],
+                    failed: configured,
+                };
             }
         };
 
@@ -948,7 +968,11 @@ impl RemoteHelper {
             }
             _ => {
                 warn!("Invalid root hash: {}", root_hash);
-                return 0;
+                return BlossomResult {
+                    configured: configured.clone(),
+                    succeeded: vec![],
+                    failed: configured,
+                };
             }
         };
 
@@ -1097,7 +1121,21 @@ impl RemoteHelper {
             final_uploaded > 0 || final_skipped > 0
         });
 
-        if success { blossom_server_count } else { 0 }
+        // For now, we can't track per-server success because blossom client
+        // returns on first successful server. Report all as succeeded if any worked.
+        if success {
+            BlossomResult {
+                configured: configured.clone(),
+                succeeded: configured,
+                failed: vec![],
+            }
+        } else {
+            BlossomResult {
+                configured: configured.clone(),
+                succeeded: vec![],
+                failed: configured,
+            }
+        }
     }
 
     /// Collect all hashes reachable from a root hash by walking the merkle tree
