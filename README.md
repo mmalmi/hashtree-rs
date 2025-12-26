@@ -106,6 +106,11 @@ git push origin main
 
 # Clone with secret key
 git clone htree://npub1.../repo#k=<64-hex-chars>
+
+# Private repo (encrypted, author-only)
+git remote add origin htree://self/myrepo#private
+git push origin main
+git clone htree://self/myrepo#private
 ```
 
 ## Configuration
