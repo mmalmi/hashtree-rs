@@ -231,6 +231,30 @@ fn generate_and_save_key(petname: &str) -> Result<StoredKey> {
 
 use hashtree_config::Config;
 
+/// Result of publishing to relays
+#[derive(Debug, Clone)]
+pub struct RelayResult {
+    /// Relays that were configured
+    #[allow(dead_code)]
+    pub configured: Vec<String>,
+    /// Relays that connected
+    pub connected: Vec<String>,
+    /// Relays that failed to connect
+    pub failed: Vec<String>,
+}
+
+/// Result of uploading to blossom servers
+#[derive(Debug, Clone)]
+pub struct BlossomResult {
+    /// Servers that were configured
+    #[allow(dead_code)]
+    pub configured: Vec<String>,
+    /// Servers that accepted uploads
+    pub succeeded: Vec<String>,
+    /// Servers that failed
+    pub failed: Vec<String>,
+}
+
 /// Nostr client for git operations
 pub struct NostrClient {
     pubkey: String,
@@ -722,6 +746,11 @@ impl NostrClient {
         &self.blossom
     }
 
+    /// Get the configured relay URLs
+    pub fn relay_urls(&self) -> Vec<String> {
+        self.relays.clone()
+    }
+
     /// Get the public key (hex)
     #[allow(dead_code)]
     pub fn pubkey(&self) -> &str {
@@ -741,9 +770,9 @@ impl NostrClient {
     ///   kind: 30078
     ///   tags: [["d", repo_name], ["l", "hashtree"], ["hash", root_hash], ["key"|"encryptedKey", encryption_key]]
     ///   content: <merkle-root-hash>
-    /// Returns: (npub URL, number of relays successfully published to)
+    /// Returns: (npub URL, relay result with connected/failed details)
     /// If is_private is true, uses "encryptedKey" tag (XOR masked); otherwise uses "key" tag (plaintext CHK)
-    pub fn publish_repo(&self, repo_name: &str, root_hash: &str, encryption_key: Option<(&[u8; 32], bool)>) -> Result<(String, usize)> {
+    pub fn publish_repo(&self, repo_name: &str, root_hash: &str, encryption_key: Option<(&[u8; 32], bool)>) -> Result<(String, RelayResult)> {
         let keys = self.keys.as_ref().context(format!(
             "Cannot push: no secret key for {}. You can only push to your own repos.",
             &self.pubkey[..16]
@@ -773,14 +802,19 @@ impl NostrClient {
         repo_name: &str,
         root_hash: &str,
         encryption_key: Option<(&[u8; 32], bool)>,
-    ) -> Result<(String, usize)> {
+    ) -> Result<(String, RelayResult)> {
         // Create nostr-sdk client with our keys
         let client = Client::new(keys.clone());
+
+        let configured: Vec<String> = self.relays.clone();
+        let mut connected: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
 
         // Add relays
         for relay in &self.relays {
             if let Err(e) = client.add_relay(relay).await {
                 warn!("Failed to add relay {}: {}", relay, e);
+                failed.push(relay.clone());
             }
         }
 
@@ -814,12 +848,14 @@ impl NostrClient {
             .to_event(keys)
             .map_err(|e| anyhow::anyhow!("Failed to sign event: {}", e))?;
 
-        // Count connected relays before publishing
+        // Check which relays connected
         let relays = client.relays().await;
-        let mut connected_count = 0;
-        for relay in relays.values() {
+        for (url, relay) in relays.iter() {
+            let url_str = url.to_string();
             if relay.is_connected().await {
-                connected_count += 1;
+                connected.push(url_str);
+            } else if !failed.contains(&url_str) {
+                failed.push(url_str);
             }
         }
 
@@ -829,18 +865,12 @@ impl NostrClient {
             .skip_send_confirmation(true)
             .timeout(Some(Duration::from_secs(3)));
 
-        let relay_count = match client.pool().send_event(event.clone(), send_opts).await {
+        match client.pool().send_event(event.clone(), send_opts).await {
             Ok(output) => {
-                // With skip_send_confirmation, success list may be empty but event was sent
-                // Use connected relay count as the actual number sent to
-                let count = if output.success.is_empty() { connected_count } else { output.success.len() };
-                info!("Sent event {} to {} relays", output.id(), count);
-                count
+                info!("Sent event {} to {} relays", output.id(), connected.len());
             }
             Err(e) => {
                 warn!("Failed to send event: {}", e);
-                // Event may still have been sent to some relays
-                connected_count
             }
         };
 
@@ -853,7 +883,7 @@ impl NostrClient {
         let _ = client.disconnect().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        Ok((npub_url, relay_count))
+        Ok((npub_url, RelayResult { configured, connected, failed }))
     }
 
     /// Upload blob to blossom server
