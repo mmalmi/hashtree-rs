@@ -11,7 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// Threshold for showing detailed progress (3 seconds)
+const VERBOSE_THRESHOLD: Duration = Duration::from_secs(3);
 
 use hashtree_config::Config;
 use crate::nostr_client::{BlossomResult, NostrClient, RelayResult};
@@ -97,6 +101,8 @@ pub struct RemoteHelper {
     url_secret: Option<[u8; 32]>,
     /// Whether this is a private (author-only) repo using NIP-44 encryption
     is_private: bool,
+    /// Start time for current operation (for conditional verbose logging)
+    op_start: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -145,11 +151,35 @@ impl RemoteHelper {
             fetch_specs: Vec::new(),
             url_secret,
             is_private,
+            op_start: None,
         })
     }
 
     pub fn should_exit(&self) -> bool {
         self.should_exit
+    }
+
+    /// Start timing an operation (for conditional verbose logging)
+    fn start_op(&mut self) {
+        self.op_start = Some(Instant::now());
+    }
+
+    /// Check if operation has been running long enough to show details
+    /// Also returns true if HTREE_VERBOSE=1 is set (for testing/debugging)
+    fn is_slow(&self) -> bool {
+        if std::env::var("HTREE_VERBOSE").is_ok() {
+            return true;
+        }
+        self.op_start
+            .map(|start| start.elapsed() >= VERBOSE_THRESHOLD)
+            .unwrap_or(false)
+    }
+
+    /// Log detail message only if operation is slow
+    fn detail(&self, msg: &str) {
+        if self.is_slow() {
+            eprintln!("{}", msg);
+        }
     }
 
     /// Handle a single command from git
@@ -277,6 +307,7 @@ impl RemoteHelper {
 
     /// Execute queued fetch operations
     fn execute_fetch(&mut self) -> Result<()> {
+        self.start_op(); // Start timing for conditional verbose logging
         info!("Fetching {} refs", self.fetch_specs.len());
 
         // Get the cached root hash from nostr (set during list command)
@@ -448,7 +479,11 @@ impl RemoteHelper {
         done.store(true, Ordering::Relaxed);
         let _ = progress_task.await;
         let walk_done_time = std::time::Instant::now();
-        eprintln!("\r  Loading objects tree... done ({} entries)        ", walk_entries.len());
+        if self.is_slow() {
+            eprintln!("\r  Loading objects tree... done ({} entries)        ", walk_entries.len());
+        } else {
+            eprint!("\r                                                        \r"); // Clear the line
+        }
 
         // Extract git objects from walk entries (files with 40 char hex names like "ab/cdef..." -> "abcdef...")
         let mut fetch_tasks: Vec<(String, Cid)> = Vec::new();
@@ -484,7 +519,9 @@ impl RemoteHelper {
 
         let total_objects = fetch_tasks.len();
         let prep_elapsed = walk_done_time.elapsed();
-        eprintln!("  Prepared {} objects in {:?}", total_objects, prep_elapsed);
+        if self.is_slow() {
+            eprintln!("  Prepared {} objects in {:?}", total_objects, prep_elapsed);
+        }
 
         let download_start = std::time::Instant::now();
         let downloaded = StdArc::new(AtomicUsize::new(0));
@@ -532,7 +569,7 @@ impl RemoteHelper {
 
         download_done.store(true, Ordering::Relaxed);
         let _ = timer_task.await;
-        let download_elapsed = download_start.elapsed();
+        let _download_elapsed = download_start.elapsed();
 
         // Collect successes and failures
         let mut failed: Vec<(String, Cid)> = Vec::new();
@@ -544,7 +581,7 @@ impl RemoteHelper {
         }
 
         let success_count = objects.len();
-        eprintln!("\r  Downloading: {}/{} ({:.1?})    ", success_count, total_objects, download_elapsed);
+        eprintln!("\r  Downloading: {}/{}    ", success_count, total_objects);
 
         // Retry failed downloads sequentially
         let mut missing_objects: Vec<(String, String)> = Vec::new(); // (oid, hash)
@@ -673,6 +710,7 @@ impl RemoteHelper {
 
     /// Execute queued push operations
     fn execute_push(&mut self) -> Result<Option<Vec<String>>> {
+        self.start_op(); // Start timing for conditional verbose logging
         debug!(refs_count = self.push_specs.len(), "execute_push called");
         info!("Pushing {} refs", self.push_specs.len());
 
@@ -775,17 +813,17 @@ impl RemoteHelper {
     /// This preserves branches that aren't being pushed
     fn load_existing_remote_state(&mut self) -> Result<()> {
         let data_dir = get_hashtree_data_dir();
-        eprintln!("  Loading existing remote state... (data_dir: {:?})", data_dir);
+        self.detail(&format!("  Loading existing remote state... (data_dir: {:?})", data_dir));
 
         // Fetch refs from nostr (this also caches root hash)
         let (refs, root_hash, _encryption_key) = self.nostr.fetch_refs_with_root(&self.repo_name)?;
 
         if refs.is_empty() {
-            eprintln!("  No existing refs found (new repository)");
+            self.detail("  No existing refs found (new repository)");
             return Ok(());
         }
 
-        eprintln!("  Found {} existing refs", refs.len());
+        self.detail(&format!("  Found {} existing refs", refs.len()));
 
         // Store remote refs for non-fast-forward detection
         self.remote_refs.clear();
@@ -809,7 +847,7 @@ impl RemoteHelper {
         // Fetch all git objects from remote hashtree
         if let Some(root) = root_hash {
             let objects = self.fetch_all_git_objects(&root)?;
-            eprintln!("  Importing {} existing objects", objects.len());
+            self.detail(&format!("  Importing {} existing objects", objects.len()));
 
             for (oid, content) in objects {
                 // Content from hashtree is already the compressed loose object
@@ -818,7 +856,7 @@ impl RemoteHelper {
             }
         }
 
-        eprintln!("  Remote state loaded");
+        self.detail("  Remote state loaded");
         Ok(())
     }
 
@@ -893,13 +931,17 @@ impl RemoteHelper {
         }
 
         // Build the merkle tree
-        eprint!("  Building merkle tree...");
-        let _ = std::io::stderr().flush();
+        if self.is_slow() {
+            eprint!("  Building merkle tree...");
+            let _ = std::io::stderr().flush();
+        }
         let root_cid = self.storage.build_tree()?;
         let root_hash_hex = hex::encode(root_cid.hash);
         let chk_key = root_cid.key;
         let is_link_visible = self.url_secret.is_some();
-        eprintln!(" done (encrypted: {}, link_visible: {}, private: {})", chk_key.is_some(), is_link_visible, self.is_private);
+        if self.is_slow() {
+            eprintln!(" done (encrypted: {}, link_visible: {}, private: {})", chk_key.is_some(), is_link_visible, self.is_private);
+        }
 
         // For private repos: XOR the CHK key with url_secret so only URL holders can decrypt
         // For public repos: publish the CHK key directly
@@ -1051,6 +1093,7 @@ impl RemoteHelper {
             })
         });
 
+        let verbose = self.is_slow(); // Capture before async block
         let success = rt.block_on(async {
             use std::sync::atomic::{AtomicUsize, Ordering};
             use std::sync::Arc;
@@ -1067,12 +1110,16 @@ impl RemoteHelper {
             let old_hashes: HashSet<[u8; 32]> = if let Some(old_root) = old_root_bytes {
                 // Check if old and new root are the same (no changes)
                 if old_root == root_bytes {
-                    eprintln!("  No changes detected (same root hash)");
+                    if verbose {
+                        eprintln!("  No changes detected (same root hash)");
+                    }
                     return true;
                 }
 
-                eprint!("  Computing diff from previous tree...");
-                let _ = std::io::stderr().flush();
+                if verbose {
+                    eprint!("  Computing diff from previous tree...");
+                    let _ = std::io::stderr().flush();
+                }
 
                 // Create a HashTree for the store to use collect_hashes
                 let cached_store = cached_store::CachedStore::new(
@@ -1087,12 +1134,16 @@ impl RemoteHelper {
 
                 match collect_hashes(&tree, &old_cid, 32).await {
                     Ok(hashes) => {
-                        eprintln!(" {} hashes in old tree", hashes.len());
+                        if verbose {
+                            eprintln!(" {} hashes in old tree", hashes.len());
+                        }
                         hashes
                     }
                     Err(e) => {
-                        eprintln!(" failed: {}", e);
-                        eprintln!("  Falling back to full upload");
+                        if verbose {
+                            eprintln!(" failed: {}", e);
+                            eprintln!("  Falling back to full upload");
+                        }
                         HashSet::new()
                     }
                 }
@@ -1122,7 +1173,7 @@ impl RemoteHelper {
                         needs_full.push(server.clone());
                     }
                 }
-                if !needs_full.is_empty() {
+                if !needs_full.is_empty() && verbose {
                     let server_names: Vec<_> = needs_full.iter()
                         .map(|s| s.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or(s))
                         .collect();

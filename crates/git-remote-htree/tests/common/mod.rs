@@ -373,6 +373,10 @@ crawl_depth = 0
                     std::env::var("PATH").unwrap_or_default()
                 ),
             ),
+            (
+                "HTREE_VERBOSE".to_string(),
+                "1".to_string(),
+            ),
         ]
     }
 
