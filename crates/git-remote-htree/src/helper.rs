@@ -904,7 +904,7 @@ impl RemoteHelper {
         };
 
         // Print summary
-        eprintln!("Published to: {} ({} relays, {} blossom servers)",
+        eprintln!("Published to: {} ({} relays, {} blossom servers) [config: ~/.hashtree/config.toml]",
             full_url, relay_count, blossom_count);
 
         // Print web viewer URL
