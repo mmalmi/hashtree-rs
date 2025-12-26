@@ -9,22 +9,16 @@ description = "Simulation tools for hashtree P2P protocols"
 publish = false
 
 [dependencies]
-# Core hashtree crate
+# Core hashtree crates
 hashtree-core.workspace = true
-# WebRTC P2P (for PeerChannel trait and PeerSelector)
 hashtree-webrtc = { path = "../hashtree-webrtc" }
 
-# Core
-async-trait.workspace = true
+# Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 # Simulation
 rand = "0.8"
-lru = "0.12"
-lazy_static = "1.4"
-rmp-serde = "1"
-serde_bytes = "0.11"
 
 # Async runtime
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
@@ -34,8 +28,3 @@ axum = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-
-[[bench]]
-name = "network"
-harness = false
