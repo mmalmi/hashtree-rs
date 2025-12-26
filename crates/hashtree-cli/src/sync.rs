@@ -455,7 +455,7 @@ impl BackgroundSync {
             }
         });
 
-        let cid = Cid { hash, key, size: 0 };
+        let cid = Cid { hash, key };
 
         // Build key
         let npub = event.pubkey.to_bech32().unwrap_or_else(|_| event.pubkey.to_hex());

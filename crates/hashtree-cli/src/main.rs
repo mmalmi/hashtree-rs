@@ -204,7 +204,6 @@ async fn resolve_cid_input(input: &str) -> Result<ResolvedCid> {
             cid: Cid {
                 hash: data.hash,
                 key: data.decrypt_key,
-                size: 0,
             },
             path,
         });
@@ -510,7 +509,7 @@ async fn main() -> Result<()> {
                     }
                 } else {
                     let data = std::fs::read(&path)?;
-                    let cid = tree.put(&data).await
+                    let (cid, _size) = tree.put(&data).await
                         .map_err(|e| anyhow::anyhow!("Failed to hash file: {}", e))?;
                     println!("hash: {}", to_hex(&cid.hash));
                     if let Some(key) = cid.key {
@@ -631,7 +630,7 @@ async fn main() -> Result<()> {
                     let hash = from_hex(&hash_hex).context("Invalid hash")?;
                     let key = key_hex.as_ref().map(|k| key_from_hex(k)).transpose()
                         .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
-                    let cid = Cid { hash, key, size: 0 };
+                    let cid = Cid { hash, key };
 
                     // Build Nostr key: "npub.../ref_name"
                     let nostr_key = format!("{}/{}", npub, ref_name);
@@ -925,7 +924,6 @@ async fn main() -> Result<()> {
             let cid = Cid {
                 hash: hash_bytes,
                 key: key_bytes,
-                size: 0,
             };
 
             // Create resolver config with secret key for publishing
@@ -1649,7 +1647,7 @@ async fn add_directory<S: hashtree_core::store::Store>(
 
         if path.is_file() {
             let data = std::fs::read(path)?;
-            let cid = tree.put(&data).await
+            let (cid, _size) = tree.put(&data).await
                 .map_err(|e| anyhow::anyhow!("Failed to add file {}: {}", path.display(), e))?;
 
             let parent = relative.parent()

@@ -119,7 +119,9 @@ impl RemoteHelper {
         config: Config,
     ) -> Result<Self> {
         // Use shared hashtree storage at ~/.hashtree/data
-        let storage = GitStorage::open(get_hashtree_data_dir())?;
+        let data_dir = get_hashtree_data_dir();
+        eprintln!("  [DEBUG] RemoteHelper::new data_dir={:?}", data_dir);
+        let storage = GitStorage::open(&data_dir)?;
         let nostr = NostrClient::new(pubkey, signing_key, &config)?;
 
         if url_secret.is_some() {
@@ -390,7 +392,6 @@ impl RemoteHelper {
         let root_cid = Cid {
             hash: root_arr,
             key: encryption_key.copied(),
-            size: 0,
         };
 
         // Resolve .git/objects path
@@ -469,7 +470,6 @@ impl RemoteHelper {
                     let obj_cid = Cid {
                         hash: entry.hash,
                         key: entry.key,
-                        size: entry.size,
                     };
                     fetch_tasks.push((oid, obj_cid));
                 }
@@ -480,7 +480,6 @@ impl RemoteHelper {
                     let obj_cid = Cid {
                         hash: entry.hash,
                         key: entry.key,
-                        size: entry.size,
                     };
                     fetch_tasks.push((oid, obj_cid));
                 }
@@ -678,11 +677,13 @@ impl RemoteHelper {
 
     /// Execute queued push operations
     fn execute_push(&mut self) -> Result<Option<Vec<String>>> {
+        eprintln!("  [DEBUG] execute_push called with {} refs", self.push_specs.len());
         info!("Pushing {} refs", self.push_specs.len());
 
         // First, load existing refs and objects from remote to preserve other branches
         // Check if any push is a force push
         let has_force_push = self.push_specs.iter().any(|s| s.force);
+        eprintln!("  [DEBUG] About to call load_existing_remote_state (force={})", has_force_push);
 
         if let Err(e) = self.load_existing_remote_state() {
             if has_force_push {
@@ -696,6 +697,7 @@ impl RemoteHelper {
                     || e.to_string().contains("timeout");
 
                 if is_likely_new_repo {
+                    eprintln!("  [DEBUG] Error loading remote state (likely new repo): {}", e);
                     info!("Could not load existing remote state: {} (likely new repo)", e);
                 } else {
                     // There's an existing remote but we can't load it - warn user
@@ -750,7 +752,8 @@ impl RemoteHelper {
     /// Load existing refs and objects from remote before pushing
     /// This preserves branches that aren't being pushed
     fn load_existing_remote_state(&mut self) -> Result<()> {
-        eprintln!("  Loading existing remote state...");
+        let data_dir = get_hashtree_data_dir();
+        eprintln!("  Loading existing remote state... (data_dir: {:?})", data_dir);
 
         // Fetch refs from nostr (this also caches root hash)
         let (refs, root_hash, _encryption_key) = self.nostr.fetch_refs_with_root(&self.repo_name)?;
@@ -869,7 +872,7 @@ impl RemoteHelper {
 
         // Push to file servers (blossom) first
         // This makes content available before we advertise the hash
-        let blossom_count = self.push_to_file_servers(&root_hash_hex);
+        let blossom_count = self.push_to_file_servers(&root_hash_hex, chk_key.as_ref());
 
         // Then publish to nostr (kind 30078 with hashtree label)
         // Include masked key (encryptedKey tag) for private or raw CHK key (key tag) for public repos
@@ -916,8 +919,9 @@ impl RemoteHelper {
     /// Push content to file servers (blossom)
     /// Walks the merkle tree from root_hash and uploads blobs as it discovers them
     /// Returns the number of blossom servers successfully used
-    fn push_to_file_servers(&self, root_hash: &str) -> usize {
+    fn push_to_file_servers(&self, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> usize {
         use hashtree_core::try_decode_tree_node;
+        use hashtree_core::crypto::decrypt_chk;
 
         let store = self.storage.store();
         let blossom = self.nostr.blossom();
@@ -1009,20 +1013,21 @@ impl RemoteHelper {
             };
 
             // Walk tree and send blobs to upload channel
+            // Queue entries are (hash, optional decryption key)
             let mut visited: HashSet<[u8; 32]> = HashSet::new();
-            let mut queue = vec![root_bytes];
+            let mut queue: Vec<([u8; 32], Option<[u8; 32]>)> = vec![(root_bytes, encryption_key.copied())];
             let mut queued_count = 0usize;
 
             eprint!("  Uploading: 0");
             let _ = std::io::stderr().flush();
 
-            while let Some(hash) = queue.pop() {
+            while let Some((hash, key)) = queue.pop() {
                 if visited.contains(&hash) {
                     continue;
                 }
                 visited.insert(hash);
 
-                // Load blob from store
+                // Load blob from store (stored encrypted)
                 let data = match store.get_sync(&hash) {
                     Ok(Some(data)) => data,
                     Ok(None) => {
@@ -1037,16 +1042,26 @@ impl RemoteHelper {
                     }
                 };
 
-                // Check if it's a tree node and queue children
-                if let Some(node) = try_decode_tree_node(&data) {
+                // Decrypt if we have a key, then check if it's a tree node
+                let plaintext = if let Some(k) = key {
+                    match decrypt_chk(&data, &k) {
+                        Ok(p) => p,
+                        Err(_) => data.clone(), // Decryption failed, try as-is
+                    }
+                } else {
+                    data.clone()
+                };
+
+                // Check if it's a tree node and queue children with their keys
+                if let Some(node) = try_decode_tree_node(&plaintext) {
                     for link in node.links {
                         if !visited.contains(&link.hash) {
-                            queue.push(link.hash);
+                            queue.push((link.hash, link.key));
                         }
                     }
                 }
 
-                // Send blob to upload channel (blocks if channel is full)
+                // Send encrypted blob to upload channel (blossom stores ciphertext)
                 if tx.send(data).await.is_err() {
                     break; // Channel closed
                 }

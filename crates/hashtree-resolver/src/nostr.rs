@@ -149,7 +149,7 @@ impl NostrRootResolver {
             }
         });
 
-        Some(Cid { hash, key, size: 0 })
+        Some(Cid { hash, key })
     }
 
     /// Extract Cid from event with encrypted_key decryption
@@ -185,7 +185,7 @@ impl NostrRootResolver {
             None
         };
 
-        Some(Cid { hash, key, size: 0 })
+        Some(Cid { hash, key })
     }
 
     /// Resolve a key, waiting indefinitely until found.

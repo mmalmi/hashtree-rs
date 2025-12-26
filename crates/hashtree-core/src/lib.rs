@@ -30,7 +30,7 @@
 //!     let tree = HashTree::new(HashTreeConfig::new(store));
 //!
 //!     // Store content (encrypted by default)
-//!     let cid = tree.put(b"Hello, World!").await?;
+//!     let (cid, _size) = tree.put(b"Hello, World!").await?;
 //!
 //!     // Read it back
 //!     let data = tree.get(&cid).await?;

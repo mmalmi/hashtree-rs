@@ -113,6 +113,14 @@ impl Link {
         self.meta = Some(meta);
         self
     }
+
+    /// Convert this link to a Cid (extracts hash and key)
+    pub fn to_cid(&self) -> Cid {
+        Cid {
+            hash: self.hash,
+            key: self.key,
+        }
+    }
 }
 
 /// Tree node - contains links to children
@@ -172,6 +180,8 @@ pub struct PutResult {
 ///
 /// For encrypted content: contains both hash (to locate) and key (to decrypt)
 /// For public content: contains only hash
+///
+/// Note: Size is not part of CID - it's metadata stored in Link/DirEntry
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cid {
     /// SHA256 hash of the (possibly encrypted) content
@@ -179,19 +189,17 @@ pub struct Cid {
     /// Encryption key (content hash of plaintext for CHK)
     /// None for unencrypted/public content
     pub key: Option<[u8; 32]>,
-    /// Size of the original plaintext data
-    pub size: u64,
 }
 
 impl Cid {
     /// Create a new CID for public (unencrypted) content
-    pub fn public(hash: Hash, size: u64) -> Self {
-        Self { hash, key: None, size }
+    pub fn public(hash: Hash) -> Self {
+        Self { hash, key: None }
     }
 
     /// Create a new CID for encrypted content
-    pub fn encrypted(hash: Hash, key: [u8; 32], size: u64) -> Self {
-        Self { hash, key: Some(key), size }
+    pub fn encrypted(hash: Hash, key: [u8; 32]) -> Self {
+        Self { hash, key: Some(key) }
     }
 
     /// Check if this CID refers to encrypted content
@@ -205,10 +213,10 @@ impl Cid {
         if let Some((hash_hex, key_hex)) = s.split_once(':') {
             let hash = from_hex(hash_hex).map_err(|_| CidParseError::InvalidHash)?;
             let key = from_hex(key_hex).map_err(|_| CidParseError::InvalidKey)?;
-            Ok(Self { hash, key: Some(key), size: 0 })
+            Ok(Self { hash, key: Some(key) })
         } else {
             let hash = from_hex(s).map_err(|_| CidParseError::InvalidHash)?;
-            Ok(Self { hash, key: None, size: 0 })
+            Ok(Self { hash, key: None })
         }
     }
 }
@@ -266,12 +274,13 @@ impl DirEntry {
         }
     }
 
-    /// Create from Cid (hash + optional key + size)
+    /// Create from Cid (hash + optional key)
+    /// Use .with_size() to set the size
     pub fn from_cid(name: impl Into<String>, cid: &Cid) -> Self {
         Self {
             name: name.into(),
             hash: cid.hash,
-            size: cid.size,
+            size: 0,
             key: cid.key,
             link_type: LinkType::Blob, // Caller should set this appropriately
             meta: None,

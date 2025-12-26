@@ -144,7 +144,7 @@ mod tests {
         let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
 
         let data = b"Hello from simulated node!";
-        let cid = tree.put(data).await.unwrap();
+        let (cid, _) = tree.put(data).await.unwrap();
 
         let retrieved = tree.get(&cid).await.unwrap().unwrap();
         assert_eq!(retrieved, data);

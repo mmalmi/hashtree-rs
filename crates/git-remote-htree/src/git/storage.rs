@@ -12,7 +12,7 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use hashtree_core::{sha256, Cid, DirEntry, HashTree, HashTreeConfig, LinkType, Store};
+use hashtree_core::{Cid, DirEntry, HashTree, HashTreeConfig, LinkType};
 use hashtree_lmdb::LmdbBlobStore;
 use sha1::{Sha1, Digest};
 use std::collections::HashMap;
@@ -351,10 +351,10 @@ impl GitStorage {
 
         let root_cid = self.runtime.block_on(async {
             // Build objects directory
-            let objects_hash = self.build_objects_dir(&objects).await?;
+            let objects_cid = self.build_objects_dir(&objects).await?;
 
             // Build refs directory
-            let refs_hash = self.build_refs_dir(&refs).await?;
+            let refs_cid = self.build_refs_dir(&refs).await?;
 
             // Build HEAD file - use default_branch if no explicit HEAD
             // Git expects HEAD to end with newline, so add it if missing
@@ -363,15 +363,15 @@ impl GitStorage {
                 .or_else(|| default_branch.as_ref().map(|b| format!("ref: {}\n", b)))
                 .unwrap_or_else(|| "ref: refs/heads/main\n".to_string());
             debug!("HEAD content: {:?}", head_content);
-            let head_hash = self.tree.put_blob(head_content.as_bytes()).await
+            let (head_cid, head_size) = self.tree.put(head_content.as_bytes()).await
                 .map_err(|e| Error::StorageError(format!("put HEAD: {}", e)))?;
-            debug!("HEAD hash: {}", hex::encode(head_hash));
+            debug!("HEAD hash: {}", hex::encode(head_cid.hash));
 
-            // Build .git directory
+            // Build .git directory - use from_cid to preserve encryption keys
             let mut git_entries = vec![
-                DirEntry::new("HEAD", head_hash).with_size(head_content.len() as u64),
-                DirEntry::new("objects", objects_hash).with_link_type(LinkType::Dir),
-                DirEntry::new("refs", refs_hash).with_link_type(LinkType::Dir),
+                DirEntry::from_cid("HEAD", &head_cid).with_size(head_size),
+                DirEntry::from_cid("objects", &objects_cid).with_link_type(LinkType::Dir),
+                DirEntry::from_cid("refs", &refs_cid).with_link_type(LinkType::Dir),
             ];
 
             // Add config if we have a default branch
@@ -380,18 +380,18 @@ impl GitStorage {
                     "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n[init]\n\tdefaultBranch = {}\n",
                     branch.trim_start_matches("refs/heads/")
                 );
-                let config_hash = self.tree.put_blob(config.as_bytes()).await
+                let (config_cid, config_size) = self.tree.put(config.as_bytes()).await
                     .map_err(|e| Error::StorageError(format!("put config: {}", e)))?;
-                git_entries.push(DirEntry::new("config", config_hash).with_size(config.len() as u64));
+                git_entries.push(DirEntry::from_cid("config", &config_cid).with_size(config_size));
             }
 
             // Build and add index file if we have a tree SHA
             if let Some(ref tree_oid) = tree_sha {
                 match self.build_index_file(tree_oid, &objects_clone) {
                     Ok(index_data) => {
-                        let index_hash = self.tree.put_blob(&index_data).await
+                        let (index_cid, index_size) = self.tree.put(&index_data).await
                             .map_err(|e| Error::StorageError(format!("put index: {}", e)))?;
-                        git_entries.push(DirEntry::new("index", index_hash).with_size(index_data.len() as u64));
+                        git_entries.push(DirEntry::from_cid("index", &index_cid).with_size(index_size));
                         info!("Added git index file ({} bytes)", index_data.len());
                     }
                     Err(e) => {
@@ -404,7 +404,8 @@ impl GitStorage {
                 .map_err(|e| Error::StorageError(format!("put .git: {}", e)))?;
 
             // Build root entries starting with .git
-            let mut root_entries = vec![DirEntry::new(".git", git_cid.hash).with_link_type(LinkType::Dir)];
+            // Use from_cid to preserve the encryption key
+            let mut root_entries = vec![DirEntry::from_cid(".git", &git_cid).with_link_type(LinkType::Dir)];
 
             // Add working tree files if we have a tree SHA
             if let Some(ref tree_oid) = tree_sha {
@@ -465,20 +466,22 @@ impl GitStorage {
                 let dir_cid = self.tree.put_directory(sub_entries).await
                     .map_err(|e| Error::StorageError(format!("put dir {}: {}", entry.name, e)))?;
 
+                // Use from_cid to preserve encryption key
                 entries.push(
-                    DirEntry::new(&entry.name, dir_cid.hash)
+                    DirEntry::from_cid(&entry.name, &dir_cid)
                         .with_link_type(LinkType::Dir)
                 );
             } else {
                 // Get blob content
                 if let Some((ObjectType::Blob, blob_content)) = self.get_object_content(&oid_hex, objects) {
                     // Use put() instead of put_blob() to chunk large files
-                    let cid = self.tree.put(&blob_content).await
+                    let (cid, size) = self.tree.put(&blob_content).await
                         .map_err(|e| Error::StorageError(format!("put blob {}: {}", entry.name, e)))?;
 
+                    // Use from_cid to preserve encryption key
                     entries.push(
-                        DirEntry::new(&entry.name, cid.hash)
-                            .with_size(blob_content.len() as u64)
+                        DirEntry::from_cid(&entry.name, &cid)
+                            .with_size(size)
                     );
                 }
             }
@@ -500,12 +503,12 @@ impl GitStorage {
     }
 
     /// Build the objects directory using HashTree
-    async fn build_objects_dir(&self, objects: &HashMap<String, Vec<u8>>) -> Result<[u8; 32]> {
+    async fn build_objects_dir(&self, objects: &HashMap<String, Vec<u8>>) -> Result<Cid> {
         if objects.is_empty() {
-            let empty_hash = sha256(b"");
-            self.store.put(empty_hash, vec![]).await
+            // Return empty directory Cid
+            let empty_cid = self.tree.put_directory(vec![]).await
                 .map_err(|e| Error::StorageError(format!("put empty objects: {}", e)))?;
-            return Ok(empty_hash);
+            return Ok(empty_cid);
         }
 
         // Group objects by first 2 characters of SHA (git loose object structure)
@@ -526,16 +529,17 @@ impl GitStorage {
             for (suffix, data) in objs {
                 // Use put() instead of put_blob() to chunk large objects
                 // Git blobs can be >5MB which exceeds blossom server limits
-                let cid = self.tree.put(&data).await
+                let (cid, size) = self.tree.put(&data).await
                     .map_err(|e| Error::StorageError(format!("put object {}{}: {}", prefix, suffix, e)))?;
-                sub_entries.push(DirEntry::new(suffix, cid.hash).with_size(data.len() as u64));
+                // Use from_cid to preserve encryption key
+                sub_entries.push(DirEntry::from_cid(suffix, &cid).with_size(size));
             }
             // Sort for deterministic ordering
             sub_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
             let sub_cid = self.tree.put_directory(sub_entries).await
                 .map_err(|e| Error::StorageError(format!("put objects/{}: {}", prefix, e)))?;
-            top_entries.push(DirEntry::new(prefix, sub_cid.hash).with_link_type(LinkType::Dir));
+            top_entries.push(DirEntry::from_cid(prefix, &sub_cid).with_link_type(LinkType::Dir));
         }
 
         // Sort for deterministic ordering
@@ -546,11 +550,11 @@ impl GitStorage {
             .map_err(|e| Error::StorageError(format!("put objects dir: {}", e)))?;
 
         debug!("Built objects dir with {} buckets: {}", bucket_count, hex::encode(cid.hash));
-        Ok(cid.hash)
+        Ok(cid)
     }
 
     /// Build the refs directory using HashTree
-    async fn build_refs_dir(&self, refs: &HashMap<String, String>) -> Result<[u8; 32]> {
+    async fn build_refs_dir(&self, refs: &HashMap<String, String>) -> Result<Cid> {
         // Group refs by category (heads, tags, etc.)
         let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
@@ -568,10 +572,11 @@ impl GitStorage {
         for (category, refs_in_category) in groups {
             let mut cat_entries = Vec::new();
             for (name, value) in refs_in_category {
-                let hash = self.tree.put_blob(value.as_bytes()).await
+                // Use put() to get Cid with encryption key
+                let (cid, _size) = self.tree.put(value.as_bytes()).await
                     .map_err(|e| Error::StorageError(format!("put ref: {}", e)))?;
-                debug!("refs/{}/{} -> blob {}", category, name, hex::encode(hash));
-                cat_entries.push(DirEntry::new(name, hash).with_size(value.len() as u64));
+                debug!("refs/{}/{} -> blob {}", category, name, hex::encode(cid.hash));
+                cat_entries.push(DirEntry::from_cid(name, &cid));
             }
 
             cat_entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -579,14 +584,14 @@ impl GitStorage {
             let cat_cid = self.tree.put_directory(cat_entries).await
                 .map_err(|e| Error::StorageError(format!("put {} dir: {}", category, e)))?;
             debug!("refs/{} dir -> {}", category, hex::encode(cat_cid.hash));
-            ref_entries.push(DirEntry::new(category, cat_cid.hash).with_link_type(LinkType::Dir));
+            ref_entries.push(DirEntry::from_cid(category, &cat_cid).with_link_type(LinkType::Dir));
         }
 
         if ref_entries.is_empty() {
-            let empty_hash = sha256(b"");
-            self.store.put(empty_hash, vec![]).await
+            // Return empty directory Cid
+            let empty_cid = self.tree.put_directory(vec![]).await
                 .map_err(|e| Error::StorageError(format!("put empty refs: {}", e)))?;
-            return Ok(empty_hash);
+            return Ok(empty_cid);
         }
 
         ref_entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -594,7 +599,7 @@ impl GitStorage {
         let refs_cid = self.tree.put_directory(ref_entries).await
             .map_err(|e| Error::StorageError(format!("put refs dir: {}", e)))?;
         debug!("refs dir -> {}", hex::encode(refs_cid.hash));
-        Ok(refs_cid.hash)
+        Ok(refs_cid)
     }
 
     /// Build git index file from tree entries

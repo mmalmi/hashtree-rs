@@ -167,7 +167,7 @@ async fn test_file_vectors() {
         };
         let tree = HashTree::new(config);
 
-        let cid = tree.put(&data).await.unwrap();
+        let (cid, size) = tree.put(&data).await.unwrap();
 
         assert_eq!(
             to_hex(&cid.hash),
@@ -177,7 +177,7 @@ async fn test_file_vectors() {
         );
 
         if let Some(expected_size) = vector.expected.size {
-            assert_eq!(cid.size, expected_size, "File size mismatch for {}", vector.name);
+            assert_eq!(size, expected_size, "File size mismatch for {}", vector.name);
         }
 
         println!("✓ {}: hash and size match", vector.name);

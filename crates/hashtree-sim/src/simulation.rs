@@ -789,7 +789,7 @@ impl Simulation {
                     let nodes = self.nodes.read().await;
                     if let Some(owner) = nodes.get(&owner_id) {
                         match owner.tree.put_file(&data).await {
-                            Ok(result) => result.hash,
+                            Ok((cid, _size)) => cid.hash,
                             Err(_) => continue,
                         }
                     } else {
@@ -920,7 +920,7 @@ impl Simulation {
                     let nodes = self.nodes.read().await;
                     if let Some(owner) = nodes.get(&owner_id) {
                         match owner.tree.put_file(&data).await {
-                            Ok(result) => result.hash,
+                            Ok((cid, _size)) => cid.hash,
                             Err(_) => continue,
                         }
                     } else {
@@ -1050,7 +1050,7 @@ impl Simulation {
                 let nodes = self.nodes.read().await;
                 if let Some(owner) = nodes.get(&owner_id) {
                     match owner.tree.put_file(&data).await {
-                        Ok(result) => result.hash,
+                        Ok((cid, _size)) => cid.hash,
                         Err(_) => continue,
                     }
                 } else {
@@ -1179,7 +1179,7 @@ impl Simulation {
                     None => continue,
                 };
                 match owner.tree.put_file(&data).await {
-                    Ok(result) => result.hash,
+                    Ok((cid, _size)) => cid.hash,
                     Err(_) => continue,
                 }
             };

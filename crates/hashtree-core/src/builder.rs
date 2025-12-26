@@ -120,17 +120,17 @@ impl<S: Store> TreeBuilder<S> {
     }
 
     /// Store a file, chunking if necessary
-    /// Returns Cid with hash, optional encryption key, and size
+    /// Returns (Cid, size) where Cid contains hash and optional encryption key
     ///
     /// When encryption is enabled (default), each chunk is CHK encrypted
     /// and the result contains the decryption key.
-    pub async fn put(&self, data: &[u8]) -> Result<Cid, BuilderError> {
+    pub async fn put(&self, data: &[u8]) -> Result<(Cid, u64), BuilderError> {
         let size = data.len() as u64;
 
         // Small file - store as single chunk
         if data.len() <= self.chunk_size {
             let (hash, key) = self.put_chunk_internal(data).await?;
-            return Ok(Cid { hash, key, size });
+            return Ok((Cid { hash, key }, size));
         }
 
         // Large file - chunk it
@@ -156,7 +156,7 @@ impl<S: Store> TreeBuilder<S> {
         // Build tree from chunks
         let (root_hash, root_key) = self.build_tree_internal(links, Some(size)).await?;
 
-        Ok(Cid { hash: root_hash, key: root_key, size })
+        Ok((Cid { hash: root_hash, key: root_key }, size))
     }
 
     /// Build tree and return (hash, optional_key)
@@ -694,9 +694,9 @@ mod tests {
         let builder = TreeBuilder::new(BuilderConfig::new(store.clone()).public());
 
         let data = vec![1u8, 2, 3, 4, 5];
-        let cid = builder.put(&data).await.unwrap();
+        let (cid, size) = builder.put(&data).await.unwrap();
 
-        assert_eq!(cid.size, 5);
+        assert_eq!(size, 5);
         assert!(cid.key.is_none()); // public content
         let retrieved = store.get(&cid.hash).await.unwrap();
         assert_eq!(retrieved, Some(data));
@@ -713,8 +713,8 @@ mod tests {
             data[i] = (i % 256) as u8;
         }
 
-        let cid = builder.put(&data).await.unwrap();
-        assert_eq!(cid.size, data.len() as u64);
+        let (_cid, size) = builder.put(&data).await.unwrap();
+        assert_eq!(size, data.len() as u64);
 
         // Verify store has multiple items (chunks + tree node)
         assert!(store.size() > 1);
@@ -873,9 +873,9 @@ mod tests {
         let builder = TreeBuilder::new(config);
 
         let data = b"Hello, World!";
-        let cid = builder.put(data).await.unwrap();
+        let (cid, size) = builder.put(data).await.unwrap();
 
-        assert_eq!(cid.size, data.len() as u64);
+        assert_eq!(size, data.len() as u64);
         assert!(cid.key.is_none()); // No encryption key for public content
         assert!(store.has(&cid.hash).await.unwrap());
     }
@@ -890,9 +890,9 @@ mod tests {
         let builder = TreeBuilder::new(config);
 
         let data = b"Hello, encrypted world!";
-        let cid = builder.put(data).await.unwrap();
+        let (cid, size) = builder.put(data).await.unwrap();
 
-        assert_eq!(cid.size, data.len() as u64);
+        assert_eq!(size, data.len() as u64);
         assert!(cid.key.is_some()); // Has encryption key
 
         // Verify we can read it back
@@ -911,9 +911,9 @@ mod tests {
 
         // Data larger than chunk size
         let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
-        let cid = builder.put(&data).await.unwrap();
+        let (cid, size) = builder.put(&data).await.unwrap();
 
-        assert_eq!(cid.size, data.len() as u64);
+        assert_eq!(size, data.len() as u64);
         assert!(cid.key.is_some());
 
         // Verify roundtrip
@@ -930,8 +930,8 @@ mod tests {
 
         let data = b"Same content produces same CID";
 
-        let cid1 = builder.put(data).await.unwrap();
-        let cid2 = builder.put(data).await.unwrap();
+        let (cid1, _) = builder.put(data).await.unwrap();
+        let (cid2, _) = builder.put(data).await.unwrap();
 
         // CHK: same content = same hash AND same key
         assert_eq!(cid1.hash, cid2.hash);

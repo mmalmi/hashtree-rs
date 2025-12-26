@@ -122,15 +122,15 @@ impl<S: Store> HashTree<S> {
 
     // ============ UNIFIED API ============
 
-    /// Store content, returns Cid (hash + optional key)
+    /// Store content, returns (Cid, size) where Cid is hash + optional key
     /// Encrypts by default when encryption feature is enabled
-    pub async fn put(&self, data: &[u8]) -> Result<Cid, HashTreeError> {
+    pub async fn put(&self, data: &[u8]) -> Result<(Cid, u64), HashTreeError> {
         let size = data.len() as u64;
 
         // Small data - store as single chunk
         if data.len() <= self.chunk_size {
             let (hash, key) = self.put_chunk_internal(data).await?;
-            return Ok(Cid { hash, key, size });
+            return Ok((Cid { hash, key }, size));
         }
 
         // Large data - chunk it
@@ -155,7 +155,7 @@ impl<S: Store> HashTree<S> {
 
         // Build tree from chunks
         let (root_hash, root_key) = self.build_tree_internal(links, Some(size)).await?;
-        Ok(Cid { hash: root_hash, key: root_key, size })
+        Ok((Cid { hash: root_hash, key: root_key }, size))
     }
 
     /// Get content by Cid (handles decryption automatically)
@@ -171,7 +171,8 @@ impl<S: Store> HashTree<S> {
     ///
     /// Reads data in chunks and builds a merkle tree incrementally.
     /// Useful for large files or streaming data sources.
-    pub async fn put_stream<R: AsyncRead + Unpin>(&self, mut reader: R) -> Result<Cid, HashTreeError> {
+    /// Returns (Cid, size) where Cid is hash + optional key
+    pub async fn put_stream<R: AsyncRead + Unpin>(&self, mut reader: R) -> Result<(Cid, u64), HashTreeError> {
         let mut buffer = vec![0u8; self.chunk_size];
         let mut links = Vec::new();
         let mut total_size: u64 = 0;
@@ -221,12 +222,12 @@ impl<S: Store> HashTree<S> {
         if links.is_empty() {
             // Empty input
             let (hash, key) = self.put_chunk_internal(&[]).await?;
-            return Ok(Cid { hash, key, size: 0 });
+            return Ok((Cid { hash, key }, 0));
         }
 
         // Build tree from chunks
         let (root_hash, root_key) = self.build_tree_internal(links, Some(total_size)).await?;
-        Ok(Cid { hash: root_hash, key: root_key, size: total_size })
+        Ok((Cid { hash: root_hash, key: root_key }, total_size))
     }
 
     /// Read content as a stream of chunks by Cid (handles decryption automatically)
@@ -514,14 +515,14 @@ impl<S: Store> HashTree<S> {
     }
 
     /// Store a file, chunking if necessary
-    /// Returns Cid with hash, key (if encrypted), and size
-    pub async fn put_file(&self, data: &[u8]) -> Result<Cid, HashTreeError> {
+    /// Returns (Cid, size) where Cid is hash + optional key
+    pub async fn put_file(&self, data: &[u8]) -> Result<(Cid, u64), HashTreeError> {
         let size = data.len() as u64;
 
         // Small file - store as single chunk
         if data.len() <= self.chunk_size {
             let (hash, key) = self.put_chunk_internal(data).await?;
-            return Ok(Cid { hash, key, size });
+            return Ok((Cid { hash, key }, size));
         }
 
         // Large file - chunk it
@@ -547,7 +548,7 @@ impl<S: Store> HashTree<S> {
 
         // Build tree from chunks (uses encryption if enabled)
         let (root_hash, root_key) = self.build_tree_internal(links, Some(size)).await?;
-        Ok(Cid { hash: root_hash, key: root_key, size })
+        Ok((Cid { hash: root_hash, key: root_key }, size))
     }
 
     /// Build a directory from entries
@@ -575,8 +576,6 @@ impl<S: Store> HashTree<S> {
             })
             .collect();
 
-        let total_size: u64 = links.iter().map(|l| l.size).sum();
-
         // Create the directory node with all entries
         let node = TreeNode {
             node_type: LinkType::Dir,
@@ -588,8 +587,8 @@ impl<S: Store> HashTree<S> {
         // For small dirs, stores as single chunk
         // For large dirs, chunks transparently via build_tree()
         // Reader uses read_file() to reassemble before decoding
-        let cid = self.put(&data).await?;
-        Ok(Cid { hash: cid.hash, key: cid.key, size: total_size })
+        let (cid, _size) = self.put(&data).await?;
+        Ok(cid)
     }
 
     /// Build a balanced tree from links
@@ -961,7 +960,7 @@ impl<S: Store> HashTree<S> {
             // Skip internal chunk nodes - recurse into them
             if let Some(ref name) = link.name {
                 if name.starts_with("_chunk_") || name.starts_with('_') {
-                    let chunk_cid = Cid { hash: link.hash, key: link.key, size: link.size };
+                    let chunk_cid = Cid { hash: link.hash, key: link.key };
                     let sub_entries = Box::pin(self.list(&chunk_cid)).await?;
                     entries.extend(sub_entries);
                     continue;
@@ -997,7 +996,7 @@ impl<S: Store> HashTree<S> {
             if let Some(ref name) = link.name {
                 if name.starts_with("_chunk_") || name.starts_with('_') {
                     // Internal nodes inherit parent's key for decryption
-                    let sub_cid = Cid { hash: link.hash, key: cid.key, size: 0 };
+                    let sub_cid = Cid { hash: link.hash, key: cid.key };
                     let sub_entries = Box::pin(self.list_directory(&sub_cid)).await?;
                     entries.extend(sub_entries);
                     continue;
@@ -1037,7 +1036,6 @@ impl<S: Store> HashTree<S> {
                 current_cid = Cid {
                     hash: link.hash,
                     key: link.key,
-                    size: link.size,
                 };
             } else {
                 // Check internal nodes
@@ -1046,7 +1044,6 @@ impl<S: Store> HashTree<S> {
                         current_cid = Cid {
                             hash: link.hash,
                             key: link.key,
-                            size: link.size,
                         };
                     }
                     None => return Ok(None),
@@ -1080,7 +1077,6 @@ impl<S: Store> HashTree<S> {
             let sub_cid = Cid {
                 hash: link.hash,
                 key: link.key.clone(),
-                size: link.size,
             };
 
             let sub_node = match self.get_node(&sub_cid).await? {
@@ -1173,7 +1169,7 @@ impl<S: Store> HashTree<S> {
                 Some(name) => {
                     if name.starts_with("_chunk_") || name.starts_with('_') {
                         // Internal nodes inherit parent's key
-                        let sub_cid = Cid { hash: link.hash, key: cid.key, size: 0 };
+                        let sub_cid = Cid { hash: link.hash, key: cid.key };
                         Box::pin(self.walk_recursive(&sub_cid, path, entries)).await?;
                         continue;
                     }
@@ -1187,7 +1183,7 @@ impl<S: Store> HashTree<S> {
             };
 
             // Child nodes use their own key from link
-            let child_cid = Cid { hash: link.hash, key: link.key, size: link.size };
+            let child_cid = Cid { hash: link.hash, key: link.key };
             Box::pin(self.walk_recursive(&child_cid, &child_path, entries)).await?;
         }
 
@@ -1297,7 +1293,7 @@ impl<S: Store> HashTree<S> {
                         Some(name) => {
                             if name.starts_with("_chunk_") || name.starts_with('_') {
                                 // Internal chunked nodes - inherit parent's key, same path
-                                let sub_cid = Cid { hash: link.hash, key: node_cid.key, size: 0 };
+                                let sub_cid = Cid { hash: link.hash, key: node_cid.key };
                                 pending.push_back((sub_cid, node_path.clone()));
                                 continue;
                             }
@@ -1327,7 +1323,7 @@ impl<S: Store> HashTree<S> {
                     }
 
                     // For tree nodes (File/Dir), we need to fetch to see their children
-                    let child_cid = Cid { hash: link.hash, key: link.key, size: link.size };
+                    let child_cid = Cid { hash: link.hash, key: link.key };
                     pending.push_back((child_cid, child_path));
                 }
             }
@@ -1490,6 +1486,7 @@ impl<S: Store> HashTree<S> {
         path: &[&str],
         name: &str,
         entry_cid: &Cid,
+        size: u64,
         link_type: LinkType,
     ) -> Result<Cid, HashTreeError> {
         let dir_cid = self.resolve_path_array(root, path).await?;
@@ -1512,7 +1509,7 @@ impl<S: Store> HashTree<S> {
         new_entries.push(DirEntry {
             name: name.to_string(),
             hash: entry_cid.hash,
-            size: entry_cid.size,
+            size,
             key: entry_cid.key,
             link_type,
             meta: None,
@@ -1625,15 +1622,15 @@ impl<S: Store> HashTree<S> {
         let entry_cid = Cid {
             hash: entry.hash,
             key: entry.key,
-            size: entry.size,
         };
+        let entry_size = entry.size;
         let entry_link_type = entry.link_type;
 
         // Remove from source
         let new_root = self.remove_entry(root, source_path, name).await?;
 
         // Add to target
-        self.set_entry(&new_root, target_path, name, &entry_cid, entry_link_type).await
+        self.set_entry(&new_root, target_path, name, &entry_cid, entry_size, entry_link_type).await
     }
 
     async fn resolve_path_array(&self, root: &Cid, path: &[&str]) -> Result<Option<Cid>, HashTreeError> {
@@ -1676,7 +1673,7 @@ impl<S: Store> HashTree<S> {
                         DirEntry {
                             name: e.name,
                             hash: child_cid.hash,
-                            size: child_cid.size,
+                            size: 0, // Directories don't have a meaningful size in the link
                             key: child_cid.key,
                             link_type: e.link_type,
                             meta: e.meta,
@@ -1828,11 +1825,11 @@ mod tests {
         let (_store, tree) = make_tree();
 
         let data = b"Hello, World!";
-        let result = tree.put_file(data).await.unwrap();
+        let (cid, size) = tree.put_file(data).await.unwrap();
 
-        assert_eq!(result.size, data.len() as u64);
+        assert_eq!(size, data.len() as u64);
 
-        let read_data = tree.read_file(&result.hash).await.unwrap();
+        let read_data = tree.read_file(&cid.hash).await.unwrap();
         assert_eq!(read_data, Some(data.to_vec()));
     }
 
@@ -1896,9 +1893,9 @@ mod tests {
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
         let data = b"Hello, public world!";
-        let cid = tree.put(data).await.unwrap();
+        let (cid, size) = tree.put(data).await.unwrap();
 
-        assert_eq!(cid.size, data.len() as u64);
+        assert_eq!(size, data.len() as u64);
         assert!(cid.key.is_none()); // No key for public content
 
         let retrieved = tree.get(&cid).await.unwrap().unwrap();
@@ -1912,9 +1909,9 @@ mod tests {
         let tree = HashTree::new(HashTreeConfig::new(store));
 
         let data = b"Hello, encrypted world!";
-        let cid = tree.put(data).await.unwrap();
+        let (cid, size) = tree.put(data).await.unwrap();
 
-        assert_eq!(cid.size, data.len() as u64);
+        assert_eq!(size, data.len() as u64);
         assert!(cid.key.is_some()); // Has encryption key
 
         let retrieved = tree.get(&cid).await.unwrap().unwrap();
@@ -1928,9 +1925,9 @@ mod tests {
 
         // Data larger than chunk size
         let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
-        let cid = tree.put(&data).await.unwrap();
+        let (cid, size) = tree.put(&data).await.unwrap();
 
-        assert_eq!(cid.size, data.len() as u64);
+        assert_eq!(size, data.len() as u64);
         assert!(cid.key.is_some());
 
         let retrieved = tree.get(&cid).await.unwrap().unwrap();
@@ -1944,8 +1941,8 @@ mod tests {
 
         let data = b"Same content produces same CID";
 
-        let cid1 = tree.put(data).await.unwrap();
-        let cid2 = tree.put(data).await.unwrap();
+        let (cid1, _) = tree.put(data).await.unwrap();
+        let (cid2, _) = tree.put(data).await.unwrap();
 
         // CHK: same content = same hash AND same key
         assert_eq!(cid1.hash, cid2.hash);
@@ -1958,7 +1955,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
-        let cid = tree.put(b"test").await.unwrap();
+        let (cid, _) = tree.put(b"test").await.unwrap();
         let s = cid.to_string();
 
         // Public CID is just the hash (64 hex chars)
@@ -1971,7 +1968,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let tree = HashTree::new(HashTreeConfig::new(store));
 
-        let cid = tree.put(b"test").await.unwrap();
+        let (cid, _) = tree.put(b"test").await.unwrap();
         let s = cid.to_string();
 
         // Encrypted CID is "hash:key" (64 + 1 + 64 = 129 chars)

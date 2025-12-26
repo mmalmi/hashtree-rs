@@ -463,7 +463,7 @@ impl HashtreeStore {
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
-        let cid = sync_block_on(async {
+        let (cid, _size) = sync_block_on(async {
             tree.put(&file_content).await
         }).context("Failed to store file")?;
 
@@ -494,7 +494,7 @@ impl HashtreeStore {
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store).public());
 
-        let cid = sync_block_on(async {
+        let (cid, _size) = sync_block_on(async {
             tree.put(&data).await
         }).context("Failed to store file")?;
 
@@ -570,7 +570,7 @@ impl HashtreeStore {
 
             if path.is_file() {
                 let content = std::fs::read(path)?;
-                let cid = tree.put(&content).await
+                let (cid, _size) = tree.put(&content).await
                     .map_err(|e| anyhow::anyhow!("Failed to upload file {}: {}", path.display(), e))?;
 
                 // Get parent directory path and file name
@@ -652,7 +652,7 @@ impl HashtreeStore {
         let store = self.store_arc();
         let tree = HashTree::new(HashTreeConfig::new(store));
 
-        let cid = sync_block_on(async {
+        let (cid, _size) = sync_block_on(async {
             tree.put(&file_content).await
         }).map_err(|e| anyhow::anyhow!("Failed to encrypt file: {}", e))?;
 
@@ -1106,7 +1106,7 @@ impl HashtreeStore {
             }
 
             // Get directory entries (public Cid - no encryption key)
-            let cid = hashtree_core::Cid::public(*hash, 0);
+            let cid = hashtree_core::Cid::public(*hash);
             let tree_entries = tree.list_directory(&cid).await
                 .map_err(|e| anyhow::anyhow!("Failed to list directory: {}", e))?;
 

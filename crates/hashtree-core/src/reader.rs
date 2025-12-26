@@ -591,7 +591,7 @@ mod tests {
         let reader = TreeReader::new(store);
 
         let data = vec![1u8, 2, 3, 4, 5];
-        let cid = builder.put(&data).await.unwrap();
+        let (cid, _size) = builder.put(&data).await.unwrap();
 
         let result = reader.read_file(&cid.hash).await.unwrap();
         assert_eq!(result, Some(data));
@@ -609,7 +609,7 @@ mod tests {
             data[i] = (i % 256) as u8;
         }
 
-        let cid = builder.put(&data).await.unwrap();
+        let (cid, _size) = builder.put(&data).await.unwrap();
         let result = reader.read_file(&cid.hash).await.unwrap();
 
         assert_eq!(result, Some(data));
@@ -741,7 +741,7 @@ mod tests {
         let builder = TreeBuilder::new(config);
 
         let data = vec![0u8; 350];
-        let cid = builder.put(&data).await.unwrap();
+        let (cid, _size) = builder.put(&data).await.unwrap();
 
         let result = verify_tree(store, &cid.hash).await.unwrap();
         assert!(result.valid);
@@ -755,7 +755,7 @@ mod tests {
         let builder = TreeBuilder::new(config);
 
         let data = vec![0u8; 350];
-        let cid = builder.put(&data).await.unwrap();
+        let (cid, _size) = builder.put(&data).await.unwrap();
 
         // Delete one of the chunks
         let keys = store.keys();
