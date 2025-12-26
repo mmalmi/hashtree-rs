@@ -557,8 +557,8 @@ impl NostrClient {
                             }
                             Err(e) => {
                                 anyhow::bail!(
-                                    "Failed to decrypt private repo key: {}\n\
-                                     This repo is private (author-only). You may not be the author.",
+                                    "Failed to decrypt private repo: {}\n\
+                                     The repo may be corrupted or published with a different key.",
                                     e
                                 );
                             }
@@ -568,8 +568,9 @@ impl NostrClient {
                     }
                 } else {
                     anyhow::bail!(
-                        "This repo is private (author-only).\n\
-                         You need the author's secret key to access it."
+                        "Cannot access this private repo.\n\
+                         Private repos can only be accessed by their author.\n\
+                         You don't have the secret key for this repo's owner."
                     );
                 }
             }
