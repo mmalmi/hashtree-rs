@@ -820,17 +820,19 @@ impl RemoteHelper {
         // Build the merkle tree
         eprint!("  Building merkle tree...");
         let _ = std::io::stderr().flush();
-        let root_hash = self.storage.build_tree()?;
-        let root_hash_hex = hex::encode(root_hash);
-        eprintln!(" done");
+        let root_cid = self.storage.build_tree()?;
+        let root_hash_hex = hex::encode(root_cid.hash);
+        let encryption_key = root_cid.key;
+        eprintln!(" done (encrypted: {})", encryption_key.is_some());
 
         // Push to file servers (blossom) first
         // This makes content available before we advertise the hash
         let blossom_count = self.push_to_file_servers(&root_hash_hex);
 
         // Then publish to nostr (kind 30078 with hashtree label)
+        // Include encryption key if present
         // Don't fail push if relay publish fails - it's just distribution
-        let (npub_url, relay_count) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex) {
+        let (npub_url, relay_count) = match self.nostr.publish_repo(&self.repo_name, &root_hash_hex, encryption_key.as_ref()) {
             Ok((url, count)) => (url, count),
             Err(e) => {
                 warn!("Failed to publish to relays: {}", e);

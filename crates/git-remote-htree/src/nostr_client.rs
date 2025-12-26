@@ -717,16 +717,17 @@ impl NostrClient {
     /// Publish repository to nostr as kind 30078 event
     /// Format:
     ///   kind: 30078
-    ///   tags: [["d", repo_name], ["l", "hashtree"], ["hash", root_hash]]
+    ///   tags: [["d", repo_name], ["l", "hashtree"], ["hash", root_hash], ["key", encryption_key]]
     ///   content: <merkle-root-hash>
     /// Returns: (npub URL, number of relays successfully published to)
-    pub fn publish_repo(&self, repo_name: &str, root_hash: &str) -> Result<(String, usize)> {
+    pub fn publish_repo(&self, repo_name: &str, root_hash: &str, encryption_key: Option<&[u8; 32]>) -> Result<(String, usize)> {
         let keys = self.keys.as_ref().context(format!(
             "Cannot push: no secret key for {}. You can only push to your own repos.",
             &self.pubkey[..16]
         ))?;
 
-        info!("Publishing repo {} with root hash {}", repo_name, root_hash);
+        info!("Publishing repo {} with root hash {} (encrypted: {})",
+            repo_name, root_hash, encryption_key.is_some());
 
         // Create a new multi-threaded runtime for nostr-sdk which spawns background tasks
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -734,7 +735,7 @@ impl NostrClient {
             .build()
             .context("Failed to create tokio runtime")?;
 
-        rt.block_on(self.publish_repo_async(keys, repo_name, root_hash))
+        rt.block_on(self.publish_repo_async(keys, repo_name, root_hash, encryption_key))
     }
 
     async fn publish_repo_async(
@@ -742,6 +743,7 @@ impl NostrClient {
         keys: &Keys,
         repo_name: &str,
         root_hash: &str,
+        encryption_key: Option<&[u8; 32]>,
     ) -> Result<(String, usize)> {
         // Create nostr-sdk client with our keys
         let client = Client::new(keys.clone());
@@ -762,6 +764,11 @@ impl NostrClient {
             Tag::custom(TagKind::custom("l"), vec![LABEL_HASHTREE.to_string()]),
             Tag::custom(TagKind::custom("hash"), vec![root_hash.to_string()]),
         ];
+
+        // Add encryption key if present (required for decryption)
+        if let Some(key) = encryption_key {
+            tags.push(Tag::custom(TagKind::custom("key"), vec![hex::encode(key)]));
+        }
 
         // Add directory prefix labels for discoverability
         // e.g. "docs/travel/doc1" -> ["l", "docs"], ["l", "docs/travel"]

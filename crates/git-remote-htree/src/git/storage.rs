@@ -12,7 +12,7 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use hashtree_core::{sha256, DirEntry, HashTree, HashTreeConfig, LinkType, Store};
+use hashtree_core::{sha256, Cid, DirEntry, HashTree, HashTreeConfig, LinkType, Store};
 use hashtree_lmdb::LmdbBlobStore;
 use sha1::{Sha1, Digest};
 use std::collections::HashMap;
@@ -52,7 +52,8 @@ pub struct GitStorage {
     /// In-memory state for the current session
     objects: std::sync::RwLock<HashMap<String, Vec<u8>>>,
     refs: std::sync::RwLock<HashMap<String, String>>,
-    root_hash: std::sync::RwLock<Option<[u8; 32]>>,
+    /// Cached root CID (hash + encryption key)
+    root_cid: std::sync::RwLock<Option<Cid>>,
 }
 
 impl GitStorage {
@@ -73,7 +74,8 @@ impl GitStorage {
                 .map_err(|e| Error::StorageError(format!("lmdb: {}", e)))?,
         );
 
-        let tree = HashTree::new(HashTreeConfig::new(store.clone()).public());
+        // Use encrypted mode (default) - blossom servers require encrypted data
+        let tree = HashTree::new(HashTreeConfig::new(store.clone()));
 
         Ok(Self {
             store,
@@ -81,7 +83,7 @@ impl GitStorage {
             runtime,
             objects: std::sync::RwLock::new(HashMap::new()),
             refs: std::sync::RwLock::new(HashMap::new()),
-            root_hash: std::sync::RwLock::new(None),
+            root_cid: std::sync::RwLock::new(None),
         })
     }
 
@@ -100,7 +102,7 @@ impl GitStorage {
         objects.insert(key, compressed);
 
         // Invalidate cached root
-        if let Ok(mut root) = self.root_hash.write() {
+        if let Ok(mut root) = self.root_cid.write() {
             *root = None;
         }
 
@@ -144,7 +146,7 @@ impl GitStorage {
         refs.insert(name.to_string(), value);
 
         // Invalidate cached root
-        if let Ok(mut root) = self.root_hash.write() {
+        if let Ok(mut root) = self.root_cid.write() {
             *root = None;
         }
 
@@ -186,7 +188,7 @@ impl GitStorage {
         let existed = refs.remove(name).is_some();
 
         // Invalidate cached root
-        if let Ok(mut root) = self.root_hash.write() {
+        if let Ok(mut root) = self.root_cid.write() {
             *root = None;
         }
 
@@ -201,7 +203,7 @@ impl GitStorage {
         objects.insert(oid.to_string(), compressed_data);
 
         // Invalidate cached root
-        if let Ok(mut root) = self.root_hash.write() {
+        if let Ok(mut root) = self.root_cid.write() {
             *root = None;
         }
 
@@ -215,7 +217,7 @@ impl GitStorage {
         refs.insert(name.to_string(), value.to_string());
 
         // Invalidate cached root
-        if let Ok(mut root) = self.root_hash.write() {
+        if let Ok(mut root) = self.root_cid.write() {
             *root = None;
         }
 
@@ -236,12 +238,12 @@ impl GitStorage {
         Ok(objects.len())
     }
 
-    /// Get the cached root hash (returns None if tree hasn't been built)
+    /// Get the cached root CID (returns None if tree hasn't been built)
     #[allow(dead_code)]
-    pub fn get_root_hash(&self) -> Result<Option<[u8; 32]>> {
-        let root = self.root_hash.read()
+    pub fn get_root_cid(&self) -> Result<Option<Cid>> {
+        let root = self.root_cid.read()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-        Ok(*root)
+        Ok(root.clone())
     }
 
     /// Get the default branch name
@@ -306,12 +308,12 @@ impl GitStorage {
         Some((obj_type, content))
     }
 
-    /// Build the hashtree and return the root hash
-    pub fn build_tree(&self) -> Result<[u8; 32]> {
+    /// Build the hashtree and return the root CID (hash + encryption key)
+    pub fn build_tree(&self) -> Result<Cid> {
         // Check if we have a cached root
-        if let Ok(root) = self.root_hash.read() {
-            if let Some(hash) = *root {
-                return Ok(hash);
+        if let Ok(root) = self.root_cid.read() {
+            if let Some(ref cid) = *root {
+                return Ok(cid.clone());
             }
         }
 
@@ -347,7 +349,7 @@ impl GitStorage {
         // Clone objects for async block
         let objects_clone = objects.clone();
 
-        let root_hash = self.runtime.block_on(async {
+        let root_cid = self.runtime.block_on(async {
             // Build objects directory
             let objects_hash = self.build_objects_dir(&objects).await?;
 
@@ -417,17 +419,20 @@ impl GitStorage {
             let root_cid = self.tree.put_directory(root_entries).await
                 .map_err(|e| Error::StorageError(format!("put root: {}", e)))?;
 
-            info!("Built hashtree root: {} (.git dir: {})", hex::encode(root_cid.hash), hex::encode(git_cid.hash));
+            info!("Built hashtree root: {} (encrypted: {}) (.git dir: {})",
+                hex::encode(root_cid.hash),
+                root_cid.key.is_some(),
+                hex::encode(git_cid.hash));
 
-            Ok::<[u8; 32], Error>(root_cid.hash)
+            Ok::<Cid, Error>(root_cid)
         })?;
 
-        // Cache the root hash
-        if let Ok(mut root) = self.root_hash.write() {
-            *root = Some(root_hash);
+        // Cache the root CID
+        if let Ok(mut root) = self.root_cid.write() {
+            *root = Some(root_cid.clone());
         }
 
-        Ok(root_hash)
+        Ok(root_cid)
     }
 
     /// Build working tree entries from a git tree object
@@ -780,7 +785,7 @@ impl GitStorage {
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
         let mut refs = self.refs.write()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
-        let mut root = self.root_hash.write()
+        let mut root = self.root_cid.write()
             .map_err(|e| Error::StorageError(format!("lock: {}", e)))?;
 
         objects.clear();
