@@ -7,8 +7,11 @@
 //! 4. Clone to new directory via `git clone htree://self/<repo>`
 //! 5. Verify files match
 //!
+//! **Prerequisites**: The `git-remote-htree` binary must be built first:
+//!   cargo build -p git-remote-htree
+//!
 //! By default, tests use local blossom + nostr servers for isolation.
-//! Set USE_PRODUCTION_SERVERS=1 to test against real infrastructure.
+//! Production tests require network access.
 //!
 //! Run with: cargo test --package git-remote-htree --test git_roundtrip -- --nocapture
 
@@ -397,6 +400,9 @@ fn find_git_remote_htree_dir() -> Option<PathBuf> {
     } else if debug_dir.join("git-remote-htree").exists() {
         Some(debug_dir)
     } else {
+        // Binary not found - print helpful message
+        eprintln!("WARNING: git-remote-htree binary not found in target/debug or target/release.");
+        eprintln!("Run: cargo build -p git-remote-htree");
         None
     }
 }
