@@ -966,10 +966,6 @@ impl RemoteHelper {
             eprintln!("View at: {}", viewer_url);
         }
 
-        if is_private {
-            eprintln!("Note: This is a private repo. Share the full URL with #k= to grant access.");
-        }
-
         Ok(())
     }
 
