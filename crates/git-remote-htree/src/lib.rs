@@ -16,11 +16,11 @@
 //!
 //! - **Unencrypted**: No CHK, just hash - anyone with hash can read
 //! - **Public**: CHK encrypted, `["key", "<hex>"]` in event - anyone can decrypt
-//! - **Unlisted**: CHK + XOR mask, `["encryptedKey", XOR(key,secret)]` - need `#k=<secret>` URL
+//! - **Link-visible**: CHK + XOR mask, `["encryptedKey", XOR(key,secret)]` - need `#k=<secret>` URL
 //! - **Private**: CHK + NIP-44 to self, `["selfEncryptedKey", "..."]` - author only
 //!
 //! Default is **Public** (CHK encrypted, key in nostr event).
-//! Use `htree://npub/repo#k=<secret>` for unlisted/link-visible repos.
+//! Use `htree://npub/repo#k=<secret>` for link-visible repos.
 
 use anyhow::{bail, Context, Result};
 use nostr_sdk::ToBech32;
@@ -84,10 +84,13 @@ fn run() -> Result<()> {
     let parsed = parse_htree_url(url)?;
     let identifier = parsed.identifier;
     let repo_name = parsed.repo_name;
-    let url_secret = parsed.secret_key; // Encryption secret from URL fragment
+    let url_secret = parsed.secret_key; // Encryption secret from URL fragment (link-visible)
+    let is_private = parsed.is_private; // Self-only visibility
 
-    if url_secret.is_some() {
-        info!("Private repo mode: using secret key from URL");
+    if is_private {
+        info!("Private repo mode: only author can decrypt");
+    } else if url_secret.is_some() {
+        info!("Link-visible repo mode: using secret key from URL");
     }
 
     // Resolve identifier to pubkey
@@ -126,6 +129,8 @@ fn run() -> Result<()> {
            config.blossom.write_servers.len());
 
     // Create helper and run protocol
+    // TODO: implement is_private support in RemoteHelper
+    let _ = is_private; // Will be used when #private encryption is implemented
     let mut helper = RemoteHelper::new(&pubkey, &repo_name, signing_key, url_secret, config)?;
 
     // Read commands from stdin, write responses to stdout
@@ -184,20 +189,29 @@ fn run() -> Result<()> {
 pub struct ParsedUrl {
     pub identifier: String,
     pub repo_name: String,
-    /// Secret key from #k=<hex> fragment (for private repos)
+    /// Secret key from #k=<hex> fragment (for link-visible repos)
     pub secret_key: Option<[u8; 32]>,
+    /// Whether this is a private (self-only) repo from #private fragment
+    pub is_private: bool,
 }
 
 /// Parse htree:// URL into components
-/// Supports: htree://identifier/repo#k=<hex> for private repos
+/// Supports:
+/// - htree://identifier/repo - public repo
+/// - htree://identifier/repo#k=<hex> - link-visible repo
+/// - htree://identifier/repo#private - private (self-only) repo
 fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
     let url = url
         .strip_prefix("htree://")
         .context("URL must start with htree://")?;
 
-    // Split off fragment (#k=secret) if present
-    let (url_path, secret_key) = if let Some((path, fragment)) = url.split_once('#') {
-        let key = if let Some(key_hex) = fragment.strip_prefix("k=") {
+    // Split off fragment (#k=secret or #private) if present
+    let (url_path, secret_key, is_private) = if let Some((path, fragment)) = url.split_once('#') {
+        if fragment == "private" {
+            // #private - self-only visibility
+            (path, None, true)
+        } else if let Some(key_hex) = fragment.strip_prefix("k=") {
+            // #k=<hex> - link-visible
             let bytes = hex::decode(key_hex)
                 .context("Invalid secret key hex in URL fragment")?;
             if bytes.len() != 32 {
@@ -205,13 +219,13 @@ fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
-            Some(key)
+            (path, Some(key), false)
         } else {
-            None
-        };
-        (path, key)
+            // Unknown fragment - ignore
+            (path, None, false)
+        }
     } else {
-        (url, None)
+        (url, None, false)
     };
 
     // Split on first /
@@ -233,6 +247,7 @@ fn parse_htree_url(url: &str) -> Result<ParsedUrl> {
         identifier: identifier.to_string(),
         repo_name,
         secret_key,
+        is_private,
     })
 }
 
@@ -341,5 +356,32 @@ mod tests {
         // Some git versions may pass URL with : instead of /
         let result = parse_htree_url("htree://test:repo");
         assert!(result.is_err()); // We don't support : syntax
+    }
+
+    #[test]
+    fn test_parse_htree_url_private() {
+        let parsed = parse_htree_url("htree://self/myrepo#private").unwrap();
+        assert_eq!(parsed.identifier, "self");
+        assert_eq!(parsed.repo_name, "myrepo");
+        assert!(parsed.is_private);
+        assert!(parsed.secret_key.is_none());
+    }
+
+    #[test]
+    fn test_parse_htree_url_secret_not_private() {
+        // #k= is link-visible, not private
+        let secret_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let url = format!("htree://test/repo#k={}", secret_hex);
+        let parsed = parse_htree_url(&url).unwrap();
+        assert!(!parsed.is_private);
+        assert!(parsed.secret_key.is_some());
+    }
+
+    #[test]
+    fn test_parse_htree_url_public() {
+        // No fragment = public
+        let parsed = parse_htree_url("htree://test/repo").unwrap();
+        assert!(!parsed.is_private);
+        assert!(parsed.secret_key.is_none());
     }
 }

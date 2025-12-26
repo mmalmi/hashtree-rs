@@ -122,10 +122,10 @@ impl RemoteHelper {
         let data_dir = get_hashtree_data_dir();
         debug!(?data_dir, "RemoteHelper::new");
         let storage = GitStorage::open(&data_dir)?;
-        let nostr = NostrClient::new(pubkey, signing_key, &config)?;
+        let nostr = NostrClient::new(pubkey, signing_key, url_secret, &config)?;
 
         if url_secret.is_some() {
-            info!("Private repo: using secret from URL fragment");
+            info!("Link-visible repo: using secret from URL fragment");
         }
 
         Ok(Self {
@@ -322,21 +322,11 @@ impl RemoteHelper {
 
     /// Fetch all git objects from hashtree's .git/objects/ directory
     fn fetch_all_git_objects(&self, root_hash: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let masked_key = self.nostr.get_cached_encryption_key(&self.repo_name).cloned();
+        // NostrClient now handles unmasking for link-visible repos (url_secret)
+        // The cached key is already the real CHK key
+        let encryption_key = self.nostr.get_cached_encryption_key(&self.repo_name).cloned();
 
-        // For private repos: XOR the masked key with url_secret to get the real CHK key
-        // For public repos: use the key directly (no masking)
-        let encryption_key = if let (Some(masked), Some(secret)) = (masked_key, self.url_secret) {
-            let mut unmasked = [0u8; 32];
-            for i in 0..32 {
-                unmasked[i] = masked[i] ^ secret[i];
-            }
-            Some(unmasked)
-        } else {
-            masked_key
-        };
-
-        info!("fetch_all_git_objects: root={}, has encryption_key: {}, private: {}",
+        info!("fetch_all_git_objects: root={}, has encryption_key: {}, link_visible: {}",
               &root_hash[..12], encryption_key.is_some(), self.url_secret.is_some());
 
         // Create tokio runtime for async blossom downloads

@@ -267,11 +267,14 @@ pub struct NostrClient {
     cached_root_hash: HashMap<String, String>,
     /// Cached encryption keys
     cached_encryption_key: HashMap<String, [u8; 32]>,
+    /// URL secret for link-visible repos (#k=<hex>)
+    /// If set, encryption keys from nostr are XOR-masked and need unmasking
+    url_secret: Option<[u8; 32]>,
 }
 
 impl NostrClient {
-    /// Create a new client with pubkey, optional secret key, and config
-    pub fn new(pubkey: &str, secret_key: Option<String>, config: &Config) -> Result<Self> {
+    /// Create a new client with pubkey, optional secret key, url secret, and config
+    pub fn new(pubkey: &str, secret_key: Option<String>, url_secret: Option<[u8; 32]>, config: &Config) -> Result<Self> {
         // Use provided secret, or try environment variable
         let secret_key = secret_key.or_else(|| std::env::var("NOSTR_SECRET_KEY").ok());
 
@@ -302,6 +305,7 @@ impl NostrClient {
             cached_refs: HashMap::new(),
             cached_root_hash: HashMap::new(),
             cached_encryption_key: HashMap::new(),
+            url_secret,
         })
     }
 
@@ -473,7 +477,7 @@ impl NostrClient {
             return Ok((HashMap::new(), None, None));
         }
 
-        // Get optional encryption key from "encryptedKey" (private/unlisted) or "key" (public) tag
+        // Get optional encryption key from "encryptedKey" (private/link-visible) or "key" (public) tag
         // For private repos, the key is XOR masked and will be unmasked by helper using url_secret
         let encryption_key = event
             .tags
@@ -495,12 +499,24 @@ impl NostrClient {
                 })
             });
 
-        info!("Found root hash {} for {} (encrypted: {})",
-              &root_hash[..12.min(root_hash.len())], repo_name, encryption_key.is_some());
+        // For link-visible repos: XOR the masked key with url_secret to get the real CHK key
+        // For public repos: use the key directly (no masking)
+        let unmasked_key = if let (Some(masked), Some(secret)) = (encryption_key, self.url_secret) {
+            let mut unmasked = [0u8; 32];
+            for i in 0..32 {
+                unmasked[i] = masked[i] ^ secret[i];
+            }
+            Some(unmasked)
+        } else {
+            encryption_key
+        };
+
+        info!("Found root hash {} for {} (encrypted: {}, link_visible: {})",
+              &root_hash[..12.min(root_hash.len())], repo_name, unmasked_key.is_some(), self.url_secret.is_some());
 
         // Fetch refs from hashtree structure at root_hash
-        let refs = self.fetch_refs_from_hashtree(&root_hash, encryption_key.as_ref()).await?;
-        Ok((refs, Some(root_hash), encryption_key))
+        let refs = self.fetch_refs_from_hashtree(&root_hash, unmasked_key.as_ref()).await?;
+        Ok((refs, Some(root_hash), unmasked_key))
     }
 
     /// Decrypt data if encryption key is provided, then decode as tree node
@@ -849,7 +865,7 @@ impl NostrClient {
         ];
 
         // Add encryption key if present (required for decryption)
-        // Use "encryptedKey" for private/unlisted repos (XOR masked), "key" for public
+        // Use "encryptedKey" for private/link-visible repos (XOR masked), "key" for public
         if let Some((key, is_private)) = encryption_key {
             let tag_name = if is_private { "encryptedKey" } else { "key" };
             tags.push(Tag::custom(TagKind::custom(tag_name), vec![hex::encode(key)]));
@@ -962,7 +978,7 @@ mod tests {
     #[test]
     fn test_new_client() {
         let config = test_config();
-        let client = NostrClient::new(TEST_PUBKEY, None, &config).unwrap();
+        let client = NostrClient::new(TEST_PUBKEY, None, None, &config).unwrap();
         assert!(!client.relays.is_empty());
         assert!(!client.can_sign());
     }
@@ -971,14 +987,14 @@ mod tests {
     fn test_new_client_with_secret() {
         let config = test_config();
         let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let client = NostrClient::new(TEST_PUBKEY, Some(secret.to_string()), &config).unwrap();
+        let client = NostrClient::new(TEST_PUBKEY, Some(secret.to_string()), None, &config).unwrap();
         assert!(client.can_sign());
     }
 
     #[test]
     fn test_fetch_refs_empty() {
         let config = test_config();
-        let mut client = NostrClient::new(TEST_PUBKEY, None, &config).unwrap();
+        let mut client = NostrClient::new(TEST_PUBKEY, None, None, &config).unwrap();
         // This will timeout/return empty without real relays
         let refs = client.cached_refs.get("new-repo");
         assert!(refs.is_none());
@@ -987,7 +1003,7 @@ mod tests {
     #[test]
     fn test_update_ref() {
         let config = test_config();
-        let mut client = NostrClient::new(TEST_PUBKEY, None, &config).unwrap();
+        let mut client = NostrClient::new(TEST_PUBKEY, None, None, &config).unwrap();
 
         client
             .update_ref("repo", "refs/heads/main", "abc123")
