@@ -192,14 +192,25 @@ async fn resolve_cid_input(input: &str) -> Result<ResolvedCid> {
     let input = input.strip_prefix("htree://").unwrap_or(input);
 
     // Check if it's an nhash (bech32-encoded) - gives us raw bytes directly
+    // Support nhash1.../path/to/file format (path suffix after slash)
     if is_nhash(input) {
-        let data = nhash_decode(input)
-            .map_err(|e| anyhow::anyhow!("Invalid nhash: {}", e))?;
-        let path = if data.path.is_empty() {
-            None
+        let (nhash_part, url_path) = if let Some(slash_pos) = input.find('/') {
+            (&input[..slash_pos], Some(&input[slash_pos + 1..]))
         } else {
-            Some(data.path.join("/"))
+            (input, None)
         };
+
+        let data = nhash_decode(nhash_part)
+            .map_err(|e| anyhow::anyhow!("Invalid nhash: {}", e))?;
+
+        // Combine embedded TLV path with URL-style path suffix
+        let path = match (data.path.is_empty(), url_path) {
+            (true, None) => None,
+            (true, Some(p)) => Some(p.to_string()),
+            (false, None) => Some(data.path.join("/")),
+            (false, Some(p)) => Some(format!("{}/{}", data.path.join("/"), p)),
+        };
+
         return Ok(ResolvedCid {
             cid: Cid {
                 hash: data.hash,
@@ -665,6 +676,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Get { cid: cid_input, output } => {
+            use hashtree_cli::{FetchConfig, Fetcher};
             use hashtree_core::{from_hex, to_hex};
 
             // Resolve to Cid (raw bytes, no hex conversion needed for nhash)
@@ -673,11 +685,47 @@ async fn main() -> Result<()> {
             let hash_hex = to_hex(&cid.hash);
 
             let store = Arc::new(HashtreeStore::new(&data_dir)?);
+            let fetcher = Fetcher::new(FetchConfig::default());
 
-            // Check if it's a directory (try local first)
+            // Try to fetch tree from remote if not local
+            fetcher.fetch_tree(&store, None, &cid.hash).await?;
+
+            // Check if it's a directory
             let listing = store.get_directory_listing(&cid.hash)?;
 
-            if let Some(_) = listing {
+            // Handle path: nhash/path/to/file.ext
+            if let Some(ref path) = resolved.path {
+                if listing.is_some() {
+                    // nhash points to directory - resolve path within it
+                    let resolved_cid = store.resolve_path(&cid, path)?
+                        .ok_or_else(|| anyhow::anyhow!("Path not found in directory: {}", path))?;
+
+                    // Fetch the resolved file if needed
+                    fetcher.fetch_tree(&store, None, &resolved_cid.hash).await?;
+
+                    // Get the filename from the path
+                    let filename = path.rsplit('/').next().unwrap_or(path);
+                    let out_path = output.unwrap_or_else(|| PathBuf::from(filename));
+
+                    if let Some(content) = store.get_file_by_cid(&resolved_cid)? {
+                        std::fs::write(&out_path, content)?;
+                        println!("{} -> {}", to_hex(&resolved_cid.hash), out_path.display());
+                    } else {
+                        anyhow::bail!("File not found: {}", path);
+                    }
+                } else {
+                    // nhash points to file - save with the filename from path
+                    let filename = path.rsplit('/').next().unwrap_or(path);
+                    let out_path = output.unwrap_or_else(|| PathBuf::from(filename));
+
+                    if let Some(content) = store.get_file_by_cid(&cid)? {
+                        std::fs::write(&out_path, content)?;
+                        println!("{} -> {}", hash_hex, out_path.display());
+                    } else {
+                        anyhow::bail!("CID not found: {}", hash_hex);
+                    }
+                }
+            } else if let Some(_) = listing {
                 // It's a directory - create it and download contents
                 let out_dir = output.unwrap_or_else(|| PathBuf::from(&hash_hex));
                 std::fs::create_dir_all(&out_dir)?;
@@ -719,7 +767,7 @@ async fn main() -> Result<()> {
                     std::fs::write(&out_path, content)?;
                     println!("{} -> {}", hash_hex, out_path.display());
                 } else {
-                    anyhow::bail!("CID not found locally: {}", hash_hex);
+                    anyhow::bail!("CID not found: {}", hash_hex);
                 }
             }
         }
@@ -1724,4 +1772,43 @@ fn dir_size(path: &std::path::Path) -> Result<u64> {
         }
     }
     Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_resolve_nhash_with_path_suffix() {
+        // nhash for hash [0xaa; 32]
+        let nhash = hashtree_core::nhash_encode(&[0xaa; 32]).unwrap();
+
+        // Test nhash without path
+        let resolved = resolve_cid_input(&nhash).await.unwrap();
+        assert_eq!(resolved.cid.hash, [0xaa; 32]);
+        assert!(resolved.path.is_none());
+
+        // Test nhash with single file path suffix
+        let with_path = format!("{}/bitcoin.pdf", nhash);
+        let resolved = resolve_cid_input(&with_path).await.unwrap();
+        assert_eq!(resolved.cid.hash, [0xaa; 32]);
+        assert_eq!(resolved.path, Some("bitcoin.pdf".to_string()));
+
+        // Test nhash with nested path suffix
+        let with_nested = format!("{}/docs/papers/bitcoin.pdf", nhash);
+        let resolved = resolve_cid_input(&with_nested).await.unwrap();
+        assert_eq!(resolved.cid.hash, [0xaa; 32]);
+        assert_eq!(resolved.path, Some("docs/papers/bitcoin.pdf".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_nhash_with_htree_prefix() {
+        let nhash = hashtree_core::nhash_encode(&[0xbb; 32]).unwrap();
+
+        // Test htree:// prefix with path
+        let htree_url = format!("htree://{}/file.txt", nhash);
+        let resolved = resolve_cid_input(&htree_url).await.unwrap();
+        assert_eq!(resolved.cid.hash, [0xbb; 32]);
+        assert_eq!(resolved.path, Some("file.txt".to_string()));
+    }
 }

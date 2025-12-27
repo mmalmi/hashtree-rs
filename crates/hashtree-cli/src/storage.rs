@@ -1058,6 +1058,17 @@ impl HashtreeStore {
         })
     }
 
+    /// Resolve a path within a tree (returns Cid with key if encrypted)
+    pub fn resolve_path(&self, cid: &Cid, path: &str) -> Result<Option<Cid>> {
+        let store = self.store_arc();
+        let tree = HashTree::new(HashTreeConfig::new(store).public());
+
+        sync_block_on(async {
+            tree.resolve_path(cid, path).await
+                .map_err(|e| anyhow::anyhow!("Failed to resolve path: {}", e))
+        })
+    }
+
     /// Get chunk metadata for a file (chunk list, sizes, total size)
     pub fn get_file_chunk_metadata(&self, hash: &[u8; 32]) -> Result<Option<FileChunkMetadata>> {
         let store = self.store_arc();
