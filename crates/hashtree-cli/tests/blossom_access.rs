@@ -433,3 +433,83 @@ fn test_cache_control_immutable_header() {
         println!("Upload failed (possibly auth issue), skipping cache header test");
     }
 }
+
+/// Test htree add with blossom push to local server
+#[test]
+fn test_htree_add_with_blossom_push() {
+    let server = TestServer::new(18095, false);
+    let htree_bin = find_htree_binary();
+
+    // Create temp directories for the CLI instance
+    let data_dir = TempDir::new().expect("Failed to create data dir");
+    let home_dir = TempDir::new().expect("Failed to create home dir");
+
+    // Create .hashtree config dir with write_servers pointing to our test server
+    let config_dir = home_dir.path().join(".hashtree");
+    std::fs::create_dir_all(&config_dir).expect("Failed to create config dir");
+
+    let config_content = format!(r#"
+[blossom]
+write_servers = ["{}"]
+read_servers = ["{}"]
+"#, server.base_url(), server.base_url());
+    std::fs::write(config_dir.join("config.toml"), config_content)
+        .expect("Failed to write config");
+
+    // Generate keys
+    let keys = Keys::generate();
+    let nsec = keys.secret_key().to_bech32().expect("Failed to encode nsec");
+    std::fs::write(config_dir.join("keys"), &nsec)
+        .expect("Failed to write keys");
+
+    // Create a test file to add
+    let test_file = data_dir.path().join("test.txt");
+    std::fs::write(&test_file, "Hello from htree add test!").expect("Failed to write test file");
+
+    // Run htree add (without --local, so it pushes to blossom)
+    println!("Running htree add...");
+    let add_output = Command::new(&htree_bin)
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("add")
+        .arg(&test_file)
+        .arg("--public")
+        .env("HOME", home_dir.path())
+        .output()
+        .expect("Failed to run htree add");
+
+    let stdout = String::from_utf8_lossy(&add_output.stdout);
+    let stderr = String::from_utf8_lossy(&add_output.stderr);
+    println!("stdout: {}", stdout);
+    println!("stderr: {}", stderr);
+
+    assert!(add_output.status.success(), "htree add should succeed");
+
+    // Check that blossom push happened
+    assert!(stdout.contains("file servers:") || stdout.contains("uploaded"),
+        "Output should mention file server upload");
+
+    // Extract hex hash from output (line starts with "  hash:")
+    let hash = stdout.lines()
+        .find(|l| l.trim().starts_with("hash:"))
+        .and_then(|l| l.split_whitespace().last())
+        .expect("Should have hash in output");
+
+    println!("Uploaded hash: {}", hash);
+    assert!(hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "Hash should be 64 hex chars, got: {}", hash);
+
+    // Verify the blob exists on the server
+    let check_output = Command::new("curl")
+        .arg("-s")
+        .arg("-o").arg("/dev/null")
+        .arg("-w").arg("%{http_code}")
+        .arg(format!("{}/{}.bin", server.base_url(), hash))
+        .output()
+        .expect("Failed to check blob");
+
+    let status_code = String::from_utf8_lossy(&check_output.stdout);
+    println!("Server check status: {}", status_code);
+
+    assert_eq!(status_code.trim(), "200", "Blob should exist on server after htree add");
+}

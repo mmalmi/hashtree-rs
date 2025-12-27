@@ -322,6 +322,42 @@ pub fn get_keys_path() -> PathBuf {
     get_hashtree_dir().join("keys")
 }
 
+/// A stored key entry from the keys file
+#[derive(Debug, Clone)]
+pub struct KeyEntry {
+    /// The nsec or hex secret key
+    pub secret: String,
+    /// Optional alias/petname
+    pub alias: Option<String>,
+}
+
+/// Parse the keys file content into key entries
+/// Format: `nsec1... [alias]` or `hex... [alias]` per line
+/// Lines starting with # are comments
+pub fn parse_keys_file(content: &str) -> Vec<KeyEntry> {
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        let secret = parts[0].to_string();
+        let alias = parts.get(1).map(|s| s.trim().to_string());
+        entries.push(KeyEntry { secret, alias });
+    }
+    entries
+}
+
+/// Read and parse keys file, returning the first key's secret
+/// Returns None if file doesn't exist or is empty
+pub fn read_first_key() -> Option<String> {
+    let keys_path = get_keys_path();
+    let content = std::fs::read_to_string(&keys_path).ok()?;
+    let entries = parse_keys_file(&content);
+    entries.into_iter().next().map(|e| e.secret)
+}
+
 /// Get the auth cookie path (~/.hashtree/auth.cookie)
 pub fn get_auth_cookie_path() -> PathBuf {
     get_hashtree_dir().join("auth.cookie")
@@ -404,5 +440,24 @@ backend = "fs"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.storage.backend, StorageBackend::Fs);
+    }
+
+    #[test]
+    fn test_parse_keys_file() {
+        let content = r#"
+nsec1abc123 self
+# comment line
+nsec1def456 work
+
+nsec1ghi789
+"#;
+        let entries = parse_keys_file(content);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].secret, "nsec1abc123");
+        assert_eq!(entries[0].alias, Some("self".to_string()));
+        assert_eq!(entries[1].secret, "nsec1def456");
+        assert_eq!(entries[1].alias, Some("work".to_string()));
+        assert_eq!(entries[2].secret, "nsec1ghi789");
+        assert_eq!(entries[2].alias, None);
     }
 }

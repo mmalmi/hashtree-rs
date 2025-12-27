@@ -1295,30 +1295,24 @@ async fn list_following(data_dir: &PathBuf) -> Result<()> {
 
 /// Push content to Blossom servers
 async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Option<String>) -> Result<()> {
-    use hashtree_core::{from_hex, to_hex};
-    use sha2::{Sha256, Digest};
-    use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
-
-    // Load config
-    let config = Config::load()?;
-
-    // Get servers (override or from config - use write_servers for push)
-    let servers = if let Some(s) = server_override {
-        vec![s]
-    } else {
-        // Combine legacy servers with write_servers
-        let mut write_servers = config.blossom.servers.clone();
-        write_servers.extend(config.blossom.write_servers.clone());
-        write_servers
-    };
-
-    if servers.is_empty() {
-        anyhow::bail!("No file servers configured. Use --server or add write_servers to config.toml");
-    }
+    use hashtree_blossom::BlossomClient;
+    use hashtree_core::from_hex;
+    use nostr::Keys;
 
     // Ensure nsec exists for signing
     let (nsec_str, _) = ensure_keys_string()?;
     let keys = Keys::parse(&nsec_str).context("Failed to parse nsec")?;
+
+    // Create client (optionally with server override)
+    let client = if let Some(server) = server_override {
+        BlossomClient::new(keys).with_write_servers(vec![server])
+    } else {
+        BlossomClient::new(keys)
+    };
+
+    if client.write_servers().is_empty() {
+        anyhow::bail!("No file servers configured. Use --server or add write_servers to config.toml");
+    }
 
     // Open local store
     let store = HashtreeStore::new(data_dir)?;
@@ -1332,7 +1326,7 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
 
     // Collect all blocks to push (walk the DAG)
     println!("Collecting blocks...");
-    let mut blocks_to_push: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut blocks_to_push: Vec<Vec<u8>> = Vec::new();
     let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let root_hash = from_hex(&hash_hex).context("Invalid hash")?;
     let mut queue = vec![root_hash];
@@ -1343,163 +1337,66 @@ async fn push_to_blossom(data_dir: &PathBuf, cid_str: &str, server_override: Opt
         }
         visited.insert(hash);
 
-        // Try to get as tree node first (for directories/internal nodes)
         if let Ok(Some(node)) = store.get_tree_node(&hash) {
-            // Get raw block data
             if let Ok(Some(data)) = store.get_blob(&hash) {
-                blocks_to_push.push((hash, data));
+                blocks_to_push.push(data);
             }
-            // Queue child hashes
             for link in &node.links {
                 if !visited.contains(&link.hash) {
                     queue.push(link.hash);
                 }
             }
         } else if let Ok(Some(metadata)) = store.get_file_chunk_metadata(&hash) {
-            // It's a file - get the file data
             if metadata.is_chunked {
-                // Get chunks
                 for chunk_hash in &metadata.chunk_hashes {
                     if !visited.contains(chunk_hash) {
                         if let Ok(Some(chunk_data)) = store.get_blob(chunk_hash) {
-                            blocks_to_push.push((*chunk_hash, chunk_data));
+                            blocks_to_push.push(chunk_data);
                             visited.insert(*chunk_hash);
                         }
                     }
                 }
             }
-            // Get the file's own block
             if let Ok(Some(data)) = store.get_blob(&hash) {
-                blocks_to_push.push((hash, data));
+                blocks_to_push.push(data);
             }
         } else if let Ok(Some(data)) = store.get_blob(&hash) {
-            // Raw block
-            blocks_to_push.push((hash, data));
+            blocks_to_push.push(data);
         }
     }
 
     println!("Found {} blocks to push", blocks_to_push.len());
 
-    // Create HTTP client
-    let client = reqwest::Client::new();
+    let mut uploaded = 0;
+    let mut skipped = 0;
+    let mut errors = 0;
 
-    // Push to each server
-    for server in &servers {
-        println!("\nPushing to {}...", server);
-        let mut uploaded = 0;
-        let mut skipped = 0;
-        let mut errors = 0;
-
-        for (hash, data) in &blocks_to_push {
-            let hash_hex = to_hex(hash);
-            // Check if already exists (HEAD request)
-            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash_hex);
-            let head_resp = client.head(&url).send().await;
-
-            if let Ok(resp) = head_resp {
-                if resp.status().is_success() || resp.status().as_u16() == 200 {
+    for data in &blocks_to_push {
+        match client.upload_if_missing(data).await {
+            Ok((_hash, was_uploaded)) => {
+                if was_uploaded {
+                    uploaded += 1;
+                } else {
                     skipped += 1;
-                    continue;
                 }
             }
-
-            // Create Blossom auth event (kind 24242)
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let expiration = now + 300; // 5 minutes
-
-            // Compute SHA256 of the data
-            let mut hasher = Sha256::new();
-            hasher.update(data);
-            let computed_hash = hex::encode(hasher.finalize());
-
-            // Build auth event
-            let auth_event = EventBuilder::new(
-                Kind::Custom(24242),
-                "Upload",
-                vec![
-                    Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
-                    Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
-                    Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
-                ],
-            )
-            .to_event(&keys)
-            .context("Failed to sign auth event")?;
-
-            let auth_json = auth_event.as_json();
-            let auth_header = format!("Nostr {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth_json));
-
-            // Upload
-            let upload_url = format!("{}/upload", server.trim_end_matches('/'));
-            let resp = client.put(&upload_url)
-                .header("Authorization", auth_header)
-                .header("Content-Type", "application/octet-stream")
-                .header("X-SHA-256", &computed_hash)
-                .body(data.clone())
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
-                    uploaded += 1;
-                }
-                Ok(r) => {
-                    let status = r.status();
-                    let text = r.text().await.unwrap_or_default();
-                    eprintln!("  Error uploading {}: {} {}", &hash_hex[..12], status, text);
-                    errors += 1;
-                }
-                Err(e) => {
-                    eprintln!("  Error uploading {}: {}", &hash_hex[..12], e);
-                    errors += 1;
-                }
+            Err(e) => {
+                eprintln!("  Upload error: {}", e);
+                errors += 1;
             }
         }
-
-        println!("  Uploaded: {}, Skipped: {}, Errors: {}", uploaded, skipped, errors);
     }
 
-    println!("\nDone!");
+    println!("\nUploaded: {}, Skipped: {}, Errors: {}", uploaded, skipped, errors);
+    println!("Done!");
     Ok(())
 }
 
-/// Background push to Blossom - fire and forget with server-level backoff
-/// Tries up to MAX_ATTEMPTS total, gives up and drops if still failing
-async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[String]) -> Result<()> {
-    use hashtree_core::{from_hex, to_hex};
-    use sha2::{Sha256, Digest};
-    use nostr::{EventBuilder, Kind, Tag, TagKind, Keys, JsonUtil};
-    use std::collections::HashMap;
-    use std::time::Instant;
-
-    const MAX_ATTEMPTS: u32 = 3;
-    const BASE_BACKOFF_MS: u64 = 1000;
-    const MAX_BACKOFF_MS: u64 = 30000;
-
-    // Track server health for backoff
-    struct ServerHealth {
-        last_error: Instant,
-        consecutive_errors: u32,
-    }
-    let mut server_health: HashMap<String, ServerHealth> = HashMap::new();
-
-    // Check if server is in backoff
-    let is_in_backoff = |health: &HashMap<String, ServerHealth>, server: &str| -> bool {
-        if let Some(h) = health.get(server) {
-            if h.consecutive_errors == 0 {
-                return false;
-            }
-            let backoff_ms = std::cmp::min(
-                BASE_BACKOFF_MS * 2_u64.pow(h.consecutive_errors - 1),
-                MAX_BACKOFF_MS,
-            );
-            h.last_error.elapsed().as_millis() < backoff_ms as u128
-        } else {
-            false
-        }
-    };
+/// Push tree to Blossom servers using BlossomClient
+async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, _servers: &[String]) -> Result<()> {
+    use hashtree_blossom::BlossomClient;
+    use hashtree_core::from_hex;
+    use nostr::Keys;
 
     // Ensure nsec exists for signing
     let (nsec_str, _) = ensure_keys_string()?;
@@ -1516,7 +1413,7 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
     };
 
     // Collect all blocks to push (walk the DAG)
-    let mut blocks_to_push: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut blocks_to_push: Vec<Vec<u8>> = Vec::new();
     let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let root_hash = from_hex(&hash_hex).context("Invalid hash")?;
     let mut queue = vec![root_hash];
@@ -1530,7 +1427,7 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
         // Try to get as tree node first (for directories/internal nodes)
         if let Ok(Some(node)) = store.get_tree_node(&hash) {
             if let Ok(Some(data)) = store.get_blob(&hash) {
-                blocks_to_push.push((hash, data));
+                blocks_to_push.push(data);
             }
             for link in &node.links {
                 if !visited.contains(&link.hash) {
@@ -1542,17 +1439,17 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
                 for chunk_hash in &metadata.chunk_hashes {
                     if !visited.contains(chunk_hash) {
                         if let Ok(Some(chunk_data)) = store.get_blob(chunk_hash) {
-                            blocks_to_push.push((*chunk_hash, chunk_data));
+                            blocks_to_push.push(chunk_data);
                             visited.insert(*chunk_hash);
                         }
                     }
                 }
             }
             if let Ok(Some(data)) = store.get_blob(&hash) {
-                blocks_to_push.push((hash, data));
+                blocks_to_push.push(data);
             }
         } else if let Ok(Some(data)) = store.get_blob(&hash) {
-            blocks_to_push.push((hash, data));
+            blocks_to_push.push(data);
         }
     }
 
@@ -1560,98 +1457,24 @@ async fn background_blossom_push(data_dir: &PathBuf, cid_str: &str, servers: &[S
         return Ok(());
     }
 
-    let client = reqwest::Client::new();
+    // Use BlossomClient (auto-loads servers from config)
+    let client = BlossomClient::new(keys);
     let mut total_uploaded = 0;
     let mut total_skipped = 0;
 
-    // Try each block with limited retries
-    for (hash, data) in &blocks_to_push {
-        let hash_hex = to_hex(hash);
-        let mut attempts = 0;
-        let mut uploaded = false;
-
-        while attempts < MAX_ATTEMPTS && !uploaded {
-            attempts += 1;
-
-            // Find a server not in backoff
-            let available_server = servers.iter().find(|s| !is_in_backoff(&server_health, s));
-            let server = match available_server {
-                Some(s) => s,
-                None => {
-                    // All servers in backoff, wait a bit and retry
-                    tokio::time::sleep(tokio::time::Duration::from_millis(BASE_BACKOFF_MS)).await;
-                    continue;
-                }
-            };
-
-            // Check if already exists (HEAD request)
-            let url = format!("{}/{}.bin", server.trim_end_matches('/'), hash_hex);
-            if let Ok(resp) = client.head(&url).send().await {
-                if resp.status().is_success() {
+    for data in &blocks_to_push {
+        match client.upload_if_missing(data).await {
+            Ok((_hash, was_uploaded)) => {
+                if was_uploaded {
+                    total_uploaded += 1;
+                } else {
                     total_skipped += 1;
-                    uploaded = true;
-                    continue;
                 }
             }
-
-            // Create Blossom auth event
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let expiration = now + 300;
-
-            let mut hasher = Sha256::new();
-            hasher.update(data);
-            let computed_hash = hex::encode(hasher.finalize());
-
-            let auth_event = match EventBuilder::new(
-                Kind::Custom(24242),
-                "Upload",
-                vec![
-                    Tag::custom(TagKind::custom("t"), vec!["upload".to_string()]),
-                    Tag::custom(TagKind::custom("x"), vec![computed_hash.clone()]),
-                    Tag::custom(TagKind::custom("expiration"), vec![expiration.to_string()]),
-                ],
-            )
-            .to_event(&keys)
-            {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let auth_json = auth_event.as_json();
-            let auth_header = format!("Nostr {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth_json));
-
-            let upload_url = format!("{}/upload", server.trim_end_matches('/'));
-            let resp = client.put(&upload_url)
-                .header("Authorization", auth_header)
-                .header("Content-Type", "application/octet-stream")
-                .header("X-SHA-256", &computed_hash)
-                .body(data.clone())
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
-                    // Success - reset server health
-                    server_health.remove(server);
-                    total_uploaded += 1;
-                    uploaded = true;
-                }
-                Ok(_) | Err(_) => {
-                    // Error - record backoff
-                    let health = server_health.entry(server.clone()).or_insert(ServerHealth {
-                        last_error: Instant::now(),
-                        consecutive_errors: 0,
-                    });
-                    health.last_error = Instant::now();
-                    health.consecutive_errors += 1;
-                }
+            Err(e) => {
+                tracing::warn!("Blossom upload failed: {}", e);
             }
         }
-
-        // If still not uploaded after MAX_ATTEMPTS, just drop it (no memory accumulation)
     }
 
     if total_uploaded > 0 || total_skipped > 0 {

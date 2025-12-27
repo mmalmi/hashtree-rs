@@ -93,20 +93,11 @@ pub fn load_keys() -> Vec<StoredKey> {
     // Primary: ~/.hashtree/keys (multi-key format)
     let keys_path = hashtree_config::get_keys_path();
     if let Ok(content) = std::fs::read_to_string(&keys_path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let parts: Vec<&str> = line.splitn(2, ' ').collect();
-            let key_str = parts[0];
-            let petname = parts.get(1).map(|s| s.trim().to_string());
-
-            let key = if key_str.starts_with("nsec1") {
-                StoredKey::from_nsec(key_str, petname)
-            } else if key_str.len() == 64 {
-                StoredKey::from_secret_hex(key_str, petname)
+        for entry in hashtree_config::parse_keys_file(&content) {
+            let key = if entry.secret.starts_with("nsec1") {
+                StoredKey::from_nsec(&entry.secret, entry.alias)
+            } else if entry.secret.len() == 64 {
+                StoredKey::from_secret_hex(&entry.secret, entry.alias)
             } else {
                 continue;
             };

@@ -333,10 +333,13 @@ pub fn ensure_keys() -> Result<(Keys, bool)> {
     let keys_path = get_keys_path();
 
     if keys_path.exists() {
-        let nsec_str = fs::read_to_string(&keys_path)
+        let content = fs::read_to_string(&keys_path)
             .context("Failed to read keys file")?;
-        let nsec_str = nsec_str.trim();
-        let secret_key = SecretKey::from_bech32(nsec_str)
+        let entries = hashtree_config::parse_keys_file(&content);
+        let nsec_str = entries.into_iter().next()
+            .map(|e| e.secret)
+            .context("Keys file is empty")?;
+        let secret_key = SecretKey::from_bech32(&nsec_str)
             .context("Invalid nsec format")?;
         let keys = Keys::new(secret_key);
         Ok((keys, false))
@@ -349,10 +352,13 @@ pub fn ensure_keys() -> Result<(Keys, bool)> {
 /// Read existing keys
 pub fn read_keys() -> Result<Keys> {
     let keys_path = get_keys_path();
-    let nsec_str = fs::read_to_string(&keys_path)
+    let content = fs::read_to_string(&keys_path)
         .context("Failed to read keys file")?;
-    let nsec_str = nsec_str.trim();
-    let secret_key = SecretKey::from_bech32(nsec_str)
+    let entries = hashtree_config::parse_keys_file(&content);
+    let nsec_str = entries.into_iter().next()
+        .map(|e| e.secret)
+        .context("Keys file is empty")?;
+    let secret_key = SecretKey::from_bech32(&nsec_str)
         .context("Invalid nsec format")?;
     Ok(Keys::new(secret_key))
 }
@@ -363,9 +369,13 @@ pub fn ensure_keys_string() -> Result<(String, bool)> {
     let keys_path = get_keys_path();
 
     if keys_path.exists() {
-        let nsec_str = fs::read_to_string(&keys_path)
+        let content = fs::read_to_string(&keys_path)
             .context("Failed to read keys file")?;
-        Ok((nsec_str.trim().to_string(), false))
+        let entries = hashtree_config::parse_keys_file(&content);
+        let nsec_str = entries.into_iter().next()
+            .map(|e| e.secret)
+            .context("Keys file is empty")?;
+        Ok((nsec_str, false))
     } else {
         let keys = generate_keys()?;
         let nsec = keys.secret_key().to_bech32()
