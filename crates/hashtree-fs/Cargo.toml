@@ -17,3 +17,8 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+hashtree-lmdb.workspace = true
+
+[[bench]]
+name = "fs_vs_lmdb"
+harness = false
