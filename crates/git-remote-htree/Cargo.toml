@@ -65,3 +65,8 @@ lmdb = ["dep:hashtree-lmdb"]
 [dev-dependencies]
 tempfile.workspace = true
 tokio-tungstenite = "0.24"
+hashtree-lmdb.workspace = true
+
+[[bench]]
+name = "git_storage"
+harness = false

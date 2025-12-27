@@ -40,7 +40,7 @@ use nostr_sdk::ToBech32;
 use std::io::{BufRead, Write};
 use tracing::{debug, info, warn};
 
-mod git;
+pub mod git;
 mod helper;
 mod nostr_client;
 
