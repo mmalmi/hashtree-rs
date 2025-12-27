@@ -54,12 +54,13 @@ fi
 # Tier 1: No internal dependencies
 publish_crate "hashtree-core"
 publish_crate "hashtree-config"
-publish_crate "hashtree-blossom"
 # hashtree-bep52 excluded - internal testing only
 
 # Tier 2: Depends on hashtree-core only
 publish_crate "hashtree-lmdb"
+publish_crate "hashtree-fs"
 publish_crate "hashtree-s3"
+publish_crate "hashtree-blossom"  # optional deps on core, config
 publish_crate "hashtree-resolver"
 # hashtree-sim excluded - internal testing only
 
