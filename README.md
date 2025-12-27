@@ -4,14 +4,30 @@ Content-addressed filesystem on Nostr.
 
 Basically [Blossom](https://github.com/hzrd149/blossom) with chunking and directory structure. Merkle roots can be published on Nostr to get mutable `npub/path` addresses.
 
-## Quick Start
+## Store & retrieve files
+```bash
+# 1. Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 2. Install hashtree-cli
+cargo install hashtree-cli
+
+# 3. Add file or dir
+htree add file.txt
+
+# 4. Download bitcoin.pdf
+htree get nhash1qqsw9hdps3pkyjm7nlg9783xazg4cnmuj8sp4wnddsa8lzku6qt457c9yzckwsv34z8vtnwhx0jzgz5psqcsthzp94kxwzx482u5lsjg7n64x5rckap/bitcoin.pdf
+
+```
+
+## Git on hashtree
 
 ```bash
 # 1. Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # 2. Install git-remote-htree
-cargo install --git https://github.com/mmalmi/hashtree-rs git-remote-htree
+cargo install git-remote-htree
 
 # 3. Clone a repo
 git clone htree://npub1dxs2pygtfxsah77yuncsmu3ttqr274qr56xz3gsvetxzq2vjfnxsy6knkn/hashtree-rs
@@ -22,7 +38,7 @@ git remote add htree htree://self/myrepo
 git push htree master
 ```
 
-View repos at [files.iris.to](https://files.iris.to)
+View repos at files.iris.to, for example [hashtree-rs](https://files.iris.to/#/npub1xndmdgymsf4a34rzr7346vp8qcptxf75pjqweh8naa8rklgxpfqqmfjtce/hashtree-rs)
 
 ## Design
 
