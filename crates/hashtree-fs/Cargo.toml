@@ -1,0 +1,19 @@
+[package]
+name = "hashtree-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Filesystem-based content-addressed blob storage for hashtree"
+
+[dependencies]
+hashtree-core.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

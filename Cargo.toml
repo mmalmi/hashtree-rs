@@ -35,6 +35,7 @@ hashtree-blossom = { version = "0.2.0", path = "crates/hashtree-blossom" }
 hashtree-sim = { version = "0.2.0", path = "crates/hashtree-sim" }
 hashtree-resolver = { version = "0.2.0", path = "crates/hashtree-resolver" }
 hashtree-config = { version = "0.2.0", path = "crates/hashtree-config" }
+hashtree-fs = { version = "0.2.0", path = "crates/hashtree-fs" }
 
 # AWS S3
 aws-sdk-s3 = "1"
