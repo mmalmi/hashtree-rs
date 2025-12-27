@@ -554,12 +554,10 @@ impl RemoteHelper {
             eprintln!("  Prepared {} objects in {:?}", total_objects, prep_elapsed);
         }
 
-        let download_start = std::time::Instant::now();
         let downloaded = StdArc::new(AtomicUsize::new(0));
         let download_done = StdArc::new(AtomicBool::new(false));
 
-        // Spawn elapsed time reporter (shows time even when downloads are slow)
-        let download_start_clone = download_start.clone();
+        // Spawn progress reporter
         let downloaded_clone = downloaded.clone();
         let download_done_clone = download_done.clone();
         let total_for_timer = total_objects;
@@ -570,7 +568,6 @@ impl RemoteHelper {
                     break;
                 }
                 let count = downloaded_clone.load(Ordering::Relaxed);
-                let elapsed = download_start_clone.elapsed().as_secs();
                 eprint!("\r  Loading: {}/{}    ", count, total_for_timer);
                 let _ = std::io::stderr().flush();
             }
@@ -600,7 +597,6 @@ impl RemoteHelper {
 
         download_done.store(true, Ordering::Relaxed);
         let _ = timer_task.await;
-        let _download_elapsed = download_start.elapsed();
 
         // Collect successes and failures
         let mut failed: Vec<(String, Cid)> = Vec::new();
