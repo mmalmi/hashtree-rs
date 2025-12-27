@@ -18,7 +18,8 @@ path = "src/main.rs"
 [dependencies]
 # Content-addressed storage
 hashtree-core.workspace = true
-hashtree-lmdb.workspace = true
+hashtree-fs.workspace = true
+hashtree-lmdb = { workspace = true, optional = true }
 hashtree-config.workspace = true
 
 # Nostr
@@ -56,6 +57,10 @@ clap.workspace = true
 
 # TLS crypto provider
 rustls = { version = "0.23", features = ["ring"] }
+
+[features]
+default = []
+lmdb = ["dep:hashtree-lmdb"]
 
 [dev-dependencies]
 tempfile.workspace = true

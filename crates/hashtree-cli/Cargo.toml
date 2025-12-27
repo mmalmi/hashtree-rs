@@ -22,7 +22,8 @@ git-remote-htree = { version = "0.2.0", path = "../git-remote-htree" }
 
 # Core hashtree crates
 hashtree-core.workspace = true
-hashtree-lmdb.workspace = true
+hashtree-fs.workspace = true
+hashtree-lmdb = { workspace = true, optional = true }
 hashtree-blossom.workspace = true
 hashtree-config.workspace = true
 hashtree-resolver = { workspace = true, features = ["nostr"] }
@@ -31,7 +32,7 @@ hashtree-resolver = { workspace = true, features = ["nostr"] }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 
-# Storage
+# Storage (heed needed for metadata databases)
 heed.workspace = true
 tempfile.workspace = true
 
@@ -90,6 +91,7 @@ rustls = { version = "0.23", features = ["ring"] }
 [features]
 default = []
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+lmdb = ["dep:hashtree-lmdb"]
 
 [dev-dependencies]
 tempfile.workspace = true

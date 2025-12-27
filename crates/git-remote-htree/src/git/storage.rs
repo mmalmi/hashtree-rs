@@ -1,4 +1,4 @@
-//! Hashtree-backed git object and ref storage using LMDB persistence
+//! Hashtree-backed git object and ref storage with configurable persistence
 //!
 //! Stores git objects and refs in a hashtree merkle tree:
 //!   root/
@@ -12,7 +12,12 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use hashtree_config::{Config, StorageBackend};
+use hashtree_core::store::{Store, StoreError};
+use hashtree_core::types::Hash;
 use hashtree_core::{Cid, DirEntry, HashTree, HashTreeConfig, LinkType};
+use hashtree_fs::FsBlobStore;
+#[cfg(feature = "lmdb")]
 use hashtree_lmdb::LmdbBlobStore;
 use sha1::{Sha1, Digest};
 use std::collections::HashMap;
@@ -20,7 +25,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::object::{parse_tree, GitObject, ObjectId, ObjectType};
 use super::refs::{validate_ref_name, Ref};
@@ -44,10 +49,91 @@ impl RuntimeExecutor {
     }
 }
 
-/// Git storage backed by HashTree with LMDB persistence
+/// Local blob store - wraps either FsBlobStore or LmdbBlobStore
+pub enum LocalStore {
+    Fs(FsBlobStore),
+    #[cfg(feature = "lmdb")]
+    Lmdb(LmdbBlobStore),
+}
+
+impl LocalStore {
+    /// Create a new local store based on config
+    pub fn new<P: AsRef<Path>>(path: P) -> std::result::Result<Self, StoreError> {
+        let config = Config::load_or_default();
+        match config.storage.backend {
+            StorageBackend::Fs => {
+                Ok(LocalStore::Fs(FsBlobStore::new(path)?))
+            }
+            #[cfg(feature = "lmdb")]
+            StorageBackend::Lmdb => {
+                Ok(LocalStore::Lmdb(LmdbBlobStore::new(path)?))
+            }
+            #[cfg(not(feature = "lmdb"))]
+            StorageBackend::Lmdb => {
+                warn!("LMDB backend requested but lmdb feature not enabled, using filesystem storage");
+                Ok(LocalStore::Fs(FsBlobStore::new(path)?))
+            }
+        }
+    }
+
+    /// List all hashes in the store
+    pub fn list(&self) -> std::result::Result<Vec<Hash>, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.list(),
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.list(),
+        }
+    }
+
+    /// Sync get operation
+    pub fn get_sync(&self, hash: &Hash) -> std::result::Result<Option<Vec<u8>>, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.get_sync(hash),
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.get_sync(hash),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Store for LocalStore {
+    async fn put(&self, hash: Hash, data: Vec<u8>) -> std::result::Result<bool, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.put(hash, data).await,
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.put(hash, data).await,
+        }
+    }
+
+    async fn get(&self, hash: &Hash) -> std::result::Result<Option<Vec<u8>>, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.get(hash).await,
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.get(hash).await,
+        }
+    }
+
+    async fn has(&self, hash: &Hash) -> std::result::Result<bool, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.has(hash).await,
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.has(hash).await,
+        }
+    }
+
+    async fn delete(&self, hash: &Hash) -> std::result::Result<bool, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.delete(hash).await,
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.delete(hash).await,
+        }
+    }
+}
+
+/// Git storage backed by HashTree with configurable persistence
 pub struct GitStorage {
-    store: Arc<LmdbBlobStore>,
-    tree: HashTree<LmdbBlobStore>,
+    store: Arc<LocalStore>,
+    tree: HashTree<LocalStore>,
     runtime: RuntimeExecutor,
     /// In-memory state for the current session
     objects: std::sync::RwLock<HashMap<String, Vec<u8>>>,
@@ -70,8 +156,8 @@ impl GitStorage {
 
         let store_path = path.as_ref().join("blobs");
         let store = Arc::new(
-            LmdbBlobStore::new(&store_path)
-                .map_err(|e| Error::StorageError(format!("lmdb: {}", e)))?,
+            LocalStore::new(&store_path)
+                .map_err(|e| Error::StorageError(format!("local store: {}", e)))?,
         );
 
         // Use encrypted mode (default) - blossom servers require encrypted data
@@ -734,13 +820,13 @@ impl GitStorage {
     }
 
     /// Get the underlying store
-    pub fn store(&self) -> &Arc<LmdbBlobStore> {
+    pub fn store(&self) -> &Arc<LocalStore> {
         &self.store
     }
 
     /// Get the HashTree for direct access
     #[allow(dead_code)]
-    pub fn hashtree(&self) -> &HashTree<LmdbBlobStore> {
+    pub fn hashtree(&self) -> &HashTree<LocalStore> {
         &self.tree
     }
 

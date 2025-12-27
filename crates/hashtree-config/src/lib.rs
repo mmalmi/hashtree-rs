@@ -76,9 +76,28 @@ fn default_true() -> bool {
     true
 }
 
+/// Storage backend type
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// Filesystem storage (default) - stores in ~/.hashtree/blobs/{prefix}/{hash}
+    Fs,
+    /// LMDB storage - requires lmdb feature
+    Lmdb,
+}
+
+impl Default for StorageBackend {
+    fn default() -> Self {
+        Self::Fs
+    }
+}
+
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
+    /// Storage backend: "fs" (default) or "lmdb"
+    #[serde(default)]
+    pub backend: StorageBackend,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
     #[serde(default = "default_max_size_gb")]
@@ -90,6 +109,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
+            backend: StorageBackend::default(),
             data_dir: default_data_dir(),
             max_size_gb: default_max_size_gb(),
             s3: None,
@@ -358,5 +378,31 @@ write_servers = ["https://custom.server"]
         let write = config.all_write_servers();
         assert!(write.contains(&"https://legacy.server".to_string()));
         assert!(write.contains(&"https://upload.iris.to".to_string()));
+    }
+
+    #[test]
+    fn test_storage_backend_default() {
+        let config = Config::default();
+        assert_eq!(config.storage.backend, StorageBackend::Fs);
+    }
+
+    #[test]
+    fn test_storage_backend_lmdb() {
+        let toml = r#"
+[storage]
+backend = "lmdb"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.storage.backend, StorageBackend::Lmdb);
+    }
+
+    #[test]
+    fn test_storage_backend_fs_explicit() {
+        let toml = r#"
+[storage]
+backend = "fs"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.storage.backend, StorageBackend::Fs);
     }
 }

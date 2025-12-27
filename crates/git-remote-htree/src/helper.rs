@@ -20,48 +20,47 @@ const VERBOSE_THRESHOLD: Duration = Duration::from_secs(3);
 use hashtree_config::Config;
 use crate::nostr_client::{BlossomResult, NostrClient, RelayResult};
 
-// CachedStore: LMDB first, then Blossom fallback
+// CachedStore: local store first, then Blossom fallback
 mod cached_store {
     use hashtree_blossom::BlossomStore;
     use hashtree_core::{Hash, Store, StoreError};
-    use hashtree_lmdb::LmdbBlobStore;
     use std::sync::Arc;
 
     pub struct CachedStore {
-        lmdb: Arc<LmdbBlobStore>,
+        local: Arc<dyn Store + Send + Sync>,
         blossom: BlossomStore,
     }
 
     impl CachedStore {
-        pub fn new(lmdb: Arc<LmdbBlobStore>, blossom: BlossomStore) -> Self {
-            Self { lmdb, blossom }
+        pub fn new(local: Arc<dyn Store + Send + Sync>, blossom: BlossomStore) -> Self {
+            Self { local, blossom }
         }
     }
 
     #[async_trait::async_trait]
     impl Store for CachedStore {
         async fn put(&self, hash: Hash, data: Vec<u8>) -> Result<bool, StoreError> {
-            // Store in LMDB locally
-            self.lmdb.put(hash, data).await
+            // Store locally
+            self.local.put(hash, data).await
         }
 
         async fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
-            // Try LMDB first
-            if let Ok(Some(data)) = self.lmdb.get(hash).await {
+            // Try local first
+            if let Ok(Some(data)) = self.local.get(hash).await {
                 return Ok(Some(data));
             }
             // Fallback to Blossom
             let result = self.blossom.get(hash).await;
-            // Cache in LMDB if found
+            // Cache locally if found
             if let Ok(Some(ref data)) = result {
-                let _ = self.lmdb.put(*hash, data.clone()).await;
+                let _ = self.local.put(*hash, data.clone()).await;
             }
             result
         }
 
         async fn has(&self, hash: &Hash) -> Result<bool, StoreError> {
-            // Check LMDB first
-            if self.lmdb.has(hash).await? {
+            // Check local first
+            if self.local.has(hash).await? {
                 return Ok(true);
             }
             // Fallback to Blossom
@@ -69,8 +68,8 @@ mod cached_store {
         }
 
         async fn delete(&self, hash: &Hash) -> Result<bool, StoreError> {
-            // Delete from LMDB only (don't delete from remote)
-            self.lmdb.delete(hash).await
+            // Delete from local only (don't delete from remote)
+            self.local.delete(hash).await
         }
     }
 }
@@ -78,6 +77,28 @@ mod cached_store {
 /// Get the shared hashtree data directory
 fn get_hashtree_data_dir() -> PathBuf {
     hashtree_config::get_data_dir()
+}
+
+/// Create local blob store based on config
+fn create_local_store(path: &std::path::Path) -> Result<std::sync::Arc<dyn hashtree_core::Store + Send + Sync>> {
+    use hashtree_config::StorageBackend;
+    use hashtree_fs::FsBlobStore;
+
+    let config = Config::load_or_default();
+    match config.storage.backend {
+        StorageBackend::Fs => {
+            Ok(std::sync::Arc::new(FsBlobStore::new(path)?))
+        }
+        #[cfg(feature = "lmdb")]
+        StorageBackend::Lmdb => {
+            Ok(std::sync::Arc::new(hashtree_lmdb::LmdbBlobStore::new(path)?))
+        }
+        #[cfg(not(feature = "lmdb"))]
+        StorageBackend::Lmdb => {
+            warn!("LMDB backend requested but lmdb feature not enabled, using filesystem storage");
+            Ok(std::sync::Arc::new(FsBlobStore::new(path)?))
+        }
+    }
 }
 
 /// Git remote helper state machine
@@ -396,22 +417,19 @@ impl RemoteHelper {
     ) -> Result<Vec<(String, Vec<u8>)>> {
         use hashtree_blossom::BlossomStore;
         use hashtree_core::{Cid, HashTree, HashTreeConfig};
-        use hashtree_lmdb::LmdbBlobStore;
 
         let blossom = self.nostr.blossom();
         let mut objects = Vec::new();
 
         // Log the servers being used
         let servers = blossom.read_servers().to_vec();
-        info!("Creating CachedStore with LMDB + Blossom (servers: {:?})", servers);
+        info!("Creating CachedStore with local + Blossom (servers: {:?})", servers);
 
-        // Create LMDB store for local caching
+        // Create local blob store based on config
         let data_dir = get_hashtree_data_dir();
-        let lmdb_path = data_dir.join("blobs");
-        let lmdb = std::sync::Arc::new(
-            LmdbBlobStore::new(&lmdb_path)
-                .context("Failed to open LMDB store")?
-        );
+        let blobs_path = data_dir.join("blobs");
+        let local_store = create_local_store(&blobs_path)
+            .context("Failed to create local blob store")?;
 
         // Create Blossom store for remote fallback
         let blossom_store = BlossomStore::with_servers(
@@ -419,8 +437,8 @@ impl RemoteHelper {
             servers,
         );
 
-        // Create cached store: LMDB first, then Blossom
-        let store = cached_store::CachedStore::new(lmdb, blossom_store);
+        // Create cached store: local first, then Blossom
+        let store = cached_store::CachedStore::new(local_store, blossom_store);
         let tree = HashTree::new(HashTreeConfig::new(std::sync::Arc::new(store)));
 
         // Parse root hash and create Cid with encryption key

@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use heed::{Database, EnvOpenOptions};
 use heed::types::*;
+use hashtree_fs::FsBlobStore;
+#[cfg(feature = "lmdb")]
 use hashtree_lmdb::LmdbBlobStore;
 use hashtree_core::{
     HashTree, HashTreeConfig, Cid,
@@ -9,6 +11,7 @@ use hashtree_core::{
     types::Hash,
 };
 use hashtree_core::store::{Store, StoreError};
+use hashtree_config::StorageBackend;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::collections::HashSet;
@@ -50,6 +53,125 @@ pub struct CachedRoot {
     pub visibility: String,
 }
 
+/// Storage statistics
+#[derive(Debug, Clone)]
+pub struct LocalStoreStats {
+    pub count: usize,
+    pub total_bytes: u64,
+}
+
+/// Local blob store - wraps either FsBlobStore or LmdbBlobStore
+pub enum LocalStore {
+    Fs(FsBlobStore),
+    #[cfg(feature = "lmdb")]
+    Lmdb(LmdbBlobStore),
+}
+
+impl LocalStore {
+    /// Create a new local store based on config
+    pub fn new<P: AsRef<Path>>(path: P, backend: &StorageBackend) -> Result<Self, StoreError> {
+        match backend {
+            StorageBackend::Fs => {
+                Ok(LocalStore::Fs(FsBlobStore::new(path)?))
+            }
+            #[cfg(feature = "lmdb")]
+            StorageBackend::Lmdb => {
+                Ok(LocalStore::Lmdb(LmdbBlobStore::new(path)?))
+            }
+            #[cfg(not(feature = "lmdb"))]
+            StorageBackend::Lmdb => {
+                tracing::warn!("LMDB backend requested but lmdb feature not enabled, using filesystem storage");
+                Ok(LocalStore::Fs(FsBlobStore::new(path)?))
+            }
+        }
+    }
+
+    /// Sync put operation
+    pub fn put_sync(&self, hash: Hash, data: &[u8]) -> Result<bool, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.put_sync(hash, data),
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.put_sync(hash, data),
+        }
+    }
+
+    /// Sync get operation
+    pub fn get_sync(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.get_sync(hash),
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.get_sync(hash),
+        }
+    }
+
+    /// Check if hash exists
+    pub fn exists(&self, hash: &Hash) -> Result<bool, StoreError> {
+        match self {
+            LocalStore::Fs(store) => Ok(store.exists(hash)),
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.exists(hash),
+        }
+    }
+
+    /// Sync delete operation
+    pub fn delete_sync(&self, hash: &Hash) -> Result<bool, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.delete_sync(hash),
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.delete_sync(hash),
+        }
+    }
+
+    /// Get storage statistics
+    pub fn stats(&self) -> Result<LocalStoreStats, StoreError> {
+        match self {
+            LocalStore::Fs(store) => {
+                let stats = store.stats()?;
+                Ok(LocalStoreStats {
+                    count: stats.count,
+                    total_bytes: stats.total_bytes,
+                })
+            }
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => {
+                let stats = store.stats()?;
+                Ok(LocalStoreStats {
+                    count: stats.count,
+                    total_bytes: stats.total_bytes,
+                })
+            }
+        }
+    }
+
+    /// List all hashes in the store
+    pub fn list(&self) -> Result<Vec<Hash>, StoreError> {
+        match self {
+            LocalStore::Fs(store) => store.list(),
+            #[cfg(feature = "lmdb")]
+            LocalStore::Lmdb(store) => store.list(),
+        }
+    }
+}
+
+#[async_trait]
+impl Store for LocalStore {
+    async fn put(&self, hash: Hash, data: Vec<u8>) -> Result<bool, StoreError> {
+        self.put_sync(hash, &data)
+    }
+
+    async fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>, StoreError> {
+        self.get_sync(hash)
+    }
+
+    async fn has(&self, hash: &Hash) -> Result<bool, StoreError> {
+        self.exists(hash)
+    }
+
+    async fn delete(&self, hash: &Hash) -> Result<bool, StoreError> {
+        self.delete_sync(hash)
+    }
+}
+
 #[cfg(feature = "s3")]
 use tokio::sync::mpsc;
 
@@ -62,13 +184,13 @@ enum S3SyncMessage {
     Delete { hash: Hash },
 }
 
-/// Storage router - LMDB primary with optional S3 backup
+/// Storage router - local store primary with optional S3 backup
 ///
-/// Write path: LMDB first (fast), then queue S3 upload (non-blocking)
-/// Read path: LMDB first, fall back to S3 if miss
+/// Write path: local first (fast), then queue S3 upload (non-blocking)
+/// Read path: local first, fall back to S3 if miss
 pub struct StorageRouter {
     /// Primary local store (always used)
-    local: Arc<LmdbBlobStore>,
+    local: Arc<LocalStore>,
     /// Optional S3 client for backup
     #[cfg(feature = "s3")]
     s3_client: Option<aws_sdk_s3::Client>,
@@ -82,8 +204,8 @@ pub struct StorageRouter {
 }
 
 impl StorageRouter {
-    /// Create router with LMDB only
-    pub fn new(local: Arc<LmdbBlobStore>) -> Self {
+    /// Create router with local storage only
+    pub fn new(local: Arc<LocalStore>) -> Self {
         Self {
             local,
             #[cfg(feature = "s3")]
@@ -97,9 +219,9 @@ impl StorageRouter {
         }
     }
 
-    /// Create router with LMDB + S3 backup
+    /// Create router with local storage + S3 backup
     #[cfg(feature = "s3")]
-    pub async fn with_s3(local: Arc<LmdbBlobStore>, config: &S3Config) -> Result<Self, anyhow::Error> {
+    pub async fn with_s3(local: Arc<LocalStore>, config: &S3Config) -> Result<Self, anyhow::Error> {
         use aws_sdk_s3::Client as S3Client;
 
         // Build AWS config
@@ -304,7 +426,7 @@ impl StorageRouter {
     }
 
     /// Get stats from local store
-    pub fn stats(&self) -> Result<hashtree_lmdb::LmdbStats, StoreError> {
+    pub fn stats(&self) -> Result<LocalStoreStats, StoreError> {
         self.local.stats()
     }
 
@@ -313,8 +435,8 @@ impl StorageRouter {
         self.local.list()
     }
 
-    /// Get the underlying LMDB store for HashTree operations
-    pub fn local_store(&self) -> Arc<LmdbBlobStore> {
+    /// Get the underlying local store for HashTree operations
+    pub fn local_store(&self) -> Arc<LocalStore> {
         Arc::clone(&self.local)
     }
 }
@@ -395,8 +517,12 @@ impl HashtreeStore {
         let cached_roots = env.create_database(&mut wtxn, Some("cached_roots"))?;
         wtxn.commit()?;
 
-        // Create local LMDB blob store
-        let lmdb_store = Arc::new(LmdbBlobStore::new(path.join("blobs"))
+        // Get storage backend from config
+        let config = hashtree_config::Config::load_or_default();
+        let backend = &config.storage.backend;
+
+        // Create local blob store based on configured backend
+        let local_store = Arc::new(LocalStore::new(path.join("blobs"), backend)
             .map_err(|e| anyhow::anyhow!("Failed to create blob store: {}", e))?);
 
         // Create storage router with optional S3
@@ -406,10 +532,10 @@ impl HashtreeStore {
                 s3_cfg.bucket, s3_cfg.endpoint);
 
             sync_block_on(async {
-                StorageRouter::with_s3(lmdb_store, s3_cfg).await
+                StorageRouter::with_s3(local_store, s3_cfg).await
             })?
         } else {
-            StorageRouter::new(lmdb_store)
+            StorageRouter::new(local_store)
         });
 
         #[cfg(not(feature = "s3"))]
@@ -417,7 +543,7 @@ impl HashtreeStore {
             if s3_config.is_some() {
                 tracing::warn!("S3 config provided but S3 feature not enabled. Using local storage only.");
             }
-            StorageRouter::new(lmdb_store)
+            StorageRouter::new(local_store)
         });
 
         Ok(Self {
