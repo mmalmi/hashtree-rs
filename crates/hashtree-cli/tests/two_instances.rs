@@ -385,9 +385,17 @@ fn test_two_instances_discover_and_sync() {
 
 fn extract_cid(text: &str) -> Option<String> {
     // First try to find nhash format (preferred)
+    // Note: output may be "nhash1.../filename" URL format, extract just the nhash part
     if let Some(nhash) = text.lines().find_map(|line| {
         line.split_whitespace().find(|word| word.starts_with("nhash1"))
-            .map(|s| s.to_string())
+            .map(|s| {
+                // Strip /filename suffix if present
+                if let Some(slash_pos) = s.find('/') {
+                    s[..slash_pos].to_string()
+                } else {
+                    s.to_string()
+                }
+            })
     }) {
         return Some(nhash);
     }

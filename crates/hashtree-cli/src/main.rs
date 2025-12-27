@@ -545,8 +545,11 @@ async fn main() -> Result<()> {
                     let hash = from_hex(&hash_hex).context("Invalid hash")?;
                     let nhash = nhash_encode(&hash)
                         .map_err(|e| anyhow::anyhow!("Failed to encode nhash: {}", e))?;
+                    let filename = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     println!("added {}", path.display());
-                    println!("  nhash: {}", nhash);
+                    println!("  url:   {}/{}", nhash, filename);
                     println!("  hash:  {}", hash_hex);
                     (hash_hex, None)
                 } else {
@@ -573,8 +576,11 @@ async fn main() -> Result<()> {
                     };
                     let nhash = nhash_encode_full(&nhash_data)
                         .map_err(|e| anyhow::anyhow!("Failed to encode nhash: {}", e))?;
+                    let filename = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     println!("added {}", path.display());
-                    println!("  nhash: {}", nhash);
+                    println!("  url:   {}/{}", nhash, filename);
                     println!("  hash:  {}", hash_hex);
                     if let Some(ref k) = key_hex {
                         println!("  key:   {}", k);
