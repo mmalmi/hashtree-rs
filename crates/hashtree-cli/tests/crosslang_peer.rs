@@ -86,7 +86,7 @@ crawl_depth = 0
             .arg("--relays")
             .arg(&relay_url)
             .env("HOME", home_dir)
-            .env("RUST_LOG", "warn,hashtree_cli::webrtc=info")
+            .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,hashtree_cli::webrtc=info".to_string()))
             .stdout(Stdio::inherit())  // Forward stdout to test output
             .stderr(Stdio::inherit())  // Forward stderr to test output
             .spawn()

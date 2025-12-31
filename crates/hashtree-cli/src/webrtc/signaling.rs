@@ -899,6 +899,7 @@ impl WebRTCManager {
         offer: serde_json::Value,
         relay_write_tx: &tokio::sync::broadcast::Sender<SignalingMessage>,
     ) -> Result<()> {
+        debug!("handle_offer ENTRY: sender={}, uuid={}", &sender_pubkey[..8.min(sender_pubkey.len())], their_uuid);
         let full_peer_id = PeerId::new(sender_pubkey.to_string(), Some(their_uuid.to_string()));
         let peer_key = full_peer_id.to_string();
 
@@ -910,22 +911,30 @@ impl WebRTCManager {
         // Check if we already have this peer with an actual connection
         {
             let peers = self.state.peers.read().await;
+            debug!("Checking for existing peer, peer_key: {}, known_peers: {}", peer_key, peers.len());
             if let Some(entry) = peers.get(&peer_key) {
                 // Only skip if we have an actual peer connection (not just discovered)
                 if entry.peer.is_some() {
                     debug!("Already have peer {} with connection, skipping offer", full_peer_id.short());
                     return Ok(());
                 }
+                debug!("Peer {} exists but has no connection, proceeding", full_peer_id.short());
+            } else {
+                debug!("Peer {} not found in peers map, will create new entry", full_peer_id.short());
             }
         }
 
         // Check pool limits
         let pool_counts = self.get_pool_counts().await;
+        debug!("Pool counts: {:?}, checking can_accept_peer for {:?}", pool_counts, pool);
         if !self.can_accept_peer(pool, &pool_counts) {
             warn!("Rejecting offer from {} - pool {:?} is full", full_peer_id.short(), pool);
             return Ok(());
         }
+        debug!("Pool check passed for {}", full_peer_id.short());
+
         // Create peer connection with content store and state events
+        debug!("Creating peer connection for {}", full_peer_id.short());
         let mut peer = Peer::new_with_store_and_events(
             full_peer_id.clone(),
             PeerDirection::Inbound,
@@ -936,11 +945,14 @@ impl WebRTCManager {
             Some(self.state_event_tx.clone()),
         )
         .await?;
+        debug!("Peer connection created for {}", full_peer_id.short());
 
         peer.setup_handlers().await?;
+        debug!("Handlers set up for {}", full_peer_id.short());
 
         // Handle offer and create answer
         let answer = peer.handle_offer(offer).await?;
+        debug!("Answer created for {}", full_peer_id.short());
 
         // Update state
         {
@@ -1005,7 +1017,11 @@ impl WebRTCManager {
                 }
                 peer.handle_answer(answer).await?;
                 info!("Applied answer from {}", full_peer_id.short());
+            } else {
+                debug!("Peer {} has no connection object", full_peer_id.short());
             }
+        } else {
+            debug!("No peer found for key: {}", peer_key);
         }
 
         Ok(())

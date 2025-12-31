@@ -10,7 +10,6 @@ use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
-use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
@@ -106,11 +105,10 @@ impl Peer {
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut m)?;
 
-        // Disable mDNS to prevent CPU spin from orphaned mDNS agents.
-        // See: https://github.com/webrtc-rs/webrtc/issues/616
-        // mDNS is only useful for LAN peer discovery which we don't need.
-        let mut setting_engine = SettingEngine::default();
-        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        // Enable mDNS temporarily for debugging
+        // Previously disabled due to https://github.com/webrtc-rs/webrtc/issues/616
+        let setting_engine = SettingEngine::default();
+        // Note: mDNS enabled by default
 
         let api = APIBuilder::new()
             .with_media_engine(m)
@@ -134,7 +132,6 @@ impl Peer {
 
         let pc = Arc::new(api.new_peer_connection(config).await?);
         let (message_tx, message_rx) = mpsc::channel(100);
-
         Ok(Self {
             peer_id,
             direction,
@@ -254,14 +251,29 @@ impl Peer {
         }
         println!("[Peer {}] Data channel stored", self.peer_id.short());
 
-        // Create offer
+        // Create offer and wait for ICE gathering to complete
+        // This ensures all ICE candidates are embedded in the SDP
         let offer = self.pc.create_offer(None).await?;
-        self.pc.set_local_description(offer.clone()).await?;
+        let mut gathering_complete = self.pc.gathering_complete_promise().await;
+        self.pc.set_local_description(offer).await?;
+
+        // Wait for ICE gathering to complete (with timeout)
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            gathering_complete.recv()
+        ).await;
+
+        // Get the local description with ICE candidates embedded
+        let local_desc = self.pc.local_description().await
+            .ok_or_else(|| anyhow::anyhow!("No local description after gathering"))?;
+
+        debug!("Offer created, SDP len: {}, ice_gathering: {:?}",
+            local_desc.sdp.len(), self.pc.ice_gathering_state());
 
         // Return offer as JSON
         let offer_json = serde_json::json!({
-            "type": offer.sdp_type.to_string().to_lowercase(),
-            "sdp": offer.sdp
+            "type": local_desc.sdp_type.to_string().to_lowercase(),
+            "sdp": local_desc.sdp
         });
 
         Ok(offer_json)
@@ -312,17 +324,32 @@ impl Peer {
                 })
             }));
 
-        // Now set remote description after handler is registered
+        // Set remote description after handler is registered
         let offer_desc = RTCSessionDescription::offer(sdp.to_string())?;
         self.pc.set_remote_description(offer_desc).await?;
 
-        // Create answer
+        // Create answer and wait for ICE gathering to complete
+        // This ensures all ICE candidates are embedded in the SDP
         let answer = self.pc.create_answer(None).await?;
-        self.pc.set_local_description(answer.clone()).await?;
+        let mut gathering_complete = self.pc.gathering_complete_promise().await;
+        self.pc.set_local_description(answer).await?;
+
+        // Wait for ICE gathering to complete (with timeout)
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            gathering_complete.recv()
+        ).await;
+
+        // Get the local description with ICE candidates embedded
+        let local_desc = self.pc.local_description().await
+            .ok_or_else(|| anyhow::anyhow!("No local description after gathering"))?;
+
+        debug!("Answer created, SDP len: {}, ice_gathering: {:?}",
+            local_desc.sdp.len(), self.pc.ice_gathering_state());
 
         let answer_json = serde_json::json!({
-            "type": answer.sdp_type.to_string().to_lowercase(),
-            "sdp": answer.sdp
+            "type": local_desc.sdp_type.to_string().to_lowercase(),
+            "sdp": local_desc.sdp
         });
 
         Ok(answer_json)
