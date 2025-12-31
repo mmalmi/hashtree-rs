@@ -712,8 +712,11 @@ impl WebRTCManager {
                 if recipient != self.my_peer_id.to_string() {
                     return Ok(()); // Not for us
                 }
-                self.handle_offer(&sender_pubkey, &their_uuid, offer, relay_write_tx)
-                    .await?;
+                if let Err(e) = self.handle_offer(&sender_pubkey, &their_uuid, offer, relay_write_tx)
+                    .await {
+                    error!("handle_offer FAILED: sender={}, uuid={}, error={:?}", &sender_pubkey[..8.min(sender_pubkey.len())], their_uuid, e);
+                    return Err(e);
+                }
             }
             SignalingMessage::Answer {
                 recipient,
@@ -971,10 +974,12 @@ impl WebRTCManager {
         }
 
         // Send answer
+        // Note: peer_id is just the UUID, not full pubkey:uuid
+        // The recipient will construct full peer_id from sender pubkey + this UUID
         let answer_msg = SignalingMessage::Answer {
             answer,
             recipient: full_peer_id.to_string(),
-            peer_id: self.my_peer_id.to_string(),
+            peer_id: self.my_peer_id.uuid.clone(),
         };
         if relay_write_tx.send(answer_msg).is_err() {
             warn!("Failed to send answer to {}", full_peer_id.short());

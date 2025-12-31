@@ -5,7 +5,8 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::transport::{DataChannel, PeerConnectionFactory, TransportError};
 use crate::types::DATA_CHANNEL_LABEL;
@@ -14,6 +15,7 @@ use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -22,8 +24,32 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 /// Wrapper around RTCDataChannel that implements our DataChannel trait
-struct RealDataChannel {
+pub struct RealDataChannel {
     dc: Arc<RTCDataChannel>,
+    /// Receiver for incoming messages (populated by on_message callback)
+    msg_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl RealDataChannel {
+    /// Create a new RealDataChannel with message handling
+    pub fn new(dc: Arc<RTCDataChannel>) -> Arc<Self> {
+        let (msg_tx, msg_rx) = mpsc::channel(100);
+
+        // Set up on_message handler to forward messages to channel
+        let tx = msg_tx.clone();
+        dc.on_message(Box::new(move |msg: DataChannelMessage| {
+            let tx = tx.clone();
+            let data = msg.data.to_vec();
+            Box::pin(async move {
+                let _ = tx.send(data).await;
+            })
+        }));
+
+        Arc::new(Self {
+            dc,
+            msg_rx: Mutex::new(msg_rx),
+        })
+    }
 }
 
 #[async_trait]
@@ -37,13 +63,10 @@ impl DataChannel for RealDataChannel {
     }
 
     async fn recv(&self) -> Option<Vec<u8>> {
-        // Note: RTCDataChannel doesn't have a direct recv - it uses callbacks
-        // This is a simplified implementation - in practice, messages come via on_message
-        None
+        self.msg_rx.lock().await.recv().await
     }
 
     fn is_open(&self) -> bool {
-        // Check data channel state
         self.dc.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
     }
 
@@ -66,17 +89,28 @@ pub struct RealPeerConnectionFactory {
     pending: RwLock<HashMap<String, PendingConnection>>,
     /// Pending inbound connections (we received offer, sent answer)
     inbound: RwLock<HashMap<String, PendingConnection>>,
+    /// STUN servers for ICE
+    stun_servers: Vec<String>,
 }
 
 impl RealPeerConnectionFactory {
     pub fn new() -> Self {
+        Self::with_stun_servers(vec![
+            "stun:stun.iris.to:3478".to_string(),
+            "stun:stun.l.google.com:19302".to_string(),
+            "stun:stun.cloudflare.com:3478".to_string(),
+        ])
+    }
+
+    pub fn with_stun_servers(stun_servers: Vec<String>) -> Self {
         Self {
             pending: RwLock::new(HashMap::new()),
             inbound: RwLock::new(HashMap::new()),
+            stun_servers,
         }
     }
 
-    async fn create_connection() -> Result<Arc<RTCPeerConnection>, TransportError> {
+    async fn create_connection(&self) -> Result<Arc<RTCPeerConnection>, TransportError> {
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
@@ -93,11 +127,7 @@ impl RealPeerConnectionFactory {
 
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
-                urls: vec![
-                    "stun:stun.iris.to:3478".to_string(),
-                    "stun:stun.l.google.com:19302".to_string(),
-                    "stun:stun.cloudflare.com:3478".to_string(),
-                ],
+                urls: self.stun_servers.clone(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -107,6 +137,24 @@ impl RealPeerConnectionFactory {
             .await
             .map(Arc::new)
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))
+    }
+
+    /// Wait for ICE gathering to complete and return the SDP with embedded candidates
+    async fn wait_for_ice_gathering(
+        connection: &Arc<RTCPeerConnection>,
+    ) -> Result<String, TransportError> {
+        let mut gathering_complete = connection.gathering_complete_promise().await;
+
+        // Wait for ICE gathering to complete (with timeout)
+        let _ = tokio::time::timeout(Duration::from_secs(10), gathering_complete.recv()).await;
+
+        // Get the local description with ICE candidates embedded
+        let local_desc = connection
+            .local_description()
+            .await
+            .ok_or_else(|| TransportError::ConnectionFailed("No local description after ICE gathering".to_string()))?;
+
+        Ok(local_desc.sdp)
     }
 }
 
@@ -122,9 +170,9 @@ impl PeerConnectionFactory for RealPeerConnectionFactory {
         &self,
         target_peer_id: &str,
     ) -> Result<(Arc<dyn DataChannel>, String), TransportError> {
-        let connection = Self::create_connection().await?;
+        let connection = self.create_connection().await?;
 
-        // Create data channel
+        // Create data channel (unordered for better performance - protocol is stateless)
         let dc_init = RTCDataChannelInit {
             ordered: Some(false),
             ..Default::default()
@@ -134,18 +182,21 @@ impl PeerConnectionFactory for RealPeerConnectionFactory {
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
-        // Create offer
+        // Create offer and set local description to start ICE gathering
         let offer = connection
             .create_offer(None)
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
         connection
-            .set_local_description(offer.clone())
+            .set_local_description(offer)
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
-        // Store pending connection
+        // Wait for ICE gathering to complete - this embeds ICE candidates in the SDP
+        let sdp = Self::wait_for_ice_gathering(&connection).await?;
+
+        // Store pending connection (we'll need it when answer arrives)
         self.pending.write().await.insert(
             target_peer_id.to_string(),
             PendingConnection {
@@ -154,8 +205,9 @@ impl PeerConnectionFactory for RealPeerConnectionFactory {
             },
         );
 
-        let channel: Arc<dyn DataChannel> = Arc::new(RealDataChannel { dc });
-        Ok((channel, offer.sdp))
+        // Create channel wrapper with message handling
+        let channel: Arc<dyn DataChannel> = RealDataChannel::new(dc);
+        Ok((channel, sdp))
     }
 
     async fn accept_offer(
@@ -163,7 +215,21 @@ impl PeerConnectionFactory for RealPeerConnectionFactory {
         from_peer_id: &str,
         offer_sdp: &str,
     ) -> Result<(Arc<dyn DataChannel>, String), TransportError> {
-        let connection = Self::create_connection().await?;
+        let connection = self.create_connection().await?;
+
+        // Set up data channel callback BEFORE setting remote description
+        // This ensures we catch the data channel when it arrives
+        let (dc_tx, dc_rx) = tokio::sync::oneshot::channel::<Arc<RTCDataChannel>>();
+        let dc_tx = Arc::new(Mutex::new(Some(dc_tx)));
+
+        connection.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let dc_tx = dc_tx.clone();
+            Box::pin(async move {
+                if let Some(tx) = dc_tx.lock().await.take() {
+                    let _ = tx.send(dc);
+                }
+            })
+        }));
 
         // Set remote description (the offer)
         let offer = RTCSessionDescription::offer(offer_sdp.to_string())
@@ -173,32 +239,37 @@ impl PeerConnectionFactory for RealPeerConnectionFactory {
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
-        // Create and set answer
+        // Create answer and set local description to start ICE gathering
         let answer = connection
             .create_answer(None)
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
         connection
-            .set_local_description(answer.clone())
+            .set_local_description(answer)
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
-        // Store for later - data channel will arrive via on_data_channel callback
+        // Wait for ICE gathering to complete - this embeds ICE candidates in the SDP
+        let sdp = Self::wait_for_ice_gathering(&connection).await?;
+
+        // Wait for data channel from remote peer (with timeout)
+        let dc = tokio::time::timeout(Duration::from_secs(30), dc_rx)
+            .await
+            .map_err(|_| TransportError::ConnectionFailed("Timeout waiting for data channel".to_string()))?
+            .map_err(|_| TransportError::ConnectionFailed("Data channel sender dropped".to_string()))?;
+
+        // Store connection for potential future use
         self.inbound.write().await.insert(
             from_peer_id.to_string(),
             PendingConnection {
                 connection,
-                data_channel: None,
+                data_channel: Some(dc.clone()),
             },
         );
 
-        // Note: We need to wait for the data channel from the remote side
-        // For now, return a placeholder - the real implementation would need
-        // to set up callbacks and wait for the channel to be established
-        // This is simplified for the trait interface
-        Err(TransportError::ConnectionFailed(
-            "Data channel not yet received - need to implement callback".to_string(),
-        ))
+        // Create channel wrapper with message handling
+        let channel: Arc<dyn DataChannel> = RealDataChannel::new(dc);
+        Ok((channel, sdp))
     }
 
     async fn handle_answer(
@@ -222,11 +293,11 @@ impl PeerConnectionFactory for RealPeerConnectionFactory {
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
-        // Return the data channel we created earlier
+        // Return the data channel we created earlier with message handling
         let dc = pending
             .data_channel
             .ok_or_else(|| TransportError::ConnectionFailed("No data channel".to_string()))?;
 
-        Ok(Arc::new(RealDataChannel { dc }))
+        Ok(RealDataChannel::new(dc))
     }
 }

@@ -1,14 +1,20 @@
 //! Nostr relay transport implementation
 //!
 //! Wraps nostr-sdk Client to implement the RelayTransport trait for production use.
+//! Uses NIP-17 style gift-wrapping for directed messages (offer, answer, candidate)
+//! to provide privacy from relays.
 
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::transport::{RelayTransport, TransportError};
 use crate::types::{SignalingMessage, NOSTR_KIND_HASHTREE};
+
+/// Hello tag for broadcast peer discovery
+const HELLO_TAG: &str = "hello";
 
 /// Nostr relay transport for production WebRTC signaling
 pub struct NostrRelayTransport {
@@ -16,6 +22,8 @@ pub struct NostrRelayTransport {
     peer_id: String,
     /// Our pubkey (hex)
     pubkey: String,
+    /// Nostr keys for signing and decryption
+    keys: Keys,
     /// Nostr client
     client: Client,
     /// Message buffer for received signaling messages
@@ -38,7 +46,7 @@ impl NostrRelayTransport {
 
         // Create client with in-memory database to avoid event deduplication
         let client = ClientBuilder::new()
-            .signer(keys)
+            .signer(keys.clone())
             .database(nostr_sdk::database::MemoryDatabase::new())
             .build();
 
@@ -47,6 +55,7 @@ impl NostrRelayTransport {
         Self {
             peer_id,
             pubkey,
+            keys,
             client,
             buffer: Mutex::new(Vec::new()),
             connected: AtomicBool::new(false),
@@ -60,6 +69,8 @@ impl NostrRelayTransport {
     fn start_event_handler(&self) {
         let msg_tx = self.msg_tx.clone();
         let peer_id = self.peer_id.clone();
+        let pubkey = self.pubkey.clone();
+        let keys = self.keys.clone();
         let debug = self.debug;
 
         // Get notifications receiver
@@ -71,21 +82,9 @@ impl NostrRelayTransport {
                     Ok(notification) => {
                         if let RelayPoolNotification::Event { event, .. } = notification {
                             if event.kind == Kind::Custom(NOSTR_KIND_HASHTREE) {
-                                if let Ok(msg) =
-                                    serde_json::from_str::<SignalingMessage>(&event.content)
-                                {
-                                    // Only forward messages for us or broadcasts
-                                    if msg.is_for(&peer_id) || msg.target_peer_id().is_none() {
-                                        if debug {
-                                            let preview = if event.content.len() > 60 {
-                                                format!("{}...", &event.content[..60])
-                                            } else {
-                                                event.content.clone()
-                                            };
-                                            println!("[NostrTransport] Received: {}", preview);
-                                        }
-                                        let _ = msg_tx.send(msg);
-                                    }
+                                // Handle the event - may be hello (plain) or directed (encrypted)
+                                if let Some(msg) = Self::handle_event(&event, &peer_id, &pubkey, &keys, debug) {
+                                    let _ = msg_tx.send(msg);
                                 }
                             }
                         }
@@ -95,6 +94,110 @@ impl NostrRelayTransport {
                 }
             }
         });
+    }
+
+    /// Handle incoming event - returns SignalingMessage if valid and for us
+    fn handle_event(
+        event: &Event,
+        my_peer_id: &str,
+        my_pubkey: &str,
+        keys: &Keys,
+        debug: bool,
+    ) -> Option<SignalingMessage> {
+        // Helper to get tag value
+        let get_tag = |name: &str| -> Option<String> {
+            event.tags.iter().find_map(|tag| {
+                let v: Vec<String> = tag.clone().to_vec();
+                if v.len() >= 2 && v[0] == name {
+                    Some(v[1].clone())
+                } else {
+                    None
+                }
+            })
+        };
+
+        // Check if this is a hello message (#l: "hello" tag)
+        if get_tag("l").as_deref() == Some(HELLO_TAG) {
+            let sender_pubkey = event.pubkey.to_hex();
+
+            // Skip our own hello messages
+            if sender_pubkey == my_pubkey {
+                return None;
+            }
+
+            if let Some(their_uuid) = get_tag("peerId") {
+                let their_peer_id = format!("{}:{}", sender_pubkey, their_uuid);
+                if debug {
+                    println!("[NostrTransport] Received hello from {}", &sender_pubkey[..8.min(sender_pubkey.len())]);
+                }
+                return Some(SignalingMessage::Hello {
+                    peer_id: their_peer_id,
+                    roots: vec![],
+                });
+            }
+            return None;
+        }
+
+        // Check if this is a directed message for us (#p tag with our pubkey)
+        let p_tag = get_tag("p");
+        if p_tag.as_deref() != Some(my_pubkey) {
+            // Not for us - ignore silently
+            return None;
+        }
+
+        // Gift-wrapped directed message - decrypt using our key and ephemeral sender's pubkey
+        if event.content.is_empty() {
+            return None;
+        }
+
+        // Try to unwrap the gift - decrypt with our key and the ephemeral sender's pubkey
+        let seal: serde_json::Value = match nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content) {
+            Ok(plaintext) => {
+                match serde_json::from_str(&plaintext) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                }
+            }
+            Err(_) => {
+                // Can't decrypt - not for us or invalid
+                return None;
+            }
+        };
+
+        // Extract the actual sender's pubkey from the seal
+        let sender_pubkey = seal.get("pubkey")
+            .and_then(|v| v.as_str())?;
+
+        // Skip our own messages
+        if sender_pubkey == my_pubkey {
+            return None;
+        }
+
+        let content = seal.get("content")
+            .and_then(|v| v.as_str())?;
+
+        let msg: SignalingMessage = serde_json::from_str(content).ok()?;
+
+        if debug {
+            println!(
+                "[NostrTransport] Received {} from {} (gift-wrapped)",
+                match &msg {
+                    SignalingMessage::Hello { .. } => "hello",
+                    SignalingMessage::Offer { .. } => "offer",
+                    SignalingMessage::Answer { .. } => "answer",
+                    SignalingMessage::Candidate { .. } => "candidate",
+                    SignalingMessage::Candidates { .. } => "candidates",
+                },
+                &sender_pubkey[..8.min(sender_pubkey.len())]
+            );
+        }
+
+        // Only forward if message is for us
+        if msg.is_for(my_peer_id) {
+            Some(msg)
+        } else {
+            None
+        }
     }
 
     /// Get the nostr client (for advanced usage)
@@ -117,13 +220,27 @@ impl RelayTransport for NostrRelayTransport {
         // Connect
         self.client.connect().await;
 
-        // Subscribe to hashtree signaling events
-        let filter = Filter::new()
+        // Subscribe to hashtree signaling events - two filters:
+        // 1. Hello messages: kind with #l: "hello" tag (broadcasts)
+        // 2. Directed messages: kind with #p tag (our pubkey) for gift-wrapped messages
+        let hello_filter = Filter::new()
             .kind(Kind::Custom(NOSTR_KIND_HASHTREE))
-            .since(Timestamp::now());
+            .custom_tag(
+                nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::L),
+                vec![HELLO_TAG],
+            )
+            .since(Timestamp::now() - Duration::from_secs(60));
+
+        let directed_filter = Filter::new()
+            .kind(Kind::Custom(NOSTR_KIND_HASHTREE))
+            .custom_tag(
+                nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::P),
+                vec![self.pubkey.clone()],
+            )
+            .since(Timestamp::now() - Duration::from_secs(60));
 
         self.client
-            .subscribe(vec![filter], None)
+            .subscribe(vec![hello_filter, directed_filter], None)
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
@@ -144,26 +261,107 @@ impl RelayTransport for NostrRelayTransport {
             return Err(TransportError::NotConnected);
         }
 
-        let json = serde_json::to_string(&msg)
-            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        // Check if message has a target (needs gift wrapping)
+        if let Some(target_peer_id) = msg.target_peer_id() {
+            // Parse target peer ID to get their pubkey (format: pubkey:uuid)
+            let recipient_pubkey = target_peer_id
+                .split(':')
+                .next()
+                .ok_or_else(|| TransportError::SendFailed("Invalid target peer ID format".to_string()))?;
 
-        if self.debug {
-            println!(
-                "[NostrTransport] Publishing: {}",
-                &json[..json.len().min(80)]
-            );
-        }
+            let recipient_pk = PublicKey::from_hex(recipient_pubkey)
+                .map_err(|e| TransportError::SendFailed(format!("Invalid recipient pubkey: {}", e)))?;
 
-        let builder = EventBuilder::new(Kind::Custom(NOSTR_KIND_HASHTREE), json, []);
+            // Create seal with sender's actual pubkey (the "rumor")
+            let seal = serde_json::json!({
+                "pubkey": self.pubkey,
+                "kind": NOSTR_KIND_HASHTREE,
+                "content": serde_json::to_string(&msg)
+                    .map_err(|e| TransportError::SendFailed(e.to_string()))?,
+                "tags": []
+            });
 
-        match self.client.send_event_builder(builder).await {
-            Ok(output) => {
-                if output.success.is_empty() {
-                    return Err(TransportError::SendFailed("No relay accepted event".to_string()));
-                }
-                Ok(())
+            // Generate ephemeral keypair for the wrapper
+            let ephemeral_keys = Keys::generate();
+
+            // Encrypt the seal for the recipient using ephemeral key (NIP-44)
+            let encrypted_content = nip44::encrypt(
+                ephemeral_keys.secret_key(),
+                &recipient_pk,
+                &seal.to_string(),
+                nip44::Version::V2
+            ).map_err(|e| TransportError::SendFailed(format!("Encryption failed: {}", e)))?;
+
+            // Create wrapper event with ephemeral key
+            let expiration = Timestamp::now() + Duration::from_secs(5 * 60); // 5 minutes
+
+            let tags = vec![
+                Tag::public_key(recipient_pk),
+                Tag::expiration(expiration),
+            ];
+
+            if self.debug {
+                println!(
+                    "[NostrTransport] Publishing {} to {} (gift-wrapped)",
+                    match &msg {
+                        SignalingMessage::Hello { .. } => "hello",
+                        SignalingMessage::Offer { .. } => "offer",
+                        SignalingMessage::Answer { .. } => "answer",
+                        SignalingMessage::Candidate { .. } => "candidate",
+                        SignalingMessage::Candidates { .. } => "candidates",
+                    },
+                    &recipient_pubkey[..8.min(recipient_pubkey.len())]
+                );
             }
-            Err(e) => Err(TransportError::SendFailed(e.to_string())),
+
+            let builder = EventBuilder::new(Kind::Custom(NOSTR_KIND_HASHTREE), encrypted_content, tags);
+            let event = builder
+                .to_event(&ephemeral_keys)
+                .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+
+            match self.client.send_event(event).await {
+                Ok(output) => {
+                    if output.success.is_empty() {
+                        return Err(TransportError::SendFailed("No relay accepted event".to_string()));
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(TransportError::SendFailed(e.to_string())),
+            }
+        } else {
+            // Hello message - broadcast with #l: "hello" tag
+            // Extract UUID from our peer_id (format: pubkey:uuid)
+            let our_uuid = self.peer_id
+                .split(':')
+                .nth(1)
+                .unwrap_or(&self.peer_id);
+
+            let tags = vec![
+                Tag::custom(
+                    nostr_sdk::TagKind::SingleLetter(nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::L)),
+                    vec![HELLO_TAG.to_string()]
+                ),
+                Tag::custom(
+                    nostr_sdk::TagKind::Custom(std::borrow::Cow::Borrowed("peerId")),
+                    vec![our_uuid.to_string()]
+                ),
+            ];
+
+            if self.debug {
+                println!("[NostrTransport] Publishing hello (broadcast)");
+            }
+
+            let builder = EventBuilder::new(Kind::Custom(NOSTR_KIND_HASHTREE), "", tags);
+
+            match self.client.send_event_builder(builder).await {
+                Ok(output) => {
+                    if output.success.is_empty() {
+                        return Err(TransportError::SendFailed("No relay accepted event".to_string()));
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(TransportError::SendFailed(e.to_string())),
+            }
         }
     }
 

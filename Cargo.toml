@@ -36,6 +36,7 @@ hashtree-sim = { version = "0.2.1", path = "crates/hashtree-sim" }
 hashtree-resolver = { version = "0.2.1", path = "crates/hashtree-resolver" }
 hashtree-config = { version = "0.2.1", path = "crates/hashtree-config" }
 hashtree-fs = { version = "0.2.1", path = "crates/hashtree-fs" }
+hashtree-webrtc = { version = "0.2.1", path = "crates/hashtree-webrtc" }
 
 # AWS S3
 aws-sdk-s3 = "1"

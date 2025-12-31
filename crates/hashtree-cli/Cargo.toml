@@ -27,6 +27,7 @@ hashtree-lmdb = { workspace = true, optional = true }
 hashtree-blossom.workspace = true
 hashtree-config.workspace = true
 hashtree-resolver = { workspace = true, features = ["nostr"] }
+hashtree-webrtc.workspace = true
 
 # AWS S3 (optional)
 aws-sdk-s3 = { workspace = true, optional = true }
