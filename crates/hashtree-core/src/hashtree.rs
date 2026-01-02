@@ -737,6 +737,146 @@ impl<S: Store> HashTree<S> {
         Ok(Some(assembled))
     }
 
+    /// Read a byte range from a file (fetches only necessary chunks)
+    ///
+    /// - `start`: Starting byte offset (inclusive)
+    /// - `end`: Ending byte offset (exclusive), or None to read to end
+    ///
+    /// This is more efficient than read_file() for partial reads of large files.
+    pub async fn read_file_range(
+        &self,
+        hash: &Hash,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, HashTreeError> {
+        let data = match self.store.get(hash).await.map_err(|e| HashTreeError::Store(e.to_string()))? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Single blob - just slice it
+        if !is_tree_node(&data) {
+            let start_idx = start as usize;
+            let end_idx = end.map(|e| e as usize).unwrap_or(data.len());
+            if start_idx >= data.len() {
+                return Ok(Some(vec![]));
+            }
+            let end_idx = end_idx.min(data.len());
+            return Ok(Some(data[start_idx..end_idx].to_vec()));
+        }
+
+        // It's a chunked file - fetch only needed chunks
+        let node = decode_tree_node(&data)?;
+        let range_data = self.assemble_chunks_range(&node, start, end).await?;
+        Ok(Some(range_data))
+    }
+
+    /// Assemble only the chunks needed for a byte range
+    async fn assemble_chunks_range(
+        &self,
+        node: &TreeNode,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<u8>, HashTreeError> {
+        // First, flatten the tree to get all leaf chunks with their byte offsets
+        let chunks_info = self.collect_chunk_offsets(node).await?;
+
+        if chunks_info.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Calculate total size and actual end
+        let total_size: u64 = chunks_info.iter().map(|(_, _, size)| size).sum();
+        let actual_end = end.unwrap_or(total_size).min(total_size);
+
+        if start >= actual_end {
+            return Ok(vec![]);
+        }
+
+        // Find chunks that overlap with [start, actual_end)
+        let mut result = Vec::with_capacity((actual_end - start) as usize);
+        let mut current_offset = 0u64;
+
+        for (chunk_hash, _chunk_offset, chunk_size) in &chunks_info {
+            let chunk_start = current_offset;
+            let chunk_end = current_offset + chunk_size;
+
+            // Check if this chunk overlaps with our range
+            if chunk_end > start && chunk_start < actual_end {
+                // Fetch this chunk
+                let chunk_data = self
+                    .store
+                    .get(chunk_hash)
+                    .await
+                    .map_err(|e| HashTreeError::Store(e.to_string()))?
+                    .ok_or_else(|| HashTreeError::MissingChunk(to_hex(chunk_hash)))?;
+
+                // Calculate slice bounds within this chunk
+                let slice_start = if start > chunk_start {
+                    (start - chunk_start) as usize
+                } else {
+                    0
+                };
+                let slice_end = if actual_end < chunk_end {
+                    (actual_end - chunk_start) as usize
+                } else {
+                    chunk_data.len()
+                };
+
+                result.extend_from_slice(&chunk_data[slice_start..slice_end]);
+            }
+
+            current_offset = chunk_end;
+
+            // Early exit if we've passed the requested range
+            if current_offset >= actual_end {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Collect all leaf chunk hashes with their byte offsets
+    /// Returns Vec<(hash, offset, size)>
+    async fn collect_chunk_offsets(
+        &self,
+        node: &TreeNode,
+    ) -> Result<Vec<(Hash, u64, u64)>, HashTreeError> {
+        let mut chunks = Vec::new();
+        let mut offset = 0u64;
+        self.collect_chunk_offsets_recursive(node, &mut chunks, &mut offset).await?;
+        Ok(chunks)
+    }
+
+    async fn collect_chunk_offsets_recursive(
+        &self,
+        node: &TreeNode,
+        chunks: &mut Vec<(Hash, u64, u64)>,
+        offset: &mut u64,
+    ) -> Result<(), HashTreeError> {
+        for link in &node.links {
+            let child_data = self
+                .store
+                .get(&link.hash)
+                .await
+                .map_err(|e| HashTreeError::Store(e.to_string()))?
+                .ok_or_else(|| HashTreeError::MissingChunk(to_hex(&link.hash)))?;
+
+            if is_tree_node(&child_data) {
+                // Intermediate node - recurse
+                let child_node = decode_tree_node(&child_data)?;
+                Box::pin(self.collect_chunk_offsets_recursive(&child_node, chunks, offset)).await?;
+            } else {
+                // Leaf chunk
+                let size = child_data.len() as u64;
+                chunks.push((link.hash, *offset, size));
+                *offset += size;
+            }
+        }
+        Ok(())
+    }
+
     /// Recursively assemble chunks from tree
     async fn assemble_chunks(&self, node: &TreeNode) -> Result<Vec<u8>, HashTreeError> {
         let mut parts: Vec<Vec<u8>> = Vec::new();
