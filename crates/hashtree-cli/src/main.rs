@@ -19,9 +19,10 @@ use clap::{Parser, Subcommand};
 use hashtree_cli::config::{ensure_auth_cookie, ensure_keys, ensure_keys_string, parse_npub, pubkey_bytes};
 use hashtree_cli::{
     BackgroundSync, Config, HashtreeServer, HashtreeStore,
-    NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, PeerPool, RootResolver,
-    WebRTCConfig, WebRTCManager,
+    NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RootResolver,
 };
+#[cfg(feature = "p2p")]
+use hashtree_cli::{PeerPool, WebRTCConfig, WebRTCManager};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -311,60 +312,68 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Start STUN server if configured
-            let stun_handle = if config.server.stun_port > 0 {
-                let stun_addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.server.stun_port)
-                    .parse()
-                    .context("Invalid STUN bind address")?;
-                Some(hashtree_cli::server::stun::start_stun_server(stun_addr).await
-                    .context("Failed to start STUN server")?)
-            } else {
-                None
-            };
-
-            // Start WebRTC signaling manager if enabled
-            let (webrtc_handle, webrtc_state) = if config.server.enable_webrtc {
-                let webrtc_config = WebRTCConfig {
-                    relays: config.nostr.relays.clone(),
-                    ..Default::default()
+            // Start STUN server and WebRTC if P2P feature enabled
+            #[cfg(feature = "p2p")]
+            let (stun_handle, webrtc_handle, webrtc_state) = {
+                // Start STUN server if configured
+                let stun_handle = if config.server.stun_port > 0 {
+                    let stun_addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.server.stun_port)
+                        .parse()
+                        .context("Invalid STUN bind address")?;
+                    Some(hashtree_cli::server::stun::start_stun_server(stun_addr).await
+                        .context("Failed to start STUN server")?)
+                } else {
+                    None
                 };
 
-                // Create peer classifier based on local contacts file
-                let contacts_file = data_dir.join("contacts.json");
-                let peer_classifier: hashtree_cli::PeerClassifier = Arc::new(move |pubkey_hex: &str| {
-                    // Check local contacts.json file (updated by htree follow command)
-                    if contacts_file.exists() {
-                        if let Ok(data) = std::fs::read_to_string(&contacts_file) {
-                            if let Ok(contacts) = serde_json::from_str::<Vec<String>>(&data) {
-                                if contacts.contains(&pubkey_hex.to_string()) {
-                                    return PeerPool::Follows;
+                // Start WebRTC signaling manager if enabled
+                let (webrtc_handle, webrtc_state) = if config.server.enable_webrtc {
+                    let webrtc_config = WebRTCConfig {
+                        relays: config.nostr.relays.clone(),
+                        ..Default::default()
+                    };
+
+                    // Create peer classifier based on local contacts file
+                    let contacts_file = data_dir.join("contacts.json");
+                    let peer_classifier: hashtree_cli::PeerClassifier = Arc::new(move |pubkey_hex: &str| {
+                        // Check local contacts.json file (updated by htree follow command)
+                        if contacts_file.exists() {
+                            if let Ok(data) = std::fs::read_to_string(&contacts_file) {
+                                if let Ok(contacts) = serde_json::from_str::<Vec<String>>(&data) {
+                                    if contacts.contains(&pubkey_hex.to_string()) {
+                                        return PeerPool::Follows;
+                                    }
                                 }
                             }
                         }
-                    }
-                    PeerPool::Other
-                });
+                        PeerPool::Other
+                    });
 
-                let mut manager = WebRTCManager::new_with_store_and_classifier(
-                    keys.clone(),
-                    webrtc_config,
-                    Arc::clone(&store) as Arc<dyn hashtree_cli::ContentStore>,
-                    peer_classifier,
-                );
+                    let mut manager = WebRTCManager::new_with_store_and_classifier(
+                        keys.clone(),
+                        webrtc_config,
+                        Arc::clone(&store) as Arc<dyn hashtree_cli::ContentStore>,
+                        peer_classifier,
+                    );
 
-                // Get the WebRTC state before spawning (for HTTP handler to query peers)
-                let webrtc_state = manager.state();
+                    // Get the WebRTC state before spawning (for HTTP handler to query peers)
+                    let webrtc_state = manager.state();
 
-                // Spawn the manager in a background task
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = manager.run().await {
-                        tracing::error!("WebRTC manager error: {}", e);
-                    }
-                });
-                (Some(handle), Some(webrtc_state))
-            } else {
-                (None, None)
+                    // Spawn the manager in a background task
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = manager.run().await {
+                            tracing::error!("WebRTC manager error: {}", e);
+                        }
+                    });
+                    (Some(handle), Some(webrtc_state))
+                } else {
+                    (None, None)
+                };
+                (stun_handle, webrtc_handle, webrtc_state)
             };
+
+            #[cfg(not(feature = "p2p"))]
+            let (stun_handle, webrtc_handle, webrtc_state): (Option<tokio::task::JoinHandle<()>>, Option<tokio::task::JoinHandle<()>>, Option<Arc<hashtree_cli::webrtc::WebRTCState>>) = (None, None, None);
 
             // Combine legacy servers with read_servers for upstream cascade
             let mut upstream_blossom = config.blossom.servers.clone();
@@ -456,9 +465,11 @@ async fn main() -> Result<()> {
             }
             println!("Relays: {} configured", config.nostr.relays.len());
             println!("Git remote: http://{}/git/<pubkey>/<repo>", addr);
+            #[cfg(feature = "p2p")]
             if let Some(ref handle) = stun_handle {
                 println!("STUN server: {}", handle.addr);
             }
+            #[cfg(feature = "p2p")]
             if config.server.enable_webrtc {
                 println!("WebRTC: enabled (P2P connections)");
             }
@@ -495,14 +506,20 @@ async fn main() -> Result<()> {
             }
 
             // Shutdown WebRTC manager
+            #[cfg(feature = "p2p")]
             if let Some(handle) = webrtc_handle {
                 handle.abort();
             }
 
             // Shutdown STUN server
+            #[cfg(feature = "p2p")]
             if let Some(handle) = stun_handle {
                 handle.shutdown();
             }
+
+            // Suppress unused variable warnings when p2p is disabled
+            #[cfg(not(feature = "p2p"))]
+            let _ = (stun_handle, webrtc_handle);
         }
         Commands::Add { path, only_hash, public, no_ignore, publish, local } => {
             let is_dir = path.is_dir();

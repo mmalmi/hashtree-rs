@@ -3,7 +3,13 @@ pub mod fetch;
 pub mod server;
 pub mod storage;
 pub mod sync;
+
+#[cfg(feature = "p2p")]
 pub mod webrtc;
+#[cfg(not(feature = "p2p"))]
+pub mod webrtc_stub;
+#[cfg(not(feature = "p2p"))]
+pub use webrtc_stub as webrtc;
 
 pub use config::Config;
 pub use hashtree_resolver::nostr::{NostrRootResolver, NostrResolverConfig};
@@ -15,4 +21,6 @@ pub use storage::{
 };
 pub use fetch::{FetchConfig, Fetcher};
 pub use sync::{BackgroundSync, SyncConfig, SyncPriority, SyncStatus, SyncTask};
-pub use webrtc::{ContentStore, DataMessage, PeerClassifier, PeerId, PeerPool, PoolConfig, PoolSettings, WebRTCConfig, WebRTCManager, WebRTCState};
+pub use webrtc::{WebRTCState, ConnectionState};
+#[cfg(feature = "p2p")]
+pub use webrtc::{ContentStore, DataMessage, PeerClassifier, PeerId, PeerPool, PoolConfig, PoolSettings, WebRTCConfig, WebRTCManager};

@@ -2,6 +2,7 @@ mod auth;
 pub mod blossom;
 mod handlers;
 mod mime;
+#[cfg(feature = "p2p")]
 pub mod stun;
 mod ui;
 
