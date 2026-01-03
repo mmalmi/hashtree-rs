@@ -145,6 +145,14 @@ fn wait_for_server(url: &str) -> bool {
     false
 }
 
+fn get_daemon_status(peer_url: &str) -> serde_json::Value {
+    let url = format!("{}/api/status", peer_url);
+    reqwest::blocking::get(&url)
+        .expect("Failed to get status")
+        .json()
+        .expect("Failed to parse status JSON")
+}
+
 fn wait_for_p2p(peer_url: &str, target_pubkey: &str) -> bool {
     for attempt in 1..=30 {
         if let Ok(resp) = reqwest::blocking::get(&format!("{}/api/peers", peer_url)) {
@@ -216,9 +224,28 @@ fn test_p2p_git_roundtrip() {
     assert!(push.status.success() || stderr.contains("-> master"), "Initial push failed: {}", stderr);
     println!("   Pushed (count=1)\n");
 
-    // Wait for P2P connection
+    // Wait for P2P connection (both directions)
     println!("2. Waiting for P2P connection...");
-    assert!(wait_for_p2p(&peer_a.api_url(), &pubkey_b), "P2P connection failed");
+    assert!(wait_for_p2p(&peer_a.api_url(), &pubkey_b), "P2P A->B connection failed");
+    assert!(wait_for_p2p(&peer_b.api_url(), &pubkey_a), "P2P B->A connection failed");
+
+    // === Verify status endpoint shows connection ===
+    println!("   Verifying /api/status...");
+    let status_a = get_daemon_status(&peer_a.api_url());
+    let status_b = get_daemon_status(&peer_b.api_url());
+
+    let webrtc_a = status_a.get("webrtc").expect("status should have webrtc");
+    let webrtc_b = status_b.get("webrtc").expect("status should have webrtc");
+
+    assert!(webrtc_a.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false), "WebRTC should be enabled");
+    assert!(webrtc_b.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false), "WebRTC should be enabled");
+
+    let connected_a = webrtc_a.get("with_data_channel").and_then(|c| c.as_u64()).unwrap_or(0);
+    let connected_b = webrtc_b.get("with_data_channel").and_then(|c| c.as_u64()).unwrap_or(0);
+
+    assert!(connected_a >= 1, "Peer A should have at least 1 connected peer with data channel, got {}", connected_a);
+    assert!(connected_b >= 1, "Peer B should have at least 1 connected peer with data channel, got {}", connected_b);
+    println!("   Status verified: A has {} peers, B has {} peers", connected_a, connected_b);
 
     // === Peer B: Clone the repo ===
     println!("\n3. Peer B: Cloning repo...");

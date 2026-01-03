@@ -111,6 +111,12 @@ enum Commands {
     },
     /// Get storage statistics
     Stats,
+    /// Show daemon status (peers, storage, etc.)
+    Status {
+        /// Daemon address (default: 127.0.0.1:8080)
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+    },
     /// Run garbage collection
     Gc,
     /// Show or set your nostr identity
@@ -895,6 +901,63 @@ async fn main() -> Result<()> {
             println!("  Total size: {} bytes ({:.2} KB)",
                 stats.total_bytes,
                 stats.total_bytes as f64 / 1024.0);
+        }
+        Commands::Status { addr } => {
+            let url = format!("http://{}/api/status", addr);
+            match reqwest::blocking::get(&url) {
+                Ok(resp) if resp.status().is_success() => {
+                    let status: serde_json::Value = resp.json()?;
+                    println!("Daemon Status:");
+                    println!("  Status: {}", status["status"].as_str().unwrap_or("unknown"));
+
+                    if let Some(storage) = status.get("storage") {
+                        println!("\nStorage:");
+                        if let Some(total) = storage.get("total_dags") {
+                            println!("  Total DAGs: {}", total);
+                        }
+                        if let Some(pinned) = storage.get("pinned_dags") {
+                            println!("  Pinned DAGs: {}", pinned);
+                        }
+                        if let Some(bytes) = storage.get("total_bytes").and_then(|b| b.as_u64()) {
+                            println!("  Total size: {} bytes ({:.2} KB)", bytes, bytes as f64 / 1024.0);
+                        }
+                    }
+
+                    if let Some(webrtc) = status.get("webrtc") {
+                        println!("\nWebRTC:");
+                        if webrtc.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
+                            println!("  Enabled: yes");
+                            if let Some(total) = webrtc.get("total_peers") {
+                                println!("  Total peers: {}", total);
+                            }
+                            if let Some(connected) = webrtc.get("connected") {
+                                println!("  Connected: {}", connected);
+                            }
+                            if let Some(dc) = webrtc.get("with_data_channel") {
+                                println!("  With data channel: {}", dc);
+                            }
+                        } else {
+                            println!("  Enabled: no");
+                        }
+                    }
+
+                    if let Some(upstream) = status.get("upstream") {
+                        if let Some(count) = upstream.get("blossom_servers").and_then(|c| c.as_u64()) {
+                            if count > 0 {
+                                println!("\nUpstream:");
+                                println!("  Blossom servers: {}", count);
+                            }
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    eprintln!("Daemon returned error: {}", resp.status());
+                }
+                Err(_) => {
+                    eprintln!("Daemon not running at {}", addr);
+                    eprintln!("Start with: htree start");
+                }
+            }
         }
         Commands::Gc => {
             let store = HashtreeStore::new(&data_dir)?;

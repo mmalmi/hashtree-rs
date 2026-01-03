@@ -589,6 +589,60 @@ pub async fn webrtc_peers(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// Daemon status endpoint - localhost only
+pub async fn daemon_status(
+    State(state): State<AppState>,
+    connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> impl IntoResponse {
+    // Only allow localhost
+    let ip = connect_info.0.ip();
+    if !ip.is_loopback() {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "localhost only"}))).into_response();
+    }
+
+    // Storage stats
+    let storage = match state.store.get_storage_stats() {
+        Ok(stats) => json!({
+            "total_dags": stats.total_dags,
+            "pinned_dags": stats.pinned_dags,
+            "total_bytes": stats.total_bytes,
+        }),
+        Err(e) => json!({"error": e.to_string()}),
+    };
+
+    // WebRTC peers
+    let webrtc = if let Some(ref webrtc_state) = state.webrtc_peers {
+        let peers = webrtc_state.peers.read().await;
+        let connected = peers.values()
+            .filter(|e| e.state == ConnectionState::Connected)
+            .count();
+        let with_data_channel = peers.values()
+            .filter(|e| e.state == ConnectionState::Connected
+                && e.peer.as_ref().map(|p| p.has_data_channel()).unwrap_or(false))
+            .count();
+        json!({
+            "enabled": true,
+            "total_peers": peers.len(),
+            "connected": connected,
+            "with_data_channel": with_data_channel,
+        })
+    } else {
+        json!({"enabled": false})
+    };
+
+    // Upstream servers
+    let upstream = json!({
+        "blossom_servers": state.upstream_blossom.len(),
+    });
+
+    Json(json!({
+        "status": "running",
+        "storage": storage,
+        "webrtc": webrtc,
+        "upstream": upstream,
+    })).into_response()
+}
+
 pub async fn garbage_collect(State(state): State<AppState>) -> impl IntoResponse {
     let store = &state.store;
     match store.gc() {
