@@ -9,6 +9,7 @@ use nostr_sdk::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
+use tracing::{debug, info, warn};
 
 use crate::transport::{RelayTransport, TransportError};
 use crate::types::{SignalingMessage, NOSTR_KIND_HASHTREE};
@@ -86,20 +87,29 @@ impl NostrRelayTransport {
         let mut notifications = self.client.notifications();
 
         tokio::spawn(async move {
+            debug!("[NostrTransport] Event handler started");
             loop {
                 match notifications.recv().await {
                     Ok(notification) => {
                         if let RelayPoolNotification::Event { event, .. } = notification {
                             if event.kind == Kind::Custom(NOSTR_KIND_HASHTREE) {
+                                debug!("[NostrTransport] Received kind={} event from {}", NOSTR_KIND_HASHTREE, &event.pubkey.to_hex()[..8]);
                                 // Handle the event - may be hello (plain) or directed (encrypted)
                                 if let Some(msg) = Self::handle_event(&event, &peer_id, &pubkey, &keys, debug) {
+                                    debug!("[NostrTransport] Forwarding message to recv channel");
                                     let _ = msg_tx.send(msg);
                                 }
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("[NostrTransport] Event handler closed");
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("[NostrTransport] Event handler lagged by {} messages", n);
+                        continue;
+                    }
                 }
             }
         });
@@ -227,7 +237,9 @@ impl RelayTransport for NostrRelayTransport {
         }
 
         // Connect
+        info!("[NostrTransport] Connecting to relays...");
         self.client.connect().await;
+        info!("[NostrTransport] Connected, setting up subscriptions...");
 
         // Subscribe to hashtree signaling events - two filters:
         // 1. Hello messages: kind with #l: "hello" tag (broadcasts)
@@ -253,10 +265,13 @@ impl RelayTransport for NostrRelayTransport {
             .await
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
 
+        info!("[NostrTransport] Subscriptions created for kind={}", NOSTR_KIND_HASHTREE);
+
         // Start event handler
         self.start_event_handler();
 
         self.connected.store(true, Ordering::Relaxed);
+        info!("[NostrTransport] Transport connected and ready");
         Ok(())
     }
 
@@ -345,6 +360,10 @@ impl RelayTransport for NostrRelayTransport {
                 .nth(1)
                 .unwrap_or(&self.peer_id);
 
+            debug!("[NostrTransport] Publishing hello (kind={}, uuid={}, pubkey={})", NOSTR_KIND_HASHTREE, our_uuid, &self.pubkey[..8]);
+
+            // Add expiration tag (5 minutes) to match browser behavior
+            let expiration = Timestamp::now() + Duration::from_secs(5 * 60);
             let tags = vec![
                 Tag::custom(
                     nostr_sdk::TagKind::SingleLetter(nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::L)),
@@ -354,22 +373,29 @@ impl RelayTransport for NostrRelayTransport {
                     nostr_sdk::TagKind::Custom(std::borrow::Cow::Borrowed("peerId")),
                     vec![our_uuid.to_string()]
                 ),
+                Tag::expiration(expiration),
             ];
-
-            if self.debug {
-                println!("[NostrTransport] Publishing hello (broadcast)");
-            }
 
             let builder = EventBuilder::new(Kind::Custom(NOSTR_KIND_HASHTREE), "", tags);
 
-            match self.client.send_event_builder(builder).await {
+            // Sign with our identity keys (not the client's signer which may be different)
+            let event = builder
+                .to_event(&self.keys)
+                .map_err(|e| TransportError::SendFailed(format!("Failed to sign hello: {}", e)))?;
+
+            match self.client.send_event(event).await {
                 Ok(output) => {
                     if output.success.is_empty() {
+                        warn!("[NostrTransport] Hello rejected - no relay accepted event");
                         return Err(TransportError::SendFailed("No relay accepted event".to_string()));
                     }
+                    info!("[NostrTransport] Hello sent successfully to {} relays", output.success.len());
                     Ok(())
                 }
-                Err(e) => Err(TransportError::SendFailed(e.to_string())),
+                Err(e) => {
+                    warn!("[NostrTransport] Hello send error: {}", e);
+                    Err(TransportError::SendFailed(e.to_string()))
+                }
             }
         }
     }
