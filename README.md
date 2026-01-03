@@ -9,8 +9,11 @@ Basically [Blossom](https://github.com/hzrd149/blossom) with chunking and direct
 # 1. Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 2. Install hashtree-cli
+# 2. Install hashtree-cli (with P2P enabled by default)
 cargo install hashtree-cli
+
+# Or minimal install without P2P/WebRTC (smaller binary)
+cargo install hashtree-cli --no-default-features
 
 # 3. Add file or dir
 htree add file.txt
@@ -95,6 +98,17 @@ The `Store` trait is just `get(hash) → bytes` and `put(hash, bytes)`. The core
 - `hashtree-cli` - Command-line interface
 - `hashtree-sim` - P2P network simulation (Freenet-style HTL forwarding)
 - `git-remote-htree` - Git remote helper (`htree://` protocol)
+
+## P2P Daemon
+
+Run `htree start` to enable P2P sharing via WebRTC:
+
+```bash
+htree start                  # Start daemon (default port 8080)
+htree status                 # Check daemon status, connected peers
+```
+
+The daemon acts as a local Blossom server and connects to peers via WebRTC (signaled over Nostr). Git operations automatically use the daemon when running.
 
 WebRTC transport falls back to Blossom servers when data isn't found on peers or WebRTC isn't available.
 
