@@ -39,16 +39,25 @@ pub struct NostrRelayTransport {
 }
 
 impl NostrRelayTransport {
-    /// Create a new Nostr relay transport
+    /// Create a new Nostr relay transport with its own client
     pub fn new(keys: Keys, peer_uuid: String, debug: bool) -> Self {
-        let pubkey = keys.public_key().to_hex();
-        let peer_id = format!("{}:{}", pubkey, peer_uuid);
-
         // Create client with in-memory database to avoid event deduplication
         let client = ClientBuilder::new()
             .signer(keys.clone())
             .database(nostr_sdk::database::MemoryDatabase::new())
             .build();
+
+        Self::with_client(client, keys, peer_uuid, debug)
+    }
+
+    /// Create a new Nostr relay transport with an existing client
+    ///
+    /// This allows sharing the same relay connection pool with other components
+    /// (e.g., Tauri's NostrManager). The client should already have relays added
+    /// but connect() will be called when RelayTransport::connect() is invoked.
+    pub fn with_client(client: Client, keys: Keys, peer_uuid: String, debug: bool) -> Self {
+        let pubkey = keys.public_key().to_hex();
+        let peer_id = format!("{}:{}", pubkey, peer_uuid);
 
         let (msg_tx, msg_rx) = broadcast::channel(1000);
 
