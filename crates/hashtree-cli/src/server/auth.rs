@@ -22,6 +22,8 @@ pub struct AppState {
     pub public_writes: bool,
     /// Pubkeys allowed to write (hex format, from config allowed_npubs)
     pub allowed_pubkeys: HashSet<String>,
+    /// Upstream Blossom servers for cascade fetching
+    pub upstream_blossom: Vec<String>,
 }
 
 #[derive(Clone)]

@@ -360,11 +360,16 @@ async fn main() -> Result<()> {
                 (None, None)
             };
 
+            // Combine legacy servers with read_servers for upstream cascade
+            let mut upstream_blossom = config.blossom.servers.clone();
+            upstream_blossom.extend(config.blossom.read_servers.clone());
+
             // Set up server with allowed pubkeys for blossom write access
             let mut server = HashtreeServer::new(Arc::clone(&store), addr.clone())
                 .with_allowed_pubkeys(allowed_pubkeys.clone())
                 .with_max_upload_bytes((config.blossom.max_upload_mb as usize) * 1024 * 1024)
-                .with_public_writes(config.server.public_writes);
+                .with_public_writes(config.server.public_writes)
+                .with_upstream_blossom(upstream_blossom);
 
             // Add WebRTC peer state for P2P queries from HTTP handler
             if let Some(ref webrtc_state) = webrtc_state {

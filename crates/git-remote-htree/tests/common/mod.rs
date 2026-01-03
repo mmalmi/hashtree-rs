@@ -12,40 +12,110 @@ use std::time::Duration;
 use tempfile::TempDir;
 use nostr::ToBech32;
 
-/// Minimal in-memory nostr relay for testing
+/// Minimal in-memory nostr relay for testing with real-time event broadcasting
 pub mod test_relay {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::net::TcpListener;
     use tokio::net::TcpStream;
+    use tokio::sync::{broadcast, RwLock};
     use tokio_tungstenite::{accept_async, tungstenite::Message};
     use futures::{SinkExt, StreamExt};
 
+    /// Stored filter for matching events
+    #[derive(Clone)]
+    struct StoredFilter {
+        sub_id: String,
+        kind: Option<u64>,
+        authors: Vec<String>,
+        p_tag: Option<String>,  // #p tag for directed messages
+        l_tag: Option<String>,  // #l tag for hello messages
+    }
+
+    impl StoredFilter {
+        fn matches(&self, event: &serde_json::Value) -> bool {
+            // Check kind
+            if let Some(k) = self.kind {
+                if event.get("kind").and_then(|v| v.as_u64()) != Some(k) {
+                    return false;
+                }
+            }
+
+            // Check authors
+            if !self.authors.is_empty() {
+                let event_author = event.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");
+                if !self.authors.iter().any(|a| a == event_author) {
+                    return false;
+                }
+            }
+
+            // Check #p tag
+            if let Some(ref p) = self.p_tag {
+                let has_p = event.get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|tags| {
+                        tags.iter().any(|tag| {
+                            tag.as_array().map(|arr| {
+                                arr.len() >= 2 &&
+                                arr[0].as_str() == Some("p") &&
+                                arr[1].as_str() == Some(p.as_str())
+                            }).unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                if !has_p {
+                    return false;
+                }
+            }
+
+            // Check #l tag
+            if let Some(ref l) = self.l_tag {
+                let has_l = event.get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|tags| {
+                        tags.iter().any(|tag| {
+                            tag.as_array().map(|arr| {
+                                arr.len() >= 2 &&
+                                arr[0].as_str() == Some("l") &&
+                                arr[1].as_str() == Some(l.as_str())
+                            }).unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                if !has_l {
+                    return false;
+                }
+            }
+
+            true
+        }
+    }
+
     pub struct TestRelay {
-        #[allow(dead_code)]
         port: u16,
-        #[allow(dead_code)]
-        events: Arc<Mutex<HashMap<String, serde_json::Value>>>,
-        shutdown: tokio::sync::broadcast::Sender<()>,
+        shutdown: broadcast::Sender<()>,
     }
 
     impl TestRelay {
         pub fn new(port: u16) -> Self {
-            let events = Arc::new(Mutex::new(HashMap::new()));
-            let (shutdown, _) = tokio::sync::broadcast::channel(1);
+            let events: Arc<RwLock<HashMap<String, serde_json::Value>>> = Arc::new(RwLock::new(HashMap::new()));
+            let (shutdown, _) = broadcast::channel(1);
+            // Broadcast channel for new events - larger buffer for busy relays
+            let (event_tx, _) = broadcast::channel::<serde_json::Value>(1000);
 
             let relay = TestRelay {
                 port,
-                events: events.clone(),
                 shutdown: shutdown.clone(),
             };
 
             // Start relay in background
             let events_clone = events.clone();
             let mut shutdown_rx = shutdown.subscribe();
+            let event_tx_clone = event_tx.clone();
 
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                     .unwrap();
@@ -61,7 +131,9 @@ pub mod test_relay {
                             result = listener.accept() => {
                                 if let Ok((stream, _)) = result {
                                     let events = events_clone.clone();
-                                    tokio::spawn(handle_connection(stream, events));
+                                    let event_tx = event_tx_clone.clone();
+                                    let event_rx = event_tx_clone.subscribe();
+                                    tokio::spawn(handle_connection(stream, events, event_tx, event_rx));
                                 }
                             }
                         }
@@ -87,22 +159,61 @@ pub mod test_relay {
         }
     }
 
-    async fn handle_connection(stream: TcpStream, events: Arc<Mutex<HashMap<String, serde_json::Value>>>) {
+    async fn handle_connection(
+        stream: TcpStream,
+        events: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+        event_tx: broadcast::Sender<serde_json::Value>,
+        mut event_rx: broadcast::Receiver<serde_json::Value>,
+    ) {
         let ws_stream = match accept_async(stream).await {
             Ok(s) => s,
             Err(_) => return,
         };
 
-        let (mut write, mut read) = ws_stream.split();
+        let (write, mut read) = ws_stream.split();
+        let write = Arc::new(tokio::sync::Mutex::new(write));
 
+        // Track active subscriptions for this connection
+        let subscriptions: Arc<RwLock<HashMap<String, Vec<StoredFilter>>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        // Spawn task to handle incoming broadcast events
+        let write_clone = write.clone();
+        let subs_clone = subscriptions.clone();
+        let broadcast_task = tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(event) => {
+                        let subs = subs_clone.read().await;
+                        for (_, filters) in subs.iter() {
+                            for filter in filters {
+                                if filter.matches(&event) {
+                                    let event_msg = serde_json::json!(["EVENT", &filter.sub_id, &event]);
+                                    let mut w = write_clone.lock().await;
+                                    let _ = w.send(Message::Text(event_msg.to_string())).await;
+                                    break; // Only send once per subscription
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        // Handle incoming messages from client
         while let Some(msg) = read.next().await {
             let msg = match msg {
                 Ok(Message::Text(t)) => t,
                 Ok(Message::Close(_)) => break,
+                Ok(Message::Ping(data)) => {
+                    let mut w = write.lock().await;
+                    let _ = w.send(Message::Pong(data)).await;
+                    continue;
+                }
                 _ => continue,
             };
 
-            // Parse nostr message: ["EVENT", event] or ["REQ", sub_id, filter...]
             let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(&msg);
             let parsed = match parsed {
                 Ok(p) => p,
@@ -118,82 +229,101 @@ pub mod test_relay {
             match msg_type {
                 "EVENT" => {
                     if parsed.len() >= 2 {
-                        let event = &parsed[1];
+                        let event = parsed[1].clone();
                         if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
-                            events.lock().unwrap().insert(id.to_string(), event.clone());
+                            // Store event
+                            events.write().await.insert(id.to_string(), event.clone());
+
                             // Send OK response
                             let ok_msg = serde_json::json!(["OK", id, true, ""]);
-                            let _ = write.send(Message::Text(ok_msg.to_string())).await;
+                            {
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(ok_msg.to_string())).await;
+                            }
+
+                            // Broadcast to all connections
+                            let _ = event_tx.send(event);
                         }
                     }
                 }
                 "REQ" => {
                     if parsed.len() >= 3 {
                         let sub_id = parsed[1].as_str().unwrap_or("sub").to_string();
-                        let filter = &parsed[2];
 
-                        // Simple filter matching
-                        let kind = filter.get("kinds").and_then(|k| k.as_array()).and_then(|a| a.first()).and_then(|v| v.as_u64());
-                        let author = filter.get("authors").and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let d_tag = filter.get("#d").and_then(|d| d.as_array()).and_then(|a| a.first()).and_then(|v| v.as_str()).map(|s| s.to_string());
+                        // Parse all filters (can have multiple)
+                        let mut filters = Vec::new();
+                        for i in 2..parsed.len() {
+                            let filter = &parsed[i];
 
-                        // Collect matching events while holding lock, then release before await
-                        let matching_events: Vec<serde_json::Value> = {
-                            let events_lock = events.lock().unwrap();
-                            events_lock.values().filter(|event| {
-                                let mut matches = true;
+                            let kind = filter.get("kinds")
+                                .and_then(|k| k.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|v| v.as_u64());
 
-                                if let Some(k) = kind {
-                                    if event.get("kind").and_then(|v| v.as_u64()) != Some(k) {
-                                        matches = false;
-                                    }
-                                }
+                            let authors: Vec<String> = filter.get("authors")
+                                .and_then(|a| a.as_array())
+                                .map(|arr| arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect())
+                                .unwrap_or_default();
 
-                                if let Some(ref a) = author {
-                                    if event.get("pubkey").and_then(|v| v.as_str()) != Some(a.as_str()) {
-                                        matches = false;
-                                    }
-                                }
+                            let p_tag = filter.get("#p")
+                                .and_then(|p| p.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
 
-                                if let Some(ref d) = d_tag {
-                                    let has_d_tag = event.get("tags")
-                                        .and_then(|t| t.as_array())
-                                        .map(|tags| {
-                                            tags.iter().any(|tag| {
-                                                tag.as_array().map(|arr| {
-                                                    arr.len() >= 2 &&
-                                                    arr[0].as_str() == Some("d") &&
-                                                    arr[1].as_str() == Some(d.as_str())
-                                                }).unwrap_or(false)
-                                            })
-                                        })
-                                        .unwrap_or(false);
-                                    if !has_d_tag {
-                                        matches = false;
-                                    }
-                                }
+                            let l_tag = filter.get("#l")
+                                .and_then(|l| l.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
 
-                                matches
-                            }).cloned().collect()
-                        };
-
-                        // Now send events without holding lock
-                        for event in matching_events {
-                            let event_msg = serde_json::json!(["EVENT", &sub_id, event]);
-                            let _ = write.send(Message::Text(event_msg.to_string())).await;
+                            filters.push(StoredFilter {
+                                sub_id: sub_id.clone(),
+                                kind,
+                                authors,
+                                p_tag,
+                                l_tag,
+                            });
                         }
+
+                        // Store subscription
+                        subscriptions.write().await.insert(sub_id.clone(), filters.clone());
+
+                        // Send matching historical events
+                        let events_lock = events.read().await;
+                        let mut w = write.lock().await;
+
+                        for event in events_lock.values() {
+                            for filter in &filters {
+                                if filter.matches(event) {
+                                    let event_msg = serde_json::json!(["EVENT", &sub_id, event]);
+                                    let _ = w.send(Message::Text(event_msg.to_string())).await;
+                                    break;
+                                }
+                            }
+                        }
+                        drop(events_lock);
 
                         // Send EOSE
                         let eose = serde_json::json!(["EOSE", &sub_id]);
-                        let _ = write.send(Message::Text(eose.to_string())).await;
+                        let _ = w.send(Message::Text(eose.to_string())).await;
                     }
                 }
                 "CLOSE" => {
-                    // Subscription closed, ignore
+                    if parsed.len() >= 2 {
+                        if let Some(sub_id) = parsed[1].as_str() {
+                            subscriptions.write().await.remove(sub_id);
+                        }
+                    }
                 }
                 _ => {}
             }
         }
+
+        // Clean up broadcast task
+        broadcast_task.abort();
     }
 }
 
@@ -434,7 +564,7 @@ pub fn create_test_repo() -> TempDir {
 
     // Init git repo
     let status = Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "master"])
         .current_dir(path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

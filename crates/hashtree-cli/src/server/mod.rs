@@ -34,6 +34,7 @@ impl HashtreeServer {
                 max_upload_bytes: 5 * 1024 * 1024, // 5 MB default
                 public_writes: true, // Allow anyone with valid Nostr auth by default
                 allowed_pubkeys: HashSet::new(), // No pubkeys allowed by default (use public_writes)
+                upstream_blossom: Vec::new(),
             },
             addr,
         }
@@ -66,6 +67,12 @@ impl HashtreeServer {
     /// Set allowed pubkeys for blossom write access (hex format)
     pub fn with_allowed_pubkeys(mut self, pubkeys: HashSet<String>) -> Self {
         self.state.allowed_pubkeys = pubkeys;
+        self
+    }
+
+    /// Set upstream Blossom servers for cascade fetching
+    pub fn with_upstream_blossom(mut self, servers: Vec<String>) -> Self {
+        self.state.upstream_blossom = servers;
         self
     }
 

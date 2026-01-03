@@ -266,8 +266,10 @@ pub async fn serve_content_or_blob(
 
     // Not found locally - try querying connected WebRTC peers
     if is_sha256 {
+        let hash_hex = hash_part.to_lowercase();
+
+        // Try WebRTC peers first
         if let Some(ref webrtc_state) = state.webrtc_peers {
-            let hash_hex = hash_part.to_lowercase();
             tracing::info!("Hash {} not found locally, querying WebRTC peers", &hash_hex[..16.min(hash_hex.len())]);
 
             // Query connected WebRTC peers
@@ -278,6 +280,28 @@ pub async fn serve_content_or_blob(
                 }
 
                 // Return the data directly
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_LENGTH, data.len())
+                    .header(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL)
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Body::from(data))
+                    .unwrap()
+                    .into_response();
+            }
+        }
+
+        // Try upstream Blossom servers
+        if !state.upstream_blossom.is_empty() {
+            tracing::info!("Hash {} not found via WebRTC, trying upstream Blossom", &hash_hex[..16.min(hash_hex.len())]);
+
+            if let Some(data) = query_upstream_blossom(&state.upstream_blossom, &hash_hex).await {
+                // Cache locally for future requests
+                if let Err(e) = state.store.put_blob(&data) {
+                    tracing::warn!("Failed to cache upstream data: {}", e);
+                }
+
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -797,4 +821,84 @@ async fn query_webrtc_peers(webrtc_state: &Arc<WebRTCState>, hash_hex: &str) -> 
     }
 
     None
+}
+
+/// Query upstream Blossom servers for content by hash
+/// Returns the first successful response, or None if not found
+async fn query_upstream_blossom(servers: &[String], hash_hex: &str) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    for server in servers {
+        let url = format!("{}/{}", server.trim_end_matches('/'), hash_hex);
+        tracing::debug!("Trying upstream Blossom: {}", url);
+
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    // Verify hash matches
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    let computed = hex::encode(hasher.finalize());
+
+                    if computed == hash_hex {
+                        tracing::info!(
+                            "Got {} bytes from upstream {} for hash {}",
+                            bytes.len(),
+                            server,
+                            &hash_hex[..16.min(hash_hex.len())]
+                        );
+                        return Some(bytes.to_vec());
+                    } else {
+                        tracing::warn!(
+                            "Hash mismatch from {}: expected {}, got {}",
+                            server,
+                            &hash_hex[..16.min(hash_hex.len())],
+                            &computed[..16.min(computed.len())]
+                        );
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::debug!("Upstream {} returned {}", server, resp.status());
+            }
+            Err(e) => {
+                tracing::debug!("Upstream {} error: {}", server, e);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_query_upstream_blossom_no_servers() {
+        let servers: Vec<String> = vec![];
+        let result = query_upstream_blossom(&servers, "abc123").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_upstream_blossom_invalid_server() {
+        let servers = vec!["http://localhost:99999".to_string()];
+        let result = query_upstream_blossom(&servers, "abc123").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_query_upstream_blossom_hash_format() {
+        // Test with valid SHA256 hash format but non-existent server
+        let servers = vec!["http://localhost:99999".to_string()];
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let result = query_upstream_blossom(&servers, hash).await;
+        assert!(result.is_none());
+    }
 }

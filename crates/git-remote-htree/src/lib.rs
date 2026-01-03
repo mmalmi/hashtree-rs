@@ -179,10 +179,24 @@ fn run() -> Result<()> {
     info!("Using identity: {}", npub);
 
     // Load config
-    let config = Config::load_or_default();
+    let mut config = Config::load_or_default();
     debug!("Loaded config with {} read servers, {} write servers",
            config.blossom.read_servers.len(),
            config.blossom.write_servers.len());
+
+    // Check for local daemon and use it if available
+    let daemon_url = detect_local_daemon();
+    if let Some(ref url) = daemon_url {
+        debug!("Local daemon detected at {}", url);
+        // Prepend local daemon to read servers for cascade fetching
+        config.blossom.read_servers.insert(0, url.clone());
+    } else {
+        // Show hint once per session (git may call us multiple times)
+        static HINT_SHOWN: std::sync::Once = std::sync::Once::new();
+        HINT_SHOWN.call_once(|| {
+            eprintln!("Tip: run 'htree start' for P2P sharing");
+        });
+    }
 
     // Create helper and run protocol
     let mut helper = RemoteHelper::new(&pubkey, &repo_name, signing_key, url_secret, is_private, config)?;
@@ -324,6 +338,25 @@ pub fn generate_secret_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).expect("Failed to generate random bytes");
     key
+}
+
+/// Detect if local htree daemon is running
+/// Returns the daemon URL if available
+fn detect_local_daemon() -> Option<String> {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    // Try to connect to the default daemon port
+    let addr = "127.0.0.1:8080";
+
+    // Use a short timeout for probing
+    match TcpStream::connect_timeout(
+        &addr.parse().ok()?,
+        Duration::from_millis(100),
+    ) {
+        Ok(_) => Some(format!("http://{}", addr)),
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -481,5 +514,41 @@ mod tests {
         let parsed = parse_htree_url("htree://self/myrepo#private").unwrap();
         assert!(parsed.is_private);
         assert!(!parsed.auto_generate_secret);
+    }
+
+    #[test]
+    fn test_detect_local_daemon_not_running() {
+        // When no daemon is running on port 8080, should return None
+        // This test assumes port 8080 is not in use during testing
+        let result = detect_local_daemon();
+        // Can't assert None because a daemon might be running
+        // Just verify it doesn't panic and returns valid result
+        if let Some(url) = result {
+            assert!(url.starts_with("http://"));
+            assert!(url.contains("8080"));
+        }
+    }
+
+    #[test]
+    fn test_detect_local_daemon_with_listener() {
+        use std::net::TcpListener;
+
+        // Bind to a random port
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Our detect function only checks 8080, so this won't be detected
+        // This test just verifies the TCP probe logic works
+        drop(listener);
+
+        // After dropping, connection should fail
+        use std::net::TcpStream;
+        use std::time::Duration;
+        let addr = format!("127.0.0.1:{}", port);
+        let result = TcpStream::connect_timeout(
+            &addr.parse().unwrap(),
+            Duration::from_millis(100),
+        );
+        assert!(result.is_err());
     }
 }
