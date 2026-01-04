@@ -75,6 +75,29 @@ impl NostrRelayTransport {
         }
     }
 
+    /// Create a new Nostr relay transport with an existing client
+    ///
+    /// This allows sharing a client with other parts of the application,
+    /// useful when relays are already connected via a shared NostrManager.
+    pub fn with_client(client: Client, keys: Keys, peer_uuid: String, debug: bool) -> Self {
+        let pubkey = keys.public_key().to_hex();
+        let peer_id = format!("{}:{}", pubkey, peer_uuid);
+
+        let (msg_tx, msg_rx) = broadcast::channel(1000);
+
+        Self {
+            peer_id,
+            pubkey,
+            keys,
+            client,
+            buffer: Mutex::new(Vec::new()),
+            connected: AtomicBool::new(false),
+            msg_rx: Mutex::new(Some(msg_rx)),
+            msg_tx,
+            debug,
+        }
+    }
+
     /// Start the background event handler
     fn start_event_handler(&self) {
         let msg_tx = self.msg_tx.clone();
