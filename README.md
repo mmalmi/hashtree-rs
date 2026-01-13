@@ -127,41 +127,19 @@ public_writes = true
 
 Set `stun_port = 0` to disable the built-in STUN server. Use `RUST_LOG=info` to increase verbosity.
 
-### Running as a service
+### Running in the background
 
-Use your OS service manager for restarts and logs. `htree service install` supports systemd on Linux and launchd on macOS.
-
-```ini
-# systemd example (Linux)
-[Unit]
-Description=hashtree daemon
-After=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/htree start --addr 127.0.0.1:8080
-Environment=HTREE_DATA_DIR=/var/lib/hashtree
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Built-in installer (systemd/launchd):
+Use `--daemon` to run in the background and write logs to `~/.hashtree/logs/htree.log` by default.
 
 ```bash
-htree service install --user
-htree service install --system --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
-htree service status --user
+htree start --daemon
+htree start --daemon --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
+htree start --daemon --log-file /var/log/hashtree.log
+htree status
+tail -f ~/.hashtree/logs/htree.log
 ```
 
-On macOS, user services are written to `~/Library/LaunchAgents/<name>.plist` and system services to `/Library/LaunchDaemons/<name>.plist`.
-
-Scripted install (systemd, Linux only):
-
-```bash
-./scripts/install-systemd.sh --user
-./scripts/install-systemd.sh --system --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
-```
+Stop it with `kill <pid>` (pid printed on start).
 
 ## Git Remote Helper
 

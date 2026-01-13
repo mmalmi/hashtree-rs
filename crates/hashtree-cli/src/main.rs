@@ -1,7 +1,7 @@
 //! Hashtree CLI and daemon
 //!
 //! Usage:
-//!   htree start [--addr 127.0.0.1:8080]
+//!   htree start [--addr 127.0.0.1:8080] [--daemon]
 //!   htree add <path> [--only-hash] [--public] [--no-ignore] [--publish <ref_name>]
 //!   htree get <cid> [-o output]
 //!   htree cat <cid>
@@ -20,11 +20,6 @@ use hashtree_cli::config::{ensure_auth_cookie, ensure_keys, ensure_keys_string, 
 use hashtree_cli::{
     BackgroundSync, Config, HashtreeServer, HashtreeStore,
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RootResolver,
-};
-use hashtree_config::detect_local_daemon_url;
-use hashtree_cli::service::{
-    install_service, uninstall_service, status_service,
-    ServiceInstallOptions, ServiceScope, ServiceStatusOptions, ServiceUninstallOptions,
 };
 #[cfg(feature = "p2p")]
 use hashtree_cli::{PeerPool, WebRTCConfig, WebRTCManager};
@@ -64,6 +59,12 @@ enum Commands {
         /// Override Nostr relays (comma-separated)
         #[arg(long)]
         relays: Option<String>,
+        /// Run in background (daemonize)
+        #[arg(long)]
+        daemon: bool,
+        /// Log file for daemon mode (default: ~/.hashtree/logs/htree.log)
+        #[arg(long, requires = "daemon")]
+        log_file: Option<PathBuf>,
     },
     /// Add file or directory to hashtree (like ipfs add)
     Add {
@@ -165,11 +166,6 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommands,
     },
-    /// Manage service installation (systemd/launchd)
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommands,
-    },
 }
 
 #[derive(Subcommand)]
@@ -191,60 +187,6 @@ enum StorageCommands {
     },
 }
 
-#[derive(Subcommand)]
-enum ServiceCommands {
-    /// Install and enable the service
-    Install {
-        /// Install as a user service (default)
-        #[arg(long, conflicts_with = "system")]
-        user: bool,
-        /// Install as a system service (requires root)
-        #[arg(long, conflicts_with = "user")]
-        system: bool,
-        /// Service name (default: hashtree)
-        #[arg(long, default_value = "hashtree")]
-        name: String,
-        /// Bind address for the daemon
-        #[arg(long)]
-        addr: Option<String>,
-        /// Override Nostr relays (comma-separated)
-        #[arg(long)]
-        relays: Option<String>,
-        /// Data directory (sets HTREE_DATA_DIR)
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Set RUST_LOG for the service
-        #[arg(long)]
-        rust_log: Option<String>,
-        /// Enable but do not start the service
-        #[arg(long)]
-        no_start: bool,
-    },
-    /// Disable and remove the service
-    Uninstall {
-        /// Uninstall user service (default)
-        #[arg(long, conflicts_with = "system")]
-        user: bool,
-        /// Uninstall system service (requires root)
-        #[arg(long, conflicts_with = "user")]
-        system: bool,
-        /// Service name (default: hashtree)
-        #[arg(long, default_value = "hashtree")]
-        name: String,
-    },
-    /// Show service status
-    Status {
-        /// Query user service (default)
-        #[arg(long, conflicts_with = "system")]
-        user: bool,
-        /// Query system service (requires root on Linux)
-        #[arg(long, conflicts_with = "user")]
-        system: bool,
-        /// Service name (default: hashtree)
-        #[arg(long, default_value = "hashtree")]
-        name: String,
-    },
-}
 
 /// Resolved CID with optional path
 pub struct ResolvedCid {
@@ -339,12 +281,16 @@ async fn main() -> Result<()> {
     let data_dir = cli.data_dir();
 
     match cli.command {
-        Commands::Start { addr, relays: relays_override } => {
+        Commands::Start { addr, relays: relays_override, daemon, log_file } => {
+            if daemon && std::env::var_os("HTREE_DAEMONIZED").is_none() {
+                spawn_daemon(&addr, relays_override.as_deref(), cli.data_dir.clone(), log_file.as_ref())?;
+                return Ok(());
+            }
             // Load or create config
             let mut config = Config::load()?;
 
             // Override relays if specified on command line
-            if let Some(relays_str) = relays_override {
+            if let Some(relays_str) = relays_override.as_deref() {
                 config.nostr.relays = relays_str.split(',').map(|s| s.trim().to_string()).collect();
                 println!("Using relays from CLI: {:?}", config.nostr.relays);
             }
@@ -1267,34 +1213,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Service { command } => {
-            match command {
-                ServiceCommands::Install { user: _, system, name, addr, relays, data_dir, rust_log, no_start } => {
-                    let scope = if system { ServiceScope::System } else { ServiceScope::User };
-                    let unit_path = install_service(ServiceInstallOptions {
-                        scope,
-                        name: name.clone(),
-                        addr,
-                        relays,
-                        data_dir,
-                        rust_log,
-                        start_now: !no_start,
-                    })?;
-                    println!("Installed service unit: {}", unit_path.display());
-                }
-                ServiceCommands::Uninstall { user: _, system, name } => {
-                    let scope = if system { ServiceScope::System } else { ServiceScope::User };
-                    uninstall_service(ServiceUninstallOptions { scope, name: name.clone() })?;
-                    println!("Removed service: {}", name);
-                }
-                ServiceCommands::Status { user: _, system, name } => {
-                    let scope = if system { ServiceScope::System } else { ServiceScope::User };
-                    let output = status_service(ServiceStatusOptions { scope, name: name.clone() })?;
-                    println!("{}", output);
-                    print_local_daemon_status();
-                }
-            }
-        }
     }
 
     Ok(())
@@ -1376,33 +1294,87 @@ fn format_daemon_status(status: &serde_json::Value, include_header: bool) -> Str
     lines.join("\n")
 }
 
-fn print_local_daemon_status() {
-    let config = hashtree_config::Config::load_or_default();
-    let base_url = detect_local_daemon_url(Some(&config.server.bind_address));
-    let Some(base_url) = base_url else {
-        println!("\nDaemon API: not detected");
-        return;
-    };
+fn default_daemon_log_file() -> PathBuf {
+    hashtree_cli::config::get_hashtree_dir()
+        .join("logs")
+        .join("htree.log")
+}
 
-    let url = format!("{}/api/status", base_url);
-    match reqwest::blocking::get(&url) {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>() {
-                Ok(status) => {
-                    println!("\nDaemon API ({}):", base_url);
-                    println!("{}", format_daemon_status(&status, false));
+fn build_daemon_args(
+    addr: &str,
+    relays: Option<&str>,
+    data_dir: Option<&PathBuf>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    args.push(std::ffi::OsString::from("--addr"));
+    args.push(std::ffi::OsString::from(addr));
+    if let Some(relays) = relays {
+        args.push(std::ffi::OsString::from("--relays"));
+        args.push(std::ffi::OsString::from(relays));
+    }
+    if let Some(data_dir) = data_dir {
+        args.push(std::ffi::OsString::from("--data-dir"));
+        args.push(data_dir.as_os_str().to_owned());
+    }
+    args
+}
+
+fn spawn_daemon(
+    addr: &str,
+    relays: Option<&str>,
+    data_dir: Option<PathBuf>,
+    log_file: Option<&PathBuf>,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::{self, OpenOptions};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let log_path = log_file.cloned().unwrap_or_else(default_daemon_log_file);
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create log dir {}", parent.display()))?;
+        }
+
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("Failed to open log file {}", log_path.display()))?;
+        let log_err = log.try_clone().context("Failed to clone log file handle")?;
+
+        let exe = std::env::current_exe().context("Failed to locate htree binary")?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("start")
+            .args(build_daemon_args(addr, relays, data_dir.as_ref()))
+            .env("HTREE_DAEMONIZED", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err));
+
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
                 }
-                Err(e) => {
-                    println!("\nDaemon API ({}): failed to parse status ({})", base_url, e);
-                }
-            }
+                Ok(())
+            });
         }
-        Ok(resp) => {
-            println!("\nDaemon API ({}): error {}", base_url, resp.status());
-        }
-        Err(e) => {
-            println!("\nDaemon API ({}): unreachable ({})", base_url, e);
-        }
+
+        let child = cmd.spawn().context("Failed to spawn daemon")?;
+        println!("Started hashtree daemon (pid {})", child.id());
+        println!("Log file: {}", log_path.display());
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = addr;
+        let _ = relays;
+        let _ = data_dir;
+        let _ = log_file;
+        anyhow::bail!("Daemon mode is only supported on Unix systems");
     }
 }
 
@@ -1827,6 +1799,40 @@ fn dir_size(path: &std::path::Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args_to_strings(args: Vec<std::ffi::OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_daemon_args_with_overrides() {
+        let data_dir = PathBuf::from("data-dir");
+        let args = args_to_strings(build_daemon_args(
+            "127.0.0.1:8080",
+            Some("wss://relay.example"),
+            Some(&data_dir),
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "--addr",
+                "127.0.0.1:8080",
+                "--relays",
+                "wss://relay.example",
+                "--data-dir",
+                "data-dir",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_daemon_args_minimal() {
+        let args = args_to_strings(build_daemon_args("0.0.0.0:8080", None, None));
+        assert_eq!(args, vec!["--addr", "0.0.0.0:8080"]);
+    }
 
     #[tokio::test]
     async fn test_resolve_nhash_with_path_suffix() {

@@ -1,7 +1,6 @@
 pub mod config;
 pub mod fetch;
 pub mod server;
-pub mod service;
 pub mod storage;
 pub mod sync;
 
