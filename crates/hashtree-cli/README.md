@@ -41,6 +41,8 @@ htree following                         # List followed users
 # Daemon
 htree start                             # Start P2P daemon
 htree status                            # Check daemon status
+htree service install --user            # Install systemd unit (Linux)
+htree service uninstall --user          # Remove systemd unit (Linux)
 ```
 
 ## Configuration

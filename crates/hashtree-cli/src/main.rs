@@ -21,6 +21,9 @@ use hashtree_cli::{
     BackgroundSync, Config, HashtreeServer, HashtreeStore,
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RootResolver,
 };
+use hashtree_cli::service::{
+    install_systemd, uninstall_systemd, ServiceInstallOptions, ServiceScope, ServiceUninstallOptions,
+};
 #[cfg(feature = "p2p")]
 use hashtree_cli::{PeerPool, WebRTCConfig, WebRTCManager};
 use std::collections::HashSet;
@@ -160,6 +163,11 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommands,
     },
+    /// Manage systemd service (Linux only)
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -178,6 +186,49 @@ enum StorageCommands {
         /// Also verify R2/S3 storage (slower)
         #[arg(long)]
         r2: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Install and enable the systemd service
+    Install {
+        /// Install as a user service (default)
+        #[arg(long, conflicts_with = "system")]
+        user: bool,
+        /// Install as a system service (requires root)
+        #[arg(long, conflicts_with = "user")]
+        system: bool,
+        /// Service name (default: hashtree)
+        #[arg(long, default_value = "hashtree")]
+        name: String,
+        /// Bind address for the daemon
+        #[arg(long)]
+        addr: Option<String>,
+        /// Override Nostr relays (comma-separated)
+        #[arg(long)]
+        relays: Option<String>,
+        /// Data directory (sets HTREE_DATA_DIR)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Set RUST_LOG for the service
+        #[arg(long)]
+        rust_log: Option<String>,
+        /// Enable but do not start the service
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Disable and remove the systemd service
+    Uninstall {
+        /// Uninstall user service (default)
+        #[arg(long, conflicts_with = "system")]
+        user: bool,
+        /// Uninstall system service (requires root)
+        #[arg(long, conflicts_with = "user")]
+        system: bool,
+        /// Service name (default: hashtree)
+        #[arg(long, default_value = "hashtree")]
+        name: String,
     },
 }
 
@@ -1240,6 +1291,28 @@ async fn main() -> Result<()> {
                     } else {
                         println!("All blobs verified successfully!");
                     }
+                }
+            }
+        }
+        Commands::Service { command } => {
+            match command {
+                ServiceCommands::Install { user: _, system, name, addr, relays, data_dir, rust_log, no_start } => {
+                    let scope = if system { ServiceScope::System } else { ServiceScope::User };
+                    let unit_path = install_systemd(ServiceInstallOptions {
+                        scope,
+                        name: name.clone(),
+                        addr,
+                        relays,
+                        data_dir,
+                        rust_log,
+                        start_now: !no_start,
+                    })?;
+                    println!("Installed systemd unit: {}", unit_path.display());
+                }
+                ServiceCommands::Uninstall { user: _, system, name } => {
+                    let scope = if system { ServiceScope::System } else { ServiceScope::User };
+                    uninstall_systemd(ServiceUninstallOptions { scope, name: name.clone() })?;
+                    println!("Removed systemd unit: {}.service", name);
                 }
             }
         }

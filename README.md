@@ -101,16 +101,64 @@ The `Store` trait is just `get(hash) → bytes` and `put(hash, bytes)`. The core
 
 ## P2P Daemon
 
-Run `htree start` to enable P2P sharing via WebRTC:
+Run `htree start` to enable P2P sharing via WebRTC (foreground process):
 
 ```bash
-htree start                  # Start daemon (default port 8080)
-htree status                 # Check daemon status, connected peers
+htree start                              # Start daemon (default 127.0.0.1:8080)
+htree start --addr 127.0.0.1:8081        # Custom bind address
+htree start --relays wss://relay.damus.io,wss://nos.lol
+htree --data-dir /var/lib/hashtree start # Custom data dir
+htree status                             # Check daemon status, connected peers
+curl http://127.0.0.1:8080/api/status     # Raw status JSON
 ```
 
-The daemon acts as a local Blossom server and connects to peers via WebRTC (signaled over Nostr). Git operations automatically use the daemon when running.
+The daemon acts as a local Blossom server and connects to peers via WebRTC (signaled over Nostr). Git operations automatically use the daemon when running. WebRTC transport falls back to Blossom servers when data isn't found on peers or WebRTC isn't available.
 
-WebRTC transport falls back to Blossom servers when data isn't found on peers or WebRTC isn't available.
+Config is read from `~/.hashtree/config.toml`:
+
+```toml
+[server]
+bind_address = "127.0.0.1:8080"
+enable_webrtc = true
+stun_port = 3478
+enable_auth = true
+public_writes = true
+```
+
+Set `stun_port = 0` to disable the built-in STUN server. Use `RUST_LOG=info` to increase verbosity.
+
+### Running as a service
+
+Use your OS service manager for restarts and logs. On Linux, `htree service install` can generate and enable a systemd unit for you.
+
+```ini
+# systemd example
+[Unit]
+Description=hashtree daemon
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/htree start --addr 127.0.0.1:8080
+Environment=HTREE_DATA_DIR=/var/lib/hashtree
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Built-in installer (systemd):
+
+```bash
+htree service install --user
+htree service install --system --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
+```
+
+Scripted install (systemd):
+
+```bash
+./scripts/install-systemd.sh --user
+./scripts/install-systemd.sh --system --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
+```
 
 ## Git Remote Helper
 
@@ -145,22 +193,25 @@ git clone htree://self/myrepo#private
 
 ## Configuration
 
-Config file: `~/.hashtree/config.toml`
+Config file: `~/.hashtree/config.toml` (defaults shown below)
 
 ```toml
 [blossom]
 read_servers = ["https://cdn.iris.to", "https://hashtree.iris.to"]
-write_servers = ["https://hashtree.iris.to"]
-max_upload_mb = 100
+write_servers = ["https://upload.iris.to"]
+max_upload_mb = 5
 
 [nostr]
 relays = [
     "wss://relay.damus.io",
     "wss://relay.snort.social",
     "wss://nos.lol",
-    "wss://relay.primal.net"
+    "wss://temp.iris.to"
 ]
 ```
+
+WebRTC also uses default STUN servers for NAT traversal:
+`stun:stun.iris.to:3478`, `stun:stun.l.google.com:19302`, `stun:stun.cloudflare.com:3478`.
 
 Keys file: `~/.hashtree/keys`
 
