@@ -162,34 +162,6 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
-Minimal macOS launchd plist:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-  <dict>
-    <key>Label</key>
-    <string>hashtree</string>
-    <key>ProgramArguments</key>
-    <array>
-      <string>/usr/local/bin/htree</string>
-      <string>start</string>
-      <string>--addr</string>
-      <string>127.0.0.1:8080</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-      <key>HTREE_DATA_DIR</key>
-      <string>/var/lib/hashtree</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-  </dict>
-</plist>
-```
 
 ## Git Remote Helper
 
