@@ -129,10 +129,10 @@ Set `stun_port = 0` to disable the built-in STUN server. Use `RUST_LOG=info` to 
 
 ### Running as a service
 
-Use your OS service manager for restarts and logs. On Linux, `htree service install` can generate and enable a systemd unit for you.
+Use your OS service manager for restarts and logs. `htree service install` supports systemd on Linux and launchd on macOS.
 
 ```ini
-# systemd example
+# systemd example (Linux)
 [Unit]
 Description=hashtree daemon
 After=network-online.target
@@ -146,14 +146,16 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-Built-in installer (systemd):
+Built-in installer (systemd/launchd):
 
 ```bash
 htree service install --user
 htree service install --system --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
 ```
 
-Scripted install (systemd):
+On macOS, user services are written to `~/Library/LaunchAgents/<name>.plist` and system services to `/Library/LaunchDaemons/<name>.plist`.
+
+Scripted install (systemd, Linux only):
 
 ```bash
 ./scripts/install-systemd.sh --user

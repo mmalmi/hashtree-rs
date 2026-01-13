@@ -24,6 +24,118 @@ pub struct ServiceUninstallOptions {
     pub name: String,
 }
 
+pub fn install_service(opts: ServiceInstallOptions) -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        return install_systemd(opts);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return install_launchd(opts);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = opts;
+        bail!("service install is only supported on Linux (systemd) or macOS (launchd)");
+    }
+}
+
+pub fn uninstall_service(opts: ServiceUninstallOptions) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return uninstall_systemd(opts);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return uninstall_launchd(opts);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = opts;
+        bail!("service uninstall is only supported on Linux (systemd) or macOS (launchd)");
+    }
+}
+
+pub(crate) fn launchd_plist_contents(bin_path: &Path, label: &str, opts: &ServiceInstallOptions) -> String {
+    let mut args = Vec::new();
+    args.push(bin_path.display().to_string());
+    args.push("start".to_string());
+    if let Some(addr) = &opts.addr {
+        args.push("--addr".to_string());
+        args.push(addr.clone());
+    }
+    if let Some(relays) = &opts.relays {
+        args.push("--relays".to_string());
+        args.push(relays.clone());
+    }
+
+    let mut lines = Vec::new();
+    lines.push(r#"<?xml version="1.0" encoding="UTF-8"?>"#.to_string());
+    lines.push(r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#.to_string());
+    lines.push(r#"<plist version="1.0">"#.to_string());
+    lines.push("<dict>".to_string());
+    lines.push("  <key>Label</key>".to_string());
+    lines.push(format!("  <string>{}</string>", xml_escape(label)));
+    lines.push("  <key>ProgramArguments</key>".to_string());
+    lines.push("  <array>".to_string());
+    for arg in args {
+        lines.push(format!("    <string>{}</string>", xml_escape(&arg)));
+    }
+    lines.push("  </array>".to_string());
+    if opts.data_dir.is_some() || opts.rust_log.is_some() {
+        lines.push("  <key>EnvironmentVariables</key>".to_string());
+        lines.push("  <dict>".to_string());
+        if let Some(data_dir) = &opts.data_dir {
+            lines.push("    <key>HTREE_DATA_DIR</key>".to_string());
+            lines.push(format!("    <string>{}</string>", xml_escape(&data_dir.display().to_string())));
+        }
+        if let Some(rust_log) = &opts.rust_log {
+            lines.push("    <key>RUST_LOG</key>".to_string());
+            lines.push(format!("    <string>{}</string>", xml_escape(rust_log)));
+        }
+        lines.push("  </dict>".to_string());
+    }
+    lines.push("  <key>RunAtLoad</key>".to_string());
+    lines.push("  <true/>".to_string());
+    lines.push("  <key>KeepAlive</key>".to_string());
+    lines.push("  <true/>".to_string());
+    lines.push("</dict>".to_string());
+    lines.push("</plist>".to_string());
+    lines.join("\n")
+}
+
+pub(crate) fn launchd_plist_dir(scope: ServiceScope) -> Result<PathBuf> {
+    match scope {
+        ServiceScope::User => {
+            if let Ok(home) = std::env::var("HOME") {
+                Ok(PathBuf::from(home).join("Library/LaunchAgents"))
+            } else {
+                bail!("HOME must be set for user launchd services");
+            }
+        }
+        ServiceScope::System => Ok(PathBuf::from("/Library/LaunchDaemons")),
+    }
+}
+
+fn launchd_label(name: &str) -> String {
+    let trimmed = name.strip_suffix(".plist").unwrap_or(name);
+    let trimmed = trimmed.strip_suffix(".service").unwrap_or(trimmed);
+    trimmed.to_string()
+}
+
+fn launchd_plist_name(name: &str) -> String {
+    format!("{}.plist", launchd_label(name))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn install_systemd(_opts: ServiceInstallOptions) -> Result<PathBuf> {
     bail!("systemd is only supported on Linux");
@@ -32,6 +144,16 @@ pub fn install_systemd(_opts: ServiceInstallOptions) -> Result<PathBuf> {
 #[cfg(not(target_os = "linux"))]
 pub fn uninstall_systemd(_opts: ServiceUninstallOptions) -> Result<()> {
     bail!("systemd is only supported on Linux");
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_launchd(_opts: ServiceInstallOptions) -> Result<PathBuf> {
+    bail!("launchd is only supported on macOS");
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn uninstall_launchd(_opts: ServiceUninstallOptions) -> Result<()> {
+    bail!("launchd is only supported on macOS");
 }
 
 #[cfg(target_os = "linux")]
@@ -154,6 +276,91 @@ fn run_systemctl(scope: ServiceScope, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+pub fn install_launchd(opts: ServiceInstallOptions) -> Result<PathBuf> {
+    let bin_path = std::env::current_exe().context("Failed to resolve htree binary path")?;
+    let plist_dir = launchd_plist_dir(opts.scope)?;
+    std::fs::create_dir_all(&plist_dir)
+        .with_context(|| format!("Failed to create launchd directory {}", plist_dir.display()))?;
+
+    let label = launchd_label(&opts.name);
+    let plist_name = launchd_plist_name(&opts.name);
+    let plist_path = plist_dir.join(&plist_name);
+    let contents = launchd_plist_contents(&bin_path, &label, &opts);
+    std::fs::write(&plist_path, contents)
+        .with_context(|| format!("Failed to write plist {}", plist_path.display()))?;
+
+    let domain = launchd_domain(opts.scope)?;
+    let plist_path_str = plist_path.to_string_lossy().to_string();
+    run_launchctl(&["bootstrap", &domain, &plist_path_str])?;
+
+    let service_target = format!("{}/{}", domain, label);
+    run_launchctl(&["enable", &service_target])?;
+    if opts.start_now {
+        run_launchctl(&["kickstart", "-k", &service_target])?;
+    }
+
+    Ok(plist_path)
+}
+
+#[cfg(target_os = "macos")]
+pub fn uninstall_launchd(opts: ServiceUninstallOptions) -> Result<()> {
+    let plist_dir = launchd_plist_dir(opts.scope)?;
+    let label = launchd_label(&opts.name);
+    let plist_name = launchd_plist_name(&opts.name);
+    let plist_path = plist_dir.join(&plist_name);
+    let domain = launchd_domain(opts.scope)?;
+
+    let service_target = format!("{}/{}", domain, label);
+    let plist_path_str = plist_path.to_string_lossy().to_string();
+    if plist_path.exists() {
+        run_launchctl(&["bootout", &domain, &plist_path_str])?;
+    } else {
+        run_launchctl(&["bootout", &domain, &label])?;
+    }
+    if plist_path.exists() {
+        std::fs::remove_file(&plist_path)
+            .with_context(|| format!("Failed to remove plist {}", plist_path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_domain(scope: ServiceScope) -> Result<String> {
+    match scope {
+        ServiceScope::User => {
+            let output = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .context("Failed to run id -u")?;
+            if !output.status.success() {
+                bail!("id -u failed");
+            }
+            let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if uid.is_empty() {
+                bail!("id -u returned empty uid");
+            }
+            Ok(format!("gui/{}", uid))
+        }
+        ServiceScope::System => Ok("system".to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl(args: &[&str]) -> Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("Failed to run launchctl")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("launchctl {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +374,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn renders_systemd_unit_for_user_scope() {
         let _guard = env_lock();
@@ -186,6 +394,7 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolves_user_unit_dir_from_xdg_config_home() {
         let _guard = env_lock();
@@ -202,6 +411,49 @@ mod tests {
         } else {
             std::env::remove_var("XDG_CONFIG_HOME");
         }
+        if let Some(value) = prev_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn renders_launchd_plist_for_user_scope() {
+        let _guard = env_lock();
+        let opts = ServiceInstallOptions {
+            scope: ServiceScope::User,
+            name: "hashtree".to_string(),
+            addr: Some("127.0.0.1:8081".to_string()),
+            relays: Some("wss://relay.damus.io,wss://nos.lol".to_string()),
+            data_dir: Some(PathBuf::from("/var/lib/hashtree")),
+            rust_log: Some("info".to_string()),
+            start_now: true,
+        };
+        let plist = launchd_plist_contents(Path::new("/usr/local/bin/htree"), "hashtree", &opts);
+        assert!(plist.contains("<key>Label</key>"));
+        assert!(plist.contains("<string>hashtree</string>"));
+        assert!(plist.contains("<string>/usr/local/bin/htree</string>"));
+        assert!(plist.contains("<string>start</string>"));
+        assert!(plist.contains("<string>--addr</string>"));
+        assert!(plist.contains("<string>127.0.0.1:8081</string>"));
+        assert!(plist.contains("<string>--relays</string>"));
+        assert!(plist.contains("<string>wss://relay.damus.io,wss://nos.lol</string>"));
+        assert!(plist.contains("<key>HTREE_DATA_DIR</key>"));
+        assert!(plist.contains("<string>/var/lib/hashtree</string>"));
+        assert!(plist.contains("<key>RUST_LOG</key>"));
+        assert!(plist.contains("<string>info</string>"));
+    }
+
+    #[test]
+    fn resolves_launchd_plist_dir_from_home() {
+        let _guard = env_lock();
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/hashtree-home");
+
+        let dir = launchd_plist_dir(ServiceScope::User).expect("launchd dir");
+        assert_eq!(dir, PathBuf::from("/tmp/hashtree-home/Library/LaunchAgents"));
+
         if let Some(value) = prev_home {
             std::env::set_var("HOME", value);
         } else {

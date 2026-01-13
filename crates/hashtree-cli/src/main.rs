@@ -22,7 +22,7 @@ use hashtree_cli::{
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RootResolver,
 };
 use hashtree_cli::service::{
-    install_systemd, uninstall_systemd, ServiceInstallOptions, ServiceScope, ServiceUninstallOptions,
+    install_service, uninstall_service, ServiceInstallOptions, ServiceScope, ServiceUninstallOptions,
 };
 #[cfg(feature = "p2p")]
 use hashtree_cli::{PeerPool, WebRTCConfig, WebRTCManager};
@@ -1298,7 +1298,7 @@ async fn main() -> Result<()> {
             match command {
                 ServiceCommands::Install { user: _, system, name, addr, relays, data_dir, rust_log, no_start } => {
                     let scope = if system { ServiceScope::System } else { ServiceScope::User };
-                    let unit_path = install_systemd(ServiceInstallOptions {
+                    let unit_path = install_service(ServiceInstallOptions {
                         scope,
                         name: name.clone(),
                         addr,
@@ -1307,12 +1307,12 @@ async fn main() -> Result<()> {
                         rust_log,
                         start_now: !no_start,
                     })?;
-                    println!("Installed systemd unit: {}", unit_path.display());
+                    println!("Installed service unit: {}", unit_path.display());
                 }
                 ServiceCommands::Uninstall { user: _, system, name } => {
                     let scope = if system { ServiceScope::System } else { ServiceScope::User };
-                    uninstall_systemd(ServiceUninstallOptions { scope, name: name.clone() })?;
-                    println!("Removed systemd unit: {}.service", name);
+                    uninstall_service(ServiceUninstallOptions { scope, name: name.clone() })?;
+                    println!("Removed service: {}", name);
                 }
             }
         }
