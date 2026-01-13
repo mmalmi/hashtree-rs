@@ -43,6 +43,7 @@ htree start                             # Start P2P daemon
 htree status                            # Check daemon status
 htree service install --user            # Install service (Linux systemd / macOS launchd)
 htree service uninstall --user          # Remove service
+htree service status --user             # Show service status
 ```
 
 ## Configuration

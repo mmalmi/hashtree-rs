@@ -151,6 +151,7 @@ Built-in installer (systemd/launchd):
 ```bash
 htree service install --user
 htree service install --system --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
+htree service status --user
 ```
 
 On macOS, user services are written to `~/Library/LaunchAgents/<name>.plist` and system services to `/Library/LaunchDaemons/<name>.plist`.

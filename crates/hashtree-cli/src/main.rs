@@ -22,7 +22,8 @@ use hashtree_cli::{
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RootResolver,
 };
 use hashtree_cli::service::{
-    install_service, uninstall_service, ServiceInstallOptions, ServiceScope, ServiceUninstallOptions,
+    install_service, uninstall_service, status_service,
+    ServiceInstallOptions, ServiceScope, ServiceStatusOptions, ServiceUninstallOptions,
 };
 #[cfg(feature = "p2p")]
 use hashtree_cli::{PeerPool, WebRTCConfig, WebRTCManager};
@@ -224,6 +225,18 @@ enum ServiceCommands {
         #[arg(long, conflicts_with = "system")]
         user: bool,
         /// Uninstall system service (requires root)
+        #[arg(long, conflicts_with = "user")]
+        system: bool,
+        /// Service name (default: hashtree)
+        #[arg(long, default_value = "hashtree")]
+        name: String,
+    },
+    /// Show service status
+    Status {
+        /// Query user service (default)
+        #[arg(long, conflicts_with = "system")]
+        user: bool,
+        /// Query system service (requires root on Linux)
         #[arg(long, conflicts_with = "user")]
         system: bool,
         /// Service name (default: hashtree)
@@ -1313,6 +1326,11 @@ async fn main() -> Result<()> {
                     let scope = if system { ServiceScope::System } else { ServiceScope::User };
                     uninstall_service(ServiceUninstallOptions { scope, name: name.clone() })?;
                     println!("Removed service: {}", name);
+                }
+                ServiceCommands::Status { user: _, system, name } => {
+                    let scope = if system { ServiceScope::System } else { ServiceScope::User };
+                    let output = status_service(ServiceStatusOptions { scope, name: name.clone() })?;
+                    println!("{}", output);
                 }
             }
         }

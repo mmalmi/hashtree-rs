@@ -24,6 +24,12 @@ pub struct ServiceUninstallOptions {
     pub name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServiceStatusOptions {
+    pub scope: ServiceScope,
+    pub name: String,
+}
+
 pub fn install_service(opts: ServiceInstallOptions) -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -56,6 +62,23 @@ pub fn uninstall_service(opts: ServiceUninstallOptions) -> Result<()> {
     }
 }
 
+pub fn status_service(opts: ServiceStatusOptions) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return status_systemd(opts);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return status_launchd(opts);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = opts;
+        bail!("service status is only supported on Linux (systemd) or macOS (launchd)");
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn launchd_plist_contents(bin_path: &Path, label: &str, opts: &ServiceInstallOptions) -> String {
     let mut args = Vec::new();
     args.push(bin_path.display().to_string());
@@ -104,6 +127,7 @@ pub(crate) fn launchd_plist_contents(bin_path: &Path, label: &str, opts: &Servic
     lines.join("\n")
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn launchd_plist_dir(scope: ServiceScope) -> Result<PathBuf> {
     match scope {
         ServiceScope::User => {
@@ -117,16 +141,19 @@ pub(crate) fn launchd_plist_dir(scope: ServiceScope) -> Result<PathBuf> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launchd_label(name: &str) -> String {
     let trimmed = name.strip_suffix(".plist").unwrap_or(name);
     let trimmed = trimmed.strip_suffix(".service").unwrap_or(trimmed);
     trimmed.to_string()
 }
 
+#[cfg(target_os = "macos")]
 fn launchd_plist_name(name: &str) -> String {
     format!("{}.plist", launchd_label(name))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -276,6 +303,67 @@ fn run_systemctl(scope: ServiceScope, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn run_systemctl_capture(scope: ServiceScope, args: &[&str], allow_fail: bool) -> Result<String> {
+    use std::process::Command;
+
+    let mut cmd = Command::new("systemctl");
+    if matches!(scope, ServiceScope::User) {
+        cmd.arg("--user");
+    }
+    cmd.args(args);
+    let output = cmd.output().context("Failed to run systemctl")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stdout.trim().is_empty() {
+        stderr.trim().to_string()
+    } else if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        format!("{}\n{}", stdout.trim(), stderr.trim())
+    };
+    if !output.status.success() && !allow_fail {
+        bail!("systemctl {} failed: {}", args.join(" "), combined);
+    }
+    Ok(combined)
+}
+
+#[cfg(target_os = "linux")]
+fn status_systemd(opts: ServiceStatusOptions) -> Result<String> {
+    let service = systemd_unit_name(&opts.name);
+    let active = normalize_status_value(run_systemctl_capture(opts.scope, &["is-active", &service], true)?);
+    let enabled = normalize_status_value(run_systemctl_capture(opts.scope, &["is-enabled", &service], true)?);
+    let status_output = run_systemctl_capture(opts.scope, &["status", &service, "--no-pager", "--full"], true)?;
+    Ok(systemd_status_summary(&service, opts.scope, &enabled, &active, &status_output))
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_status_value(value: String) -> String {
+    let trimmed = value.lines().next().unwrap_or("").trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_status_summary(service: &str, scope: ServiceScope, enabled: &str, active: &str, status: &str) -> String {
+    let scope_label = match scope {
+        ServiceScope::User => "user",
+        ServiceScope::System => "system",
+    };
+    let status_text = if status.trim().is_empty() {
+        "(no output)"
+    } else {
+        status.trim()
+    };
+    format!(
+        "Service: {}\nScope: {}\nEnabled: {}\nActive: {}\nStatus:\n{}",
+        service, scope_label, enabled, active, status_text
+    )
+}
+
 #[cfg(target_os = "macos")]
 pub fn install_launchd(opts: ServiceInstallOptions) -> Result<PathBuf> {
     let bin_path = std::env::current_exe().context("Failed to resolve htree binary path")?;
@@ -326,6 +414,38 @@ pub fn uninstall_launchd(opts: ServiceUninstallOptions) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn status_launchd(opts: ServiceStatusOptions) -> Result<String> {
+    let label = launchd_label(&opts.name);
+    let domain = launchd_domain(opts.scope)?;
+    let list_output = run_launchctl_capture(&["list", &label], true)?;
+    let target = format!("{}/{}", domain, label);
+    let print_output = run_launchctl_capture(&["print", &target], true)?;
+    Ok(launchd_status_summary(&label, opts.scope, &list_output, &print_output))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_status_summary(label: &str, scope: ServiceScope, list_output: &str, print_output: &str) -> String {
+    let scope_label = match scope {
+        ServiceScope::User => "user",
+        ServiceScope::System => "system",
+    };
+    let list_text = if list_output.trim().is_empty() {
+        "(no output)"
+    } else {
+        list_output.trim()
+    };
+    let print_text = if print_output.trim().is_empty() {
+        "(no output)"
+    } else {
+        print_output.trim()
+    };
+    format!(
+        "Service: {}\nScope: {}\nList:\n{}\nPrint:\n{}",
+        label, scope_label, list_text, print_text
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn launchd_domain(scope: ServiceScope) -> Result<String> {
     match scope {
         ServiceScope::User => {
@@ -359,6 +479,29 @@ fn run_launchctl(args: &[&str]) -> Result<()> {
         bail!("launchctl {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl_capture(args: &[&str], allow_fail: bool) -> Result<String> {
+    use std::process::Command;
+
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("Failed to run launchctl")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stdout.trim().is_empty() {
+        stderr.trim().to_string()
+    } else if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        format!("{}\n{}", stdout.trim(), stderr.trim())
+    };
+    if !output.status.success() && !allow_fail {
+        bail!("launchctl {} failed: {}", args.join(" "), combined);
+    }
+    Ok(combined)
 }
 
 #[cfg(test)]
@@ -459,5 +602,37 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn formats_systemd_status_summary() {
+        let summary = systemd_status_summary(
+            "hashtree.service",
+            ServiceScope::User,
+            "enabled",
+            "active",
+            "status output",
+        );
+        assert!(summary.contains("Service: hashtree.service"));
+        assert!(summary.contains("Scope: user"));
+        assert!(summary.contains("Enabled: enabled"));
+        assert!(summary.contains("Active: active"));
+        assert!(summary.contains("Status:\nstatus output"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn formats_launchd_status_summary() {
+        let summary = launchd_status_summary(
+            "hashtree",
+            ServiceScope::System,
+            "list output",
+            "print output",
+        );
+        assert!(summary.contains("Service: hashtree"));
+        assert!(summary.contains("Scope: system"));
+        assert!(summary.contains("List:\nlist output"));
+        assert!(summary.contains("Print:\nprint output"));
     }
 }
