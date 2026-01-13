@@ -21,6 +21,7 @@ use hashtree_cli::{
     BackgroundSync, Config, HashtreeServer, HashtreeStore,
     NostrKeys, NostrResolverConfig, NostrRootResolver, NostrToBech32, RootResolver,
 };
+use hashtree_config::detect_local_daemon_url;
 use hashtree_cli::service::{
     install_service, uninstall_service, status_service,
     ServiceInstallOptions, ServiceScope, ServiceStatusOptions, ServiceUninstallOptions,
@@ -988,48 +989,7 @@ async fn main() -> Result<()> {
             match reqwest::blocking::get(&url) {
                 Ok(resp) if resp.status().is_success() => {
                     let status: serde_json::Value = resp.json()?;
-                    println!("Daemon Status:");
-                    println!("  Status: {}", status["status"].as_str().unwrap_or("unknown"));
-
-                    if let Some(storage) = status.get("storage") {
-                        println!("\nStorage:");
-                        if let Some(total) = storage.get("total_dags") {
-                            println!("  Total DAGs: {}", total);
-                        }
-                        if let Some(pinned) = storage.get("pinned_dags") {
-                            println!("  Pinned DAGs: {}", pinned);
-                        }
-                        if let Some(bytes) = storage.get("total_bytes").and_then(|b| b.as_u64()) {
-                            println!("  Total size: {} bytes ({:.2} KB)", bytes, bytes as f64 / 1024.0);
-                        }
-                    }
-
-                    if let Some(webrtc) = status.get("webrtc") {
-                        println!("\nWebRTC:");
-                        if webrtc.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
-                            println!("  Enabled: yes");
-                            if let Some(total) = webrtc.get("total_peers") {
-                                println!("  Total peers: {}", total);
-                            }
-                            if let Some(connected) = webrtc.get("connected") {
-                                println!("  Connected: {}", connected);
-                            }
-                            if let Some(dc) = webrtc.get("with_data_channel") {
-                                println!("  With data channel: {}", dc);
-                            }
-                        } else {
-                            println!("  Enabled: no");
-                        }
-                    }
-
-                    if let Some(upstream) = status.get("upstream") {
-                        if let Some(count) = upstream.get("blossom_servers").and_then(|c| c.as_u64()) {
-                            if count > 0 {
-                                println!("\nUpstream:");
-                                println!("  Blossom servers: {}", count);
-                            }
-                        }
-                    }
+                    println!("{}", format_daemon_status(&status, true));
                 }
                 Ok(resp) => {
                     eprintln!("Daemon returned error: {}", resp.status());
@@ -1331,6 +1291,7 @@ async fn main() -> Result<()> {
                     let scope = if system { ServiceScope::System } else { ServiceScope::User };
                     let output = status_service(ServiceStatusOptions { scope, name: name.clone() })?;
                     println!("{}", output);
+                    print_local_daemon_status();
                 }
             }
         }
@@ -1358,6 +1319,90 @@ fn chrono_humanize_timestamp(ts: u64) -> String {
         format!("{}h ago", diff / 3600)
     } else {
         format!("{}d ago", diff / 86400)
+    }
+}
+
+fn format_daemon_status(status: &serde_json::Value, include_header: bool) -> String {
+    let mut lines = Vec::new();
+    if include_header {
+        lines.push("Daemon Status:".to_string());
+    }
+    let status_text = status["status"].as_str().unwrap_or("unknown");
+    lines.push(format!("  Status: {}", status_text));
+
+    if let Some(storage) = status.get("storage") {
+        lines.push(String::new());
+        lines.push("Storage:".to_string());
+        if let Some(total) = storage.get("total_dags") {
+            lines.push(format!("  Total DAGs: {}", total));
+        }
+        if let Some(pinned) = storage.get("pinned_dags") {
+            lines.push(format!("  Pinned DAGs: {}", pinned));
+        }
+        if let Some(bytes) = storage.get("total_bytes").and_then(|b| b.as_u64()) {
+            lines.push(format!("  Total size: {} bytes ({:.2} KB)", bytes, bytes as f64 / 1024.0));
+        }
+    }
+
+    if let Some(webrtc) = status.get("webrtc") {
+        lines.push(String::new());
+        lines.push("WebRTC:".to_string());
+        if webrtc.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
+            lines.push("  Enabled: yes".to_string());
+            if let Some(total) = webrtc.get("total_peers") {
+                lines.push(format!("  Total peers: {}", total));
+            }
+            if let Some(connected) = webrtc.get("connected") {
+                lines.push(format!("  Connected: {}", connected));
+            }
+            if let Some(dc) = webrtc.get("with_data_channel") {
+                lines.push(format!("  With data channel: {}", dc));
+            }
+        } else {
+            lines.push("  Enabled: no".to_string());
+        }
+    }
+
+    if let Some(upstream) = status.get("upstream") {
+        if let Some(count) = upstream.get("blossom_servers").and_then(|c| c.as_u64()) {
+            if count > 0 {
+                lines.push(String::new());
+                lines.push("Upstream:".to_string());
+                lines.push(format!("  Blossom servers: {}", count));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn print_local_daemon_status() {
+    let config = hashtree_config::Config::load_or_default();
+    let base_url = detect_local_daemon_url(Some(&config.server.bind_address));
+    let Some(base_url) = base_url else {
+        println!("\nDaemon API: not detected");
+        return;
+    };
+
+    let url = format!("{}/api/status", base_url);
+    match reqwest::blocking::get(&url) {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>() {
+                Ok(status) => {
+                    println!("\nDaemon API ({}):", base_url);
+                    println!("{}", format_daemon_status(&status, false));
+                }
+                Err(e) => {
+                    println!("\nDaemon API ({}): failed to parse status ({})", base_url, e);
+                }
+            }
+        }
+        Ok(resp) => {
+            println!("\nDaemon API ({}): error {}", base_url, resp.status());
+        }
+        Err(e) => {
+            println!("\nDaemon API ({}): unreachable ({})", base_url, e);
+        }
     }
 }
 
