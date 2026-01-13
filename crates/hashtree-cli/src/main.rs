@@ -164,7 +164,7 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommands,
     },
-    /// Manage systemd service (Linux only)
+    /// Manage service installation (systemd/launchd)
     Service {
         #[command(subcommand)]
         command: ServiceCommands,
@@ -192,7 +192,7 @@ enum StorageCommands {
 
 #[derive(Subcommand)]
 enum ServiceCommands {
-    /// Install and enable the systemd service
+    /// Install and enable the service
     Install {
         /// Install as a user service (default)
         #[arg(long, conflicts_with = "system")]
@@ -219,7 +219,7 @@ enum ServiceCommands {
         #[arg(long)]
         no_start: bool,
     },
-    /// Disable and remove the systemd service
+    /// Disable and remove the service
     Uninstall {
         /// Uninstall user service (default)
         #[arg(long, conflicts_with = "system")]
