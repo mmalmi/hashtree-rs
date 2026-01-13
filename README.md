@@ -142,6 +142,55 @@ tail -f ~/.hashtree/logs/htree.log
 
 Stop it with `htree stop` or `kill <pid>` (pid printed on start).
 
+### Running as a service (manual)
+
+Use your OS service manager for restarts and logs. Example systemd unit:
+
+```ini
+[Unit]
+Description=hashtree daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/htree start --addr 127.0.0.1:8080
+Environment=HTREE_DATA_DIR=/var/lib/hashtree
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Minimal macOS launchd plist:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>hashtree</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/local/bin/htree</string>
+      <string>start</string>
+      <string>--addr</string>
+      <string>127.0.0.1:8080</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HTREE_DATA_DIR</key>
+      <string>/var/lib/hashtree</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+  </dict>
+</plist>
+```
+
 ## Git Remote Helper
 
 Push/pull git repos via hashtree:
