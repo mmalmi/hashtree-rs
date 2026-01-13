@@ -196,11 +196,25 @@ pub fn install_systemd(opts: ServiceInstallOptions) -> Result<PathBuf> {
     std::fs::write(&unit_path, contents)
         .with_context(|| format!("Failed to write unit file {}", unit_path.display()))?;
 
-    run_systemctl(opts.scope, &["daemon-reload"])?;
-    if opts.start_now {
-        run_systemctl(opts.scope, &["enable", "--now", &service_name])?;
+    if let Err(err) = run_systemctl(opts.scope, &["daemon-reload"]) {
+        if is_systemctl_bus_error(&err.to_string()) {
+            eprintln!("{}", systemctl_unavailable_hint(opts.scope, &service_name, Some(&unit_path)));
+            return Ok(unit_path);
+        }
+        return Err(err);
+    }
+
+    let enable_args = if opts.start_now {
+        vec!["enable", "--now", &service_name]
     } else {
-        run_systemctl(opts.scope, &["enable", &service_name])?;
+        vec!["enable", &service_name]
+    };
+    if let Err(err) = run_systemctl(opts.scope, &enable_args) {
+        if is_systemctl_bus_error(&err.to_string()) {
+            eprintln!("{}", systemctl_unavailable_hint(opts.scope, &service_name, Some(&unit_path)));
+            return Ok(unit_path);
+        }
+        return Err(err);
     }
 
     Ok(unit_path)
@@ -212,12 +226,20 @@ pub fn uninstall_systemd(opts: ServiceUninstallOptions) -> Result<()> {
     let service_name = systemd_unit_name(&opts.name);
     let unit_path = unit_dir.join(&service_name);
 
-    run_systemctl(opts.scope, &["disable", "--now", &service_name])?;
+    if let Err(err) = run_systemctl(opts.scope, &["disable", "--now", &service_name]) {
+        if !is_systemctl_bus_error(&err.to_string()) {
+            return Err(err);
+        }
+    }
     if unit_path.exists() {
         std::fs::remove_file(&unit_path)
             .with_context(|| format!("Failed to remove unit file {}", unit_path.display()))?;
     }
-    run_systemctl(opts.scope, &["daemon-reload"])?;
+    if let Err(err) = run_systemctl(opts.scope, &["daemon-reload"]) {
+        if !is_systemctl_bus_error(&err.to_string()) {
+            return Err(err);
+        }
+    }
     Ok(())
 }
 
@@ -331,9 +353,21 @@ fn run_systemctl_capture(scope: ServiceScope, args: &[&str], allow_fail: bool) -
 #[cfg(target_os = "linux")]
 fn status_systemd(opts: ServiceStatusOptions) -> Result<String> {
     let service = systemd_unit_name(&opts.name);
-    let active = normalize_status_value(run_systemctl_capture(opts.scope, &["is-active", &service], true)?);
-    let enabled = normalize_status_value(run_systemctl_capture(opts.scope, &["is-enabled", &service], true)?);
+    let active_output = run_systemctl_capture(opts.scope, &["is-active", &service], true)?;
+    if is_systemctl_bus_error(&active_output) {
+        return Ok(systemd_status_unavailable(&service, opts.scope, &active_output));
+    }
+    let enabled_output = run_systemctl_capture(opts.scope, &["is-enabled", &service], true)?;
+    if is_systemctl_bus_error(&enabled_output) {
+        return Ok(systemd_status_unavailable(&service, opts.scope, &enabled_output));
+    }
     let status_output = run_systemctl_capture(opts.scope, &["status", &service, "--no-pager", "--full"], true)?;
+    if is_systemctl_bus_error(&status_output) {
+        return Ok(systemd_status_unavailable(&service, opts.scope, &status_output));
+    }
+
+    let active = normalize_status_value(active_output);
+    let enabled = normalize_status_value(enabled_output);
     Ok(systemd_status_summary(&service, opts.scope, &enabled, &active, &status_output))
 }
 
@@ -362,6 +396,52 @@ fn systemd_status_summary(service: &str, scope: ServiceScope, enabled: &str, act
         "Service: {}\nScope: {}\nEnabled: {}\nActive: {}\nStatus:\n{}",
         service, scope_label, enabled, active, status_text
     )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_status_unavailable(service: &str, scope: ServiceScope, message: &str) -> String {
+    let scope_label = match scope {
+        ServiceScope::User => "user",
+        ServiceScope::System => "system",
+    };
+    format!(
+        "Service: {}\nScope: {}\nStatus: systemd unavailable ({})",
+        service,
+        scope_label,
+        message.lines().next().unwrap_or("unknown error")
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn is_systemctl_bus_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("failed to connect to bus")
+        || lower.contains("no medium found")
+        || lower.contains("failed to connect to system bus")
+        || lower.contains("failed to connect to user bus")
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_scope_args(scope: ServiceScope) -> &'static str {
+    match scope {
+        ServiceScope::User => "--user ",
+        ServiceScope::System => "",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_unavailable_hint(scope: ServiceScope, service_name: &str, unit_path: Option<&Path>) -> String {
+    let prefix = systemctl_scope_args(scope);
+    let mut lines = Vec::new();
+    if let Some(path) = unit_path {
+        lines.push(format!("systemd unavailable; wrote unit file to {}", path.display()));
+    } else {
+        lines.push("systemd unavailable; unit file written".to_string());
+    }
+    lines.push(format!("Run when systemd is available:"));
+    lines.push(format!("  systemctl {}daemon-reload", prefix));
+    lines.push(format!("  systemctl {}enable --now {}", prefix, service_name));
+    lines.join("\n")
 }
 
 #[cfg(target_os = "macos")]
