@@ -135,11 +135,12 @@ Use `--daemon` to run in the background and write logs to `~/.hashtree/logs/htre
 htree start --daemon
 htree start --daemon --addr 0.0.0.0:8080 --data-dir /var/lib/hashtree
 htree start --daemon --log-file /var/log/hashtree.log
+htree stop
 htree status
 tail -f ~/.hashtree/logs/htree.log
 ```
 
-Stop it with `kill <pid>` (pid printed on start).
+Stop it with `htree stop` or `kill <pid>` (pid printed on start).
 
 ## Git Remote Helper
 

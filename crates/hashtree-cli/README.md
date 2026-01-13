@@ -42,6 +42,7 @@ htree following                         # List followed users
 htree start                             # Start P2P daemon
 htree start --daemon                    # Start in background
 htree start --daemon --log-file /var/log/hashtree.log
+htree stop                              # Stop background daemon
 htree status                            # Check daemon status
 ```
 
